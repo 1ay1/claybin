@@ -104,18 +104,17 @@ constexpr std::uint64_t kClayMountOptional = 1ull << 56;
 
 // where the new root is assembled before we pivot into it.
 //
-// this is a tmpfs we mount ourselves inside our private mount namespace, so it
-// needs no privilege and no pre-existing writable directory. mounting it at a
-// path the caller might also use would be a problem, so we mount OVER a
-// well-known always-present directory and assemble inside that.
+// this needs a directory that (a) exists everywhere, (b) we can mount a tmpfs
+// over without privilege, and (c) does not SHADOW anything the caller might
+// bind from. (c) is the subtle one: staging under /tmp meant that binding a
+// source under /tmp -- a perfectly ordinary thing to do -- found the source
+// already hidden by our own staging tmpfs, and failed with ENOENT.
 //
-// /tmp is the only directory guaranteed to exist and be writable everywhere,
-// and mounting our own tmpfs over it inside a private namespace is invisible to
-// the host and to any /tmp the caller asks for (theirs is mounted later, deeper
-// in the tree).
-constexpr const char* kStageBase = "/tmp";
-constexpr const char* kStageRoot = "/tmp/.clay-root";
-constexpr const char* kOldRoot = "/tmp/.clay-root/.clay-old";
+// /proc/self/fdinfo is the trick bwrap-alikes use: it always exists, it is
+// per-process, it is already a virtual filesystem so nothing real is hidden,
+// and mounting over it inside our private namespace affects nobody.
+constexpr const char* kStageRoot = "/proc/self/fdinfo";
+constexpr const char* kOldRoot = "/proc/self/fdinfo/.clay-old";
 
 }  // namespace
 
@@ -188,31 +187,46 @@ Result<Compiled> compile(const Policy<Sealed>& policy, const HostCapabilities& h
     // pivot into it, so the host filesystem is not merely restricted but
     // absent. what is not mounted cannot be named, which is a stronger and much
     // easier-to-audit property than "is denied".
-    const bool building_tree = !d.mounts.empty();
-    if (building_tree) {
-        if (!host.mount_namespaces)
-            return std::unexpected(
-                Error{Errc::unsupported, "mounts require a mount namespace"});
+    //
+    // a host with no mount namespaces (windows, macOS, a locked-down linux)
+    // cannot do this. rather than silently dropping the mounts, we ask the plan
+    // how faithfully its OTHER interpretation -- pure access control -- can
+    // stand in, and refuse when the answer is "it cannot".
+    const bool building_tree = !d.mounts.empty() && host.mount_namespaces;
 
+    if (!d.mounts.empty() && !host.mount_namespaces) {
+        std::vector<FidelityNote> notes;
+        Fidelity f = d.mounts.fidelity(&notes);
+        if (f == Fidelity::impossible) {
+            // name the reason. "unsupported" with no explanation is what sends
+            // people to strace.
+            const char* why = notes.empty() ? "mount plan needs a mount namespace"
+                                            : notes.front().reason;
+            return std::unexpected(Error{Errc::unsupported, why});
+        }
+        // approximate: the access interpretation is sound but weaker, so the
+        // guarantee report must not claim the tree's strength.
+        out.fidelity = f;
+    }
+
+    if (building_tree) {
         // 1. make our whole tree private, or every mount we do would propagate
         //    back to the host. bwrap does this first too, and skipping it is a
         //    classic container-escape-by-accident.
         b.op(OpCode::mount, MountOp{b.intern("none"), b.intern("/"), b.intern("none"),
                                     Ref{}, kMsRec | kMsPrivate});
 
-        // 2. a private tmpfs over /tmp, then the staging root inside it. doing
-        //    it this way means we never need a writable directory on the host:
-        //    the tmpfs is ours, in our own namespace, and the caller's own /tmp
-        //    mount (if any) lands deeper in the tree and is unaffected.
-        b.op(OpCode::mount, MountOp{b.intern("tmpfs"), b.intern(kStageBase),
-                                    b.intern("tmpfs"), Ref{}, kMsNosuid | kMsNodev});
-        b.op(OpCode::mkdir_p, MkdirOp{b.intern(kStageRoot), 0755, 0});
+        // 2. a tmpfs to assemble the new root in. mounted directly over the
+        //    staging directory, which is a virtual path so nothing real is
+        //    hidden and no caller source can be shadowed by it.
         b.op(OpCode::mount, MountOp{b.intern("tmpfs"), b.intern(kStageRoot),
                                     b.intern("tmpfs"), Ref{}, kMsNosuid | kMsNodev});
         // the pivot target has to exist inside the new root
         b.op(OpCode::mkdir_p, MkdirOp{b.intern(kOldRoot), 0755, 0});
 
-        // 3. every requested mount, rebased under the staging root
+        // 3. every requested mount, rebased under the staging root. the source
+        //    is interned too, because apply() needs to stat it to decide
+        //    whether the mount point should be a file or a directory.
         for (const auto& m : d.mounts.mounts()) {
             std::string dst = std::string(kStageRoot) + path::normalize(m.dest);
             switch (m.kind) {
@@ -227,17 +241,27 @@ Result<Compiled> compile(const Policy<Sealed>& policy, const HostCapabilities& h
                     // not cover a nested userns.
                     flags |= kMsNosuid;
                     if (m.optional) flags |= kClayMountOptional;
-                    // the mount point must exist; a fresh tmpfs root is empty.
-                    b.op(OpCode::mkdir_p, MkdirOp{b.intern(dst), 0755, 0});
+                    // the mount point must exist AND be the same kind of thing
+                    // as the source: binding a file onto a directory fails with
+                    // ENOTDIR. we cannot stat at compile time (the plan may be
+                    // applied on another machine), so emit both and let the
+                    // apply step pick -- mkdir_p fails harmlessly if a file is
+                    // already there, and touch fails harmlessly if a directory
+                    // is. `bind_target` does exactly that.
+                    b.op(OpCode::bind_target,
+                         BindTargetOp{b.intern(m.source), b.intern(dst)});
                     b.op(OpCode::mount, MountOp{b.intern(m.source), b.intern(dst),
                                                 b.intern("none"), Ref{}, flags});
                     // a read-only bind needs a second remount: the kernel
                     // ignores MS_RDONLY on the initial bind, which is a
                     // notorious way to end up with a writable "read-only" mount.
+                    // the optional bit has to ride along, or a skipped bind is
+                    // followed by a remount of nothing and that fails hard.
                     if (m.kind == MountKind::bind_ro)
                         b.op(OpCode::mount,
                              MountOp{b.intern("none"), b.intern(dst), b.intern("none"), Ref{},
-                                     kMsBind | kMsRec | kMsRemount | kMsRdonly | kMsNosuid});
+                                     kMsBind | kMsRec | kMsRemount | kMsRdonly | kMsNosuid |
+                                         (m.optional ? kClayMountOptional : 0)});
                     break;
                 }
                 case MountKind::tmpfs: {
@@ -375,13 +399,18 @@ Result<Compiled> compile(const Policy<Sealed>& policy, const HostCapabilities& h
         // plan already describes exactly those, so fold its implied grants in
         // and let meet() keep whichever is tighter.
         FsAuthority effective = d.fs;
-        if (building_tree) {
+        if (!d.mounts.empty()) {
+            // the mount plan's other interpretation. on linux this is a second
+            // independent wall over the real tree; on a mountless host it is
+            // the only wall. same fold either way.
             FsAuthority implied = d.mounts.implied_authority();
-            // the new root itself needs to be listable, or readdir("/") fails
-            // and anything that walks the tree looks broken for no visible
-            // reason. it is a tmpfs containing only what we mounted, so this
-            // grants nothing the caller did not already ask for.
-            implied.grant("/", FileRights::read());
+            if (building_tree) {
+                // the new root itself needs to be listable, or readdir("/")
+                // fails and anything that walks the tree looks broken for no
+                // visible reason. it is a tmpfs containing only what we
+                // mounted, so this grants nothing the caller did not ask for.
+                implied.grant("/", FileRights::read());
+            }
             // if the caller said nothing about access, the mounts decide it.
             // otherwise intersect: a path must be both mounted AND granted.
             effective = d.fs.is_nothing() ? implied : d.fs.meet(implied);

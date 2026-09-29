@@ -51,6 +51,70 @@ constexpr const char* to_string(MountKind k) {
     return "?";
 }
 
+// ---------------------------------------------------------------------------
+// two interpretations
+//
+// a MountPlan is a FREE structure: an ordered sequence, with concatenation as
+// its only composition. it is deliberately not a lattice, because two trees do
+// not intersect in any meaningful way.
+//
+// what makes it portable is that it admits TWO interpretations (two folds):
+//
+//   to_tree(plan)       a filesystem construction    -- linux only
+//   to_authority(plan)  an FsAuthority               -- everywhere
+//
+// on linux we run both, and they check each other. on a host with no mount
+// namespaces only the second exists, and the question becomes: is the second
+// interpretation FAITHFUL to the first? that depends on the plan, and it is
+// decidable by looking at it.
+//
+// the deciding property is REMAPPING. `--ro-bind /usr /usr` says "this path
+// keeps its name", which an access-control backend can express exactly. but
+// `--ro-bind /opt/app /app` says "this path gets a NEW name", and no amount of
+// access control can rename a path. that is a mount-only capability.
+//
+// so fidelity is a property of the plan, computed once, and reported rather
+// than discovered at runtime on a user's machine.
+// ---------------------------------------------------------------------------
+
+enum class Fidelity : std::uint8_t {
+    // the access interpretation is EXACTLY the tree interpretation. every bind
+    // keeps its path, so "restrict to these subtrees" says the same thing as
+    // "build a tree from these subtrees". portable with full strength.
+    exact = 2,
+
+    // the access interpretation is a sound but weaker approximation. a tmpfs
+    // becomes "you may write here", losing the guarantees that it starts empty
+    // and is size-capped. nothing is granted that the tree would not have
+    // shown, so it is safe -- just less.
+    approximate = 1,
+
+    // no access-control interpretation exists. the plan renames paths or
+    // synthesizes entries, and neither is expressible without a real tree.
+    // a backend without mounts must REFUSE rather than pretend.
+    impossible = 0,
+};
+
+constexpr const char* to_string(Fidelity f) {
+    switch (f) {
+        case Fidelity::exact: return "exact";
+        case Fidelity::approximate: return "approximate";
+        case Fidelity::impossible: return "impossible";
+    }
+    return "?";
+}
+
+// fidelity is a meet: a plan is only as faithful as its least faithful mount.
+constexpr Fidelity meet(Fidelity a, Fidelity b) { return a < b ? a : b; }
+
+// why a particular mount limits the plan's fidelity, for an error message that
+// names the offending line rather than saying "unsupported".
+struct FidelityNote {
+    std::size_t index{0};
+    Fidelity fidelity{Fidelity::exact};
+    const char* reason{""};
+};
+
 struct Mount {
     MountKind kind{MountKind::bind_ro};
     std::string source;  // host path, or symlink target; empty for tmpfs/proc
@@ -116,12 +180,74 @@ class MountPlan {
     bool empty() const { return mounts_.empty(); }
     const std::vector<Mount>& mounts() const { return mounts_; }
 
+    // how faithfully a mountless backend can implement this plan, and why.
+    // computed as a fold, so adding a mount kind forces a decision here.
+    Fidelity fidelity(std::vector<FidelityNote>* notes = nullptr) const {
+        Fidelity acc = Fidelity::exact;
+        for (std::size_t i = 0; i < mounts_.size(); ++i) {
+            const Mount& m = mounts_[i];
+            Fidelity f = Fidelity::exact;
+            const char* why = "";
+
+            switch (m.kind) {
+                case MountKind::bind:
+                case MountKind::bind_ro:
+                case MountKind::bind_dev:
+                    // the whole question, in one comparison. same path in and
+                    // out means access control can say it; a rename cannot.
+                    if (path::normalize(m.source) != path::normalize(m.dest)) {
+                        f = Fidelity::impossible;
+                        why = "bind remaps a path; access control cannot rename";
+                    }
+                    break;
+                case MountKind::tmpfs:
+                    f = Fidelity::approximate;
+                    why = "tmpfs becomes a plain write grant: not empty, not size-capped";
+                    break;
+                case MountKind::proc:
+                    f = Fidelity::approximate;
+                    why = "procfs is linux-only; elsewhere there is simply no /proc";
+                    break;
+                case MountKind::devtmpfs:
+                    f = Fidelity::approximate;
+                    why = "device allowlist becomes a read grant on existing nodes";
+                    break;
+                case MountKind::mqueue:
+                    f = Fidelity::approximate;
+                    why = "posix mqueue is linux-only";
+                    break;
+                case MountKind::symlink:
+                    f = Fidelity::impossible;
+                    why = "creating a symlink would mutate the host filesystem";
+                    break;
+                case MountKind::dir:
+                    f = Fidelity::impossible;
+                    why = "creating a directory would mutate the host filesystem";
+                    break;
+            }
+
+            if (f != Fidelity::exact && notes) notes->push_back({i, f, why});
+            acc = clay::meet(acc, f);
+        }
+        return acc;
+    }
+
+    // shorthand: can a backend with no mount namespaces run this at all?
+    bool is_portable() const { return fidelity() != Fidelity::impossible; }
+
     // derive the landlock grants implied by this tree, so a caller who only
     // described mounts still gets the second wall for free. read-only binds
     // become read grants, read-write binds become write grants.
     //
-    // this is the bit that makes claybin strictly stronger than bwrap for the
-    // same input: the same description drives both mechanisms.
+    // this is the OTHER interpretation of the same value, and it is what makes
+    // the design cross-platform: on linux it is a second, independent wall
+    // layered over the real tree; on a host with no mount namespaces it is the
+    // only wall, and `fidelity()` says how much was lost getting there.
+    //
+    // SOUNDNESS: this must never grant a path the tree would not have shown.
+    // every grant is keyed on a mount's dest, so a path with no covering mount
+    // gets nothing -- which is the property tests/mount_algebra_test.cpp
+    // checks against random plans.
     FsAuthority implied_authority() const {
         FsAuthority fs;
         for (const auto& m : mounts_) {

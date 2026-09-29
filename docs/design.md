@@ -37,6 +37,49 @@ for every lattice type, with random samples:
 if a backend type breaks a law, the sandbox has a privilege bug. so the laws are
 tests, not comments.
 
+## the cross-platform problem, and the type-theoretic answer
+
+bubblewrap's model is mount namespaces, which only linux has. so "cross-platform
+bubblewrap" cannot mean "mounts everywhere". what saves it is that a mount plan
+is a **free structure** — an ordered sequence whose only composition is
+concatenation — and a free structure is defined by its interpretations.
+
+claybin gives `MountPlan` two:
+
+    to_tree(plan)       a filesystem construction     linux only
+    to_authority(plan)  an FsAuthority                everywhere
+
+on linux we evaluate both, and they become two independent walls that check each
+other. on a host with no mount namespaces only the second exists.
+
+that raises the real question, and it is the one most portable sandbox libraries
+get wrong by not asking: **is the second interpretation faithful to the first?**
+
+it depends on the plan, and it is decidable by looking at it. the deciding
+property is *remapping*:
+
+- `--ro-bind /usr /usr` says "this path keeps its name". access control can say
+  exactly that. `Fidelity::exact`.
+- `--tmpfs /tmp` becomes "you may write here", losing *starts empty* and
+  *size-capped*. sound but weaker: `Fidelity::approximate`.
+- `--ro-bind /opt/app /app` says "this path gets a NEW name". no access-control
+  system can rename a path. `Fidelity::impossible`.
+
+fidelity is itself a meet — a plan is only as faithful as its least faithful
+mount — so it composes like everything else here. `compile()` consults it and
+**refuses** on a mountless host rather than silently handing back less, naming
+the offending mount in the error.
+
+the soundness obligation is that `to_authority` never grants a path
+`to_tree` would not have made visible. that is a property, so it is
+property-tested against random plans rather than asserted in a comment
+(`tests/mount_algebra_test.cpp`).
+
+the practical payoff is in `shapes.hpp`: `system_ro`, `builder` and `strict` are
+written with same-path binds only, so they are `exact` and compile to a real
+sandbox on any backend. `app_container` remaps, so it is linux-only *by
+construction* and says so at compile time instead of at a user's runtime.
+
 ## typestate
 
 illegal states are unrepresentable, enforced by phantom phase tags:

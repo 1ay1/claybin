@@ -282,6 +282,41 @@ Status Plan::apply_range(Phase first, Phase last) const {
                     return die(Errc::io_error, "touch", errno);
                 return true;
             }
+            case OpCode::bind_target: {
+                BindTargetOp op{};
+                if (!decode(payload, op)) return die(Errc::invalid_policy, "bind_target", 0);
+                const char* src = cstr(op.source);
+                const char* dst = cstr(op.dest);
+                if (!src || !dst) return die(Errc::invalid_policy, "bind_target", 0);
+
+                // stat the SOURCE to decide what the mount point must be. a
+                // bind of a file onto a directory fails with ENOTDIR, and vice
+                // versa, so this cannot be decided at compile time -- the plan
+                // may well be applied on a different machine.
+                struct kstat {
+                    unsigned long st_dev, st_ino, st_nlink;
+                    unsigned int st_mode, st_uid, st_gid, _pad;
+                    unsigned long st_rdev, st_size;
+                    long _rest[11];
+                } st{};
+                char scratch[4096];
+                if (sys(SYS_newfstatat, AT_FDCWD, reinterpret_cast<long>(src),
+                        reinterpret_cast<long>(&st), 0) < 0) {
+                    // the source does not exist. make a directory and let the
+                    // mount itself fail (or be skipped, if optional).
+                    mkdir_p(dst, 0755, scratch, sizeof scratch);
+                    return true;
+                }
+                constexpr unsigned int kIfmt = 0170000, kIfdir = 0040000;
+                if ((st.st_mode & kIfmt) == kIfdir) {
+                    if (!mkdir_p(dst, 0755, scratch, sizeof scratch))
+                        return die(Errc::io_error, "bind_target: mkdir", errno);
+                } else {
+                    if (!touch_file(dst, 0600, scratch, sizeof scratch))
+                        return die(Errc::io_error, "bind_target: touch", errno);
+                }
+                return true;
+            }
             case OpCode::symlink_at: {
                 SymlinkOp op{};
                 if (!decode(payload, op)) return die(Errc::invalid_policy, "symlink", 0);
@@ -424,6 +459,18 @@ Status Plan::apply_range(Phase first, Phase last) const {
                 LandlockPathBeneathAttr attr{op.allowed, static_cast<std::int32_t>(fd)};
                 long rc = sys(kSysLandlockAddRule, ll_fd, kLandlockRuleTypePathBeneath,
                               reinterpret_cast<long>(&attr), 0);
+                if (rc < 0 && errno == EINVAL) {
+                    // landlock rejects directory-only rights on a regular file.
+                    // the compiler cannot know which a path is (the plan may be
+                    // applied elsewhere), so retry with the file-applicable
+                    // subset rather than failing the whole sandbox.
+                    constexpr std::uint64_t kFileOnly =
+                        (1ull << 0) | (1ull << 1) | (1ull << 2) | (1ull << 14);
+                    attr.allowed_access = op.allowed & kFileOnly;
+                    if (attr.allowed_access != 0)
+                        rc = sys(kSysLandlockAddRule, ll_fd, kLandlockRuleTypePathBeneath,
+                                 reinterpret_cast<long>(&attr), 0);
+                }
                 sys(SYS_close, fd);
                 if (rc < 0) return die(Errc::permission_denied, "landlock_add_rule", errno);
                 return true;

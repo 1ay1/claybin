@@ -81,6 +81,7 @@ enum class OpCode : std::uint16_t {
     mount,
     mkdir_p,        // create a mount point (and its parents) inside the new tree
     touch,          // create an empty file as a bind target for a device node
+    bind_target,    // create a mount point matching the SOURCE's kind (dir or file)
     symlink_at,     // /lib -> usr/lib, the usr-merge layout every distro needs
     pivot_root,
     umount,
@@ -104,6 +105,7 @@ constexpr Phase phase_of(OpCode c) {
         case OpCode::mount:
         case OpCode::mkdir_p:
         case OpCode::touch:
+        case OpCode::bind_target:
         case OpCode::symlink_at:
         case OpCode::pivot_root:
         case OpCode::umount: return Phase::mounts;
@@ -129,6 +131,7 @@ constexpr const char* to_string(OpCode c) {
         case OpCode::mount: return "mount";
         case OpCode::mkdir_p: return "mkdir_p";
         case OpCode::touch: return "touch";
+        case OpCode::bind_target: return "bind_target";
         case OpCode::symlink_at: return "symlink";
         case OpCode::pivot_root: return "pivot_root";
         case OpCode::umount: return "umount";
@@ -194,6 +197,14 @@ struct MkdirOp {
 struct SymlinkOp {
     Ref target;
     Ref linkpath;
+};
+// create a mount point whose KIND matches the source: a directory for a
+// directory, an empty regular file for a file. binding a file onto a directory
+// fails with ENOTDIR, and the source can only be stat'd on the machine that
+// applies the plan.
+struct BindTargetOp {
+    Ref source;
+    Ref dest;
 };
 struct UmountOp {
     Ref target;

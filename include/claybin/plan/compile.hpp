@@ -12,6 +12,7 @@
 #include "claybin/core/error.hpp"
 #include "claybin/core/witness.hpp"
 #include "claybin/plan/plan.hpp"
+#include "claybin/policy/mounts.hpp"
 #include "claybin/policy/policy.hpp"
 
 namespace clay {
@@ -53,6 +54,12 @@ struct Compiled {
     // silently empty: compile() fails outright when a policy demands strictness
     // the host cannot deliver.
     std::vector<CapId> degraded;
+
+    // how faithfully the mount plan survived. `exact` on any host with mount
+    // namespaces; on a host without them, it says whether the access-control
+    // interpretation was an exact stand-in or a weaker approximation. a plan
+    // that could not be approximated at all makes compile() fail instead.
+    Fidelity fidelity{Fidelity::exact};
 
     // assert a floor, and fail if the host did not reach it.
     //
