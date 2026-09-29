@@ -47,6 +47,10 @@ constexpr std::uint32_t kRlimitNproc = 6;
 // translate our portable rights to landlock's bits, clamped to what the host's
 // abi actually understands. asking for a bit the kernel does not know makes
 // landlock_create_ruleset fail outright, so clamping is required, not polite.
+//
+// the result is also masked against handled_access() by the caller: landlock
+// rejects a rule whose allowed_access is not a subset of the ruleset's handled
+// set, which is a very easy way to turn a working sandbox into a blanket deny.
 std::uint64_t to_landlock(FileRights r, std::uint32_t abi) {
     std::uint64_t out = 0;
     if (r.any(FileRights{FileRights::kExecute})) out |= kLlExecute;
@@ -68,6 +72,12 @@ std::uint64_t to_landlock(FileRights r, std::uint32_t abi) {
 
 // the full set of rights a ruleset governs, for this abi. anything not in here
 // is simply not mediated by landlock, so the report must not claim it is.
+//
+// IMPORTANT: we only ever ask for bits we actually know about. landlock keeps
+// adding access rights (abi 10 has several we do not model), and asking for a
+// bit the kernel does not know makes create_ruleset fail -- but under-asking is
+// safe, it just means those operations are unmediated. since our FileRights
+// vocabulary tops out at the abi-5 set, that is what we hand over.
 std::uint64_t handled_access(std::uint32_t abi) {
     std::uint64_t h = kLlExecute | kLlWriteFile | kLlReadFile | kLlReadDir | kLlRemoveDir |
                       kLlRemoveFile | kLlMakeChar | kLlMakeDir | kLlMakeReg | kLlMakeSock |
@@ -179,16 +189,37 @@ Result<Compiled> compile(const Policy<Sealed>& policy, const HostCapabilities& h
     // wall-clock is not a kernel mechanism at all: it needs a supervisor with a
     // timer, which is the loop's job. record nothing rather than imply we did.
 
+    // -- phase: privilege drop (BEFORE landlock) ---------------------------
+    // landlock_restrict_self and seccomp both require no_new_privs to already
+    // be set, so this phase has to come first. it fails with a bare EPERM
+    // otherwise, which is almost impossible to diagnose from the symptom.
+    if (host.no_new_privs) {
+        b.op(OpCode::no_new_privs, NoNewPrivsOp{0});
+        b.op(OpCode::drop_caps, DropCapsOp{0});
+        report.record(CapId::privilege_drop, Enforcement::strong, "no_new_privs+bounding-set");
+    } else {
+        degrade(CapId::privilege_drop);
+        // without nnp we cannot install landlock or seccomp at all, so nothing
+        // below would work either. say so rather than emitting a plan that is
+        // going to fail at apply() time.
+        return std::unexpected(
+            Error{Errc::unsupported, "no_new_privs required for landlock/seccomp"});
+    }
+
     // -- phase: landlock ---------------------------------------------------
     if (host.landlock_abi > 0) {
+        const std::uint64_t handled = handled_access(host.landlock_abi);
         const auto& grants = d.fs.grants();
         for (const auto& g : grants) {
-            std::uint64_t allowed = to_landlock(g.rights, host.landlock_abi);
+            // a rule may only allow what the ruleset handles. masking here
+            // rather than trusting the translation keeps a future FileRights
+            // bit from silently breaking every sandbox.
+            std::uint64_t allowed = to_landlock(g.rights, host.landlock_abi) & handled;
             if (allowed == 0) continue;  // a pure deny needs no rule: absence is denial
             b.op(OpCode::landlock_rule, LandlockRuleOp{b.intern(g.path), allowed});
         }
         b.op(OpCode::landlock_enforce,
-             LandlockEnforceOp{handled_access(host.landlock_abi), 0, host.landlock_abi, 0});
+             LandlockEnforceOp{handled, 0, host.landlock_abi, 0});
 
         report.record(CapId::fs_read, Enforcement::strong, "landlock");
         report.record(CapId::fs_write, Enforcement::strong, "landlock");
@@ -197,18 +228,6 @@ Result<Compiled> compile(const Policy<Sealed>& policy, const HostCapabilities& h
         degrade(CapId::fs_read);
         degrade(CapId::fs_write);
         degrade(CapId::fs_exec);
-    }
-
-    // -- phase: privilege drop --------------------------------------------
-    // no_new_privs must precede seccomp: the kernel requires it for an
-    // unprivileged filter, and without it an suid binary re-grants privilege
-    // across exec. the phase ordering in plan.hpp makes this structural.
-    if (host.no_new_privs) {
-        b.op(OpCode::no_new_privs, NoNewPrivsOp{0});
-        b.op(OpCode::drop_caps, DropCapsOp{0});
-        report.record(CapId::privilege_drop, Enforcement::strong, "no_new_privs+bounding-set");
-    } else {
-        degrade(CapId::privilege_drop);
     }
 
     // -- phase: seccomp (last wall) ---------------------------------------

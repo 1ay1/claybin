@@ -108,9 +108,15 @@ struct PolicyData {
 template <>
 class Policy<Draft> {
   public:
-    // a fresh draft is bottom: no filesystem, no network, no syscalls beyond the
-    // base profile, nothing. you build *up* from nothing, explicitly.
-    Policy() { data_.resources = ResourceLimits::nothing(); }
+    // a fresh draft grants no AUTHORITY: no filesystem, no network, no
+    // syscalls beyond what a profile adds. you build up from nothing.
+    //
+    // resources are deliberately NOT bottom. a limit is a ceiling, so the
+    // lattice bottom is 0, and 0 means "cannot allocate a single page" --
+    // RLIMIT_AS=0 makes execve fail with EACCES before the program ever runs.
+    // bottom is the right identity for permissions and the wrong default for
+    // ceilings, so a draft starts unlimited and the caller tightens explicitly.
+    Policy() { data_.resources = ResourceLimits::everything(); }
 
     // -- filesystem ---------------------------------------------------------
     Policy&& read(std::string_view p) && {

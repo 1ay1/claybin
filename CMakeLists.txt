@@ -13,6 +13,9 @@ add_library(claybin STATIC
   src/plan/compile.cpp
   src/plan/probe.cpp
 )
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+  target_sources(claybin PRIVATE src/linux/apply.cpp src/linux/spawn.cpp)
+endif()
 target_include_directories(claybin PUBLIC include)
 target_compile_options(claybin PRIVATE
   -Wall -Wextra -Wconversion -Wshadow -Wold-style-cast
@@ -42,4 +45,7 @@ if(CLAYBIN_TESTS)
   claybin_test(policy_typestate_test)
   claybin_test(readme_example_test)
   claybin_test(plan_test)
+  if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    claybin_test(escape_test)
+  endif()
 endif()

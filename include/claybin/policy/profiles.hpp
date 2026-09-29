@@ -17,6 +17,13 @@ namespace clay::profiles {
 // the bare minimum for a dynamically linked program to start, run, and exit.
 // anything that cannot be justified as "libc needs this before main" belongs in
 // a more specific profile, not here.
+//
+// NOTE: there is deliberately no execve here. that means a policy using bare
+// base() cannot be handed to spawn(), because spawn's own execve would be the
+// first thing the filter denies -- you get EPERM from execve and it looks like
+// the sandbox is broken. use with_processes() or compiler() when the sandboxed
+// program is launched by exec, which is almost always. base() is for a process
+// that sandboxes ITSELF after it is already running.
 inline SyscallPolicy base() {
     SyscallPolicy p;
     p.set_default(SysAction::errno_, 1 /* EPERM */);
@@ -88,7 +95,8 @@ inline SyscallPolicy base() {
     return p;
 }
 
-// base plus threads and subprocesses.
+// base plus threads and subprocesses. this is the smallest profile that works
+// with spawn(), because it is the first one that allows execve.
 inline SyscallPolicy with_processes() {
     SyscallPolicy p = base();
     for (SysNr nr : {56u /* clone */, 57u /* fork */, 58u /* vfork */, 59u /* execve */,
@@ -98,6 +106,9 @@ inline SyscallPolicy with_processes() {
 }
 
 // base plus the filesystem calls a compiler or build tool needs.
+//
+// like base(), this has no execve: it is for a process restricting itself. if
+// you are going to spawn() into it, use compiler() instead.
 inline SyscallPolicy with_filesystem() {
     SyscallPolicy p = base();
     for (SysNr nr : {2u /* open */, 4u /* stat */, 6u /* lstat */, 21u /* access */,

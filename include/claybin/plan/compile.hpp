@@ -53,6 +53,26 @@ struct Compiled {
     // silently empty: compile() fails outright when a policy demands strictness
     // the host cannot deliver.
     std::vector<CapId> degraded;
+
+    // assert a floor, and fail if the host did not reach it.
+    //
+    // this is the difference between api portability and security portability.
+    // the same policy compiles on linux, windows and macOS, but the walls you
+    // actually get differ. a program that genuinely needs a syscall filter
+    // should refuse to run where there is none rather than run unprotected, and
+    // this is how it says so:
+    //
+    //   auto ok = c->require(Enforcement::strong,
+    //                        {CapId::fs_read, CapId::syscall_filter});
+    //
+    // on macOS that fails, because seccomp has no equivalent there.
+    Status require(Enforcement floor, std::initializer_list<CapId> caps) const {
+        for (CapId id : caps) {
+            if (guarantees.strength(id) < floor)
+                return std::unexpected(Error{Errc::unsupported, cap_name(id)});
+        }
+        return {};
+    }
 };
 
 // compile a sealed policy for a given host.

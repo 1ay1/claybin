@@ -53,14 +53,19 @@ static_assert(!std::is_default_constructible_v<Witness<cap::NetworkIsolation>>);
 static_assert(!std::is_constructible_v<Witness<cap::NetworkIsolation>, Enforcement, const char*>);
 
 int main() {
-    // -- a fresh draft is bottom, not "whatever the host allows" -----------
+    // -- a fresh draft grants no authority ---------------------------------
     {
         auto p = Policy<Draft>{}.seal();
         CHECK(p.data().fs.is_nothing());
         CHECK(p.data().net.is_nothing());
-        CHECK(p.data().resources.memory.is_nothing());
         CHECK(p.data().env_cleared);
         CHECK(p.data().syscalls.default_action() == SysAction::kill_process);
+        // resources are the exception, and it matters: a limit is a ceiling, so
+        // lattice-bottom is 0, and RLIMIT_AS=0 means the child cannot map a
+        // page -- execve fails with EACCES before main(). bottom is right for
+        // permissions and wrong for ceilings.
+        CHECK(p.data().resources.memory.is_unlimited());
+        CHECK(p.data().resources.pids.is_unlimited());
     }
 
     // -- the builder chain -------------------------------------------------

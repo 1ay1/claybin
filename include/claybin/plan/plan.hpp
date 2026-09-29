@@ -36,8 +36,12 @@ namespace clay {
 //   - mounts must happen after the namespaces that contain them
 //   - landlock must come after mounts, or it locks down a tree that is about
 //     to be replaced
-//   - no_new_privs must precede seccomp (the kernel requires it for an
-//     unprivileged filter, and without it an suid exec re-grants privilege)
+//   - no_new_privs must precede BOTH landlock and seccomp. the kernel requires
+//     it for landlock_restrict_self and for an unprivileged seccomp filter, and
+//     without it an suid exec re-grants privilege across the wall we just
+//     built. this cost an afternoon: landlock_restrict_self returns EPERM with
+//     no explanation when nnp is unset, which surfaces later as an EACCES from
+//     execve and looks exactly like a missing path grant.
 //   - seccomp goes LAST, because a filter that denies mount/openat would
 //     otherwise block the rest of our own setup
 //
@@ -51,8 +55,8 @@ enum class Phase : std::uint8_t {
     mounts = 1,      // mount, pivot_root, umount
     fds = 2,         // dup2, close_range
     process = 3,     // hostname, chdir, rlimits, uid/gid
-    landlock = 4,    // filesystem/network restriction
-    privdrop = 5,    // capability drop, no_new_privs
+    privdrop = 4,    // no_new_privs, capability drop -- REQUIRED before landlock
+    landlock = 5,    // filesystem/network restriction
     seccomp = 6,     // the last wall
     count_,
 };
@@ -63,8 +67,8 @@ constexpr const char* to_string(Phase p) {
         case Phase::mounts: return "mounts";
         case Phase::fds: return "fds";
         case Phase::process: return "process";
-        case Phase::landlock: return "landlock";
         case Phase::privdrop: return "privdrop";
+        case Phase::landlock: return "landlock";
         case Phase::seccomp: return "seccomp";
         case Phase::count_: break;
     }

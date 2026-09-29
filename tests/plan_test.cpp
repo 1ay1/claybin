@@ -52,12 +52,22 @@ int main() {
         CHECK(plan.error().code == Errc::invalid_policy);
     }
     {
+        // landlock before no_new_privs is also backwards, and this one is
+        // subtle: landlock_restrict_self returns a bare EPERM when nnp is
+        // unset, which surfaces much later as EACCES from execve.
+        PlanBuilder b;
+        b.op(OpCode::landlock_enforce, LandlockEnforceOp{0, 0, 1, 0});
+        b.op(OpCode::no_new_privs, NoNewPrivsOp{0});
+        auto plan = std::move(b).build();
+        CHECK(!plan.has_value());
+    }
+    {
         // and the right order builds fine
         PlanBuilder b;
         b.op(OpCode::unshare, UnshareOp{0});
         b.op(OpCode::chdir, ChdirOp{b.intern("/")});
-        b.op(OpCode::landlock_enforce, LandlockEnforceOp{0, 0, 1, 0});
         b.op(OpCode::no_new_privs, NoNewPrivsOp{0});
+        b.op(OpCode::landlock_enforce, LandlockEnforceOp{0, 0, 1, 0});
         b.op(OpCode::seccomp_install, SeccompInstallOp{Ref{0, 0}, 0, 0});
         auto plan = std::move(b).build();
         CHECK(plan.has_value());
@@ -67,10 +77,11 @@ int main() {
 
     // -- phase_of covers every opcode with the right wall order -----------
     CHECK(phase_of(OpCode::unshare) < phase_of(OpCode::mount));
-    CHECK(phase_of(OpCode::mount) < phase_of(OpCode::landlock_enforce));
-    CHECK(phase_of(OpCode::landlock_enforce) < phase_of(OpCode::no_new_privs));
-    // the two that matter most: nnp before seccomp, seccomp dead last.
-    CHECK(phase_of(OpCode::no_new_privs) < phase_of(OpCode::seccomp_install));
+    CHECK(phase_of(OpCode::mount) < phase_of(OpCode::no_new_privs));
+    // the three that matter most, in the order the kernel demands:
+    // nnp -> landlock -> seccomp.
+    CHECK(phase_of(OpCode::no_new_privs) < phase_of(OpCode::landlock_enforce));
+    CHECK(phase_of(OpCode::landlock_enforce) < phase_of(OpCode::seccomp_install));
     for (auto c : {OpCode::unshare, OpCode::mount, OpCode::dup2, OpCode::chdir,
                    OpCode::landlock_rule, OpCode::drop_caps})
         CHECK(phase_of(c) <= phase_of(OpCode::seccomp_install));
