@@ -1,3 +1,9 @@
 build/
 compile_commands.json
 .cache/
+
+# agent state. never commit: the rag index embeds learned memory, which can
+# contain credentials and host details that have nothing to do with this repo.
+.agentty/
+.agents/
+.claude/
