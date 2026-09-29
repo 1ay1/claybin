@@ -131,6 +131,59 @@ check "unshare-net kills connectivity" \
 check "unshare-pid gives us a fresh pid space" \
     $BASE --unshare-pid --proc /proc --chdir / -- /bin/sh -c 'ls /proc | grep -c "^1$"'
 
+# ---- overlays ----------------------------------------------------------------
+# these need scratch directories, so they are set up and torn down here rather
+# than assumed to exist.
+OVL_LOWER=$(mktemp -d)
+OVL_LOWER2=$(mktemp -d)
+OVL_UPPER=$(mktemp -d)
+OVL_WORK=$(mktemp -d)
+echo "from-lower" > "$OVL_LOWER/a.txt"
+echo "from-lower2" > "$OVL_LOWER2/b.txt"
+
+check "tmp-overlay reads the lower layer" \
+    $BASE --overlay-src "$OVL_LOWER" --tmp-overlay /data --chdir / \
+    -- /bin/sh -c 'cat /data/a.txt'
+check "tmp-overlay accepts writes" \
+    $BASE --overlay-src "$OVL_LOWER" --tmp-overlay /data --chdir / \
+    -- /bin/sh -c 'echo x > /data/new && ls /data'
+check "ro-overlay merges two layers" \
+    $BASE --overlay-src "$OVL_LOWER" --overlay-src "$OVL_LOWER2" --ro-overlay /data \
+    --chdir / -- /usr/bin/ls /data
+check "ro-overlay rejects writes" \
+    $BASE --overlay-src "$OVL_LOWER" --overlay-src "$OVL_LOWER2" --ro-overlay /data \
+    --chdir / -- /usr/bin/touch /data/x
+check "writable overlay merges" \
+    $BASE --bind "$OVL_UPPER" "$OVL_UPPER" --bind "$OVL_WORK" "$OVL_WORK" \
+    --overlay-src "$OVL_LOWER" --overlay "$OVL_UPPER" "$OVL_WORK" /data \
+    --chdir / -- /usr/bin/ls /data
+
+# the tmp-overlay's whole point: the host must be untouched afterwards.
+$CLAY $BASE --overlay-src "$OVL_LOWER" --tmp-overlay /data --chdir / \
+    -- /bin/sh -c 'echo leaked > /data/leaked.txt' >/dev/null 2>&1
+if [ -e "$OVL_LOWER/leaked.txt" ]; then
+    FAIL=$((FAIL+1))
+    printf '  FAIL  tmp-overlay leaked a write to the host lower layer\n'
+else
+    PASS=$((PASS+1))
+    printf '  ok    tmp-overlay discards writes (host untouched)\n'
+fi
+
+rm -rf "$OVL_LOWER" "$OVL_LOWER2" "$OVL_UPPER" "$OVL_WORK"
+
+# ---- the newer flags ---------------------------------------------------------
+check "argv0 override" \
+    $BASE --argv0 myname --chdir / -- /bin/sh -c 'echo $0'
+check "new-session" \
+    $BASE --new-session --chdir / -- /usr/bin/true
+check "die-with-parent" \
+    $BASE --die-with-parent --chdir / -- /usr/bin/true
+check "hostname is accepted" \
+    $BASE --unshare-uts --hostname sandbox1 --chdir / -- /usr/bin/true
+check "unsetenv" \
+    $BASE --setenv KEEP yes --setenv DROP no --unsetenv DROP --chdir / \
+    -- /bin/sh -c 'echo "$KEEP-$DROP"'
+
 # ---- claybin is deliberately stricter ---------------------------------------
 check_stricter "--not-a-security-boundary" \
     $BASE --not-a-security-boundary --chdir / -- /usr/bin/true

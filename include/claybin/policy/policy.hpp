@@ -80,6 +80,15 @@ struct PolicyData {
     std::string hostname{"sandbox"};
     std::string workdir{"/"};
 
+    // setsid() before exec, so the guest gets its own session and cannot reach
+    // the host's controlling terminal via TIOCSTI keystroke injection -- a real
+    // escape when the sandbox shares a tty with an interactive shell.
+    bool new_session{false};
+
+    // PR_SET_PDEATHSIG, so an orphaned sandbox dies with its supervisor rather
+    // than surviving as a stray process nobody is watching.
+    bool die_with_parent{false};
+
     PolicyData meet(const PolicyData& o) const {
         PolicyData r;
         r.fs = fs.meet(o.fs);
@@ -108,6 +117,10 @@ struct PolicyData {
                 if (a.key == b.key && a.value == b.value) r.env.push_back(a);
         r.hostname = hostname;
         r.workdir = workdir;
+        // both are hardening, so the meet takes whichever side asked for them:
+        // composing policies must not be able to turn a protection off.
+        r.new_session = new_session || o.new_session;
+        r.die_with_parent = die_with_parent || o.die_with_parent;
         return r;
     }
 
@@ -219,6 +232,26 @@ class Policy<Draft> {
         return std::move(*this);
     }
 
+    // overlays. the lower layers are a required argument rather than accumulated
+    // state, so an overlay with no layers is not representable -- bwrap can only
+    // catch that at runtime.
+    Policy&& overlay(std::vector<std::string> lowers, std::string upper, std::string work,
+                     std::string dst) && {
+        data_.mounts.overlay(std::move(lowers), std::move(upper), std::move(work),
+                             std::move(dst));
+        return std::move(*this);
+    }
+    // the useful one for untrusted builds: the guest may write anywhere in the
+    // tree and every change is discarded when the sandbox exits.
+    Policy&& tmp_overlay(std::vector<std::string> lowers, std::string dst) && {
+        data_.mounts.tmp_overlay(std::move(lowers), std::move(dst));
+        return std::move(*this);
+    }
+    Policy&& ro_overlay(std::vector<std::string> lowers, std::string dst) && {
+        data_.mounts.ro_overlay(std::move(lowers), std::move(dst));
+        return std::move(*this);
+    }
+
     // -- network ------------------------------------------------------------
     Policy&& connect(std::string host, std::uint16_t port) && {
         data_.net.allow(std::move(host), port, kNetConnect);
@@ -288,6 +321,23 @@ class Policy<Draft> {
     }
     Policy&& workdir(std::string p) && {
         data_.workdir = path::normalize(p);
+        return std::move(*this);
+    }
+    Policy&& hostname(std::string h) && {
+        data_.hostname = std::move(h);
+        return std::move(*this);
+    }
+    // give the guest its own session. this is a real security measure, not
+    // cosmetics: sharing a controlling terminal with the host lets a guest
+    // inject keystrokes into it with TIOCSTI.
+    Policy&& new_session() && {
+        data_.new_session = true;
+        return std::move(*this);
+    }
+    // die when the supervisor does, so an orphaned sandbox cannot outlive the
+    // thing that was supposed to be watching it.
+    Policy&& die_with_parent() && {
+        data_.die_with_parent = true;
         return std::move(*this);
     }
     Policy&& isolation(Isolation lvl) && {

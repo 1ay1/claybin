@@ -206,5 +206,65 @@ int main() {
         }
     }
 
+    // -- overlays are IMPOSSIBLE to approximate ----------------------------
+    // an overlay merges several directories into one view. that is a new
+    // namespace, not a restriction of an existing one, so there is no host path
+    // whose contents are the merged view and no access-control system can
+    // synthesize one. `impossible`, not `approximate`.
+    {
+        MountPlan p;
+        p.tmp_overlay({"/usr", "/etc"}, "/data");
+        std::vector<FidelityNote> notes;
+        CHECK(p.fidelity(&notes) == Fidelity::impossible);
+        CHECK(!p.is_portable());
+        CHECK(!notes.empty());
+    }
+    {
+        MountPlan p;
+        p.ro_overlay({"/usr", "/etc"}, "/data");
+        CHECK(p.fidelity() == Fidelity::impossible);
+    }
+    {
+        MountPlan p;
+        p.overlay({"/usr"}, "/tmp/up", "/tmp/wk", "/data");
+        CHECK(p.fidelity() == Fidelity::impossible);
+    }
+
+    // -- but the implied authority is still SOUND --------------------------
+    // even though we cannot reproduce the view, the grant we derive must not
+    // over-promise: a writable overlay is writable at its dest and says nothing
+    // about anything else.
+    {
+        MountPlan p;
+        p.tmp_overlay({"/usr", "/etc"}, "/data");
+        FsAuthority fs = p.implied_authority();
+        CHECK(fs.effective("/data").subsumes(FileRights::write()));
+        CHECK(fs.effective("/data/sub/deep").subsumes(FileRights::write()));
+        // the LOWER layers are not granted at their host paths: the guest sees
+        // them only through /data, and granting /usr would be a real widening.
+        CHECK(fs.effective("/usr").is_nothing());
+        CHECK(fs.effective("/etc").is_nothing());
+    }
+    {
+        // a read-only overlay must not imply write
+        MountPlan p;
+        p.ro_overlay({"/usr", "/etc"}, "/data");
+        FsAuthority fs = p.implied_authority();
+        CHECK(fs.effective("/data").subsumes(FileRights::read()));
+        CHECK(!fs.effective("/data").subsumes(FileRights::write()));
+    }
+
+    // -- an overlay makes a whole plan unportable --------------------------
+    // fidelity is a meet, so one overlay is enough to sink an otherwise exact
+    // plan. that is the point: compile() then refuses on a mountless host
+    // rather than handing back something that is not an overlay at all.
+    {
+        MountPlan p;
+        p.bind_ro("/usr", "/usr");          // exact on its own
+        CHECK(p.fidelity() == Fidelity::exact);
+        p.tmp_overlay({"/etc"}, "/data");   // and now it is not
+        CHECK(p.fidelity() == Fidelity::impossible);
+    }
+
     return finish("mount_algebra_test");
 }

@@ -21,6 +21,7 @@
 #if defined(__linux__)
 
 #include <cerrno>
+#include <csignal>
 #include <fcntl.h>
 #include <linux/filter.h>
 #include <linux/seccomp.h>
@@ -637,6 +638,23 @@ Status Plan::apply_range(Phase first, Phase last) const {
                 if (!p) return die(Errc::invalid_policy, "chdir", 0);
                 if (sys(SYS_chdir, reinterpret_cast<long>(p)) < 0)
                     return die(Errc::io_error, "chdir", errno);
+                return true;
+            }
+            case OpCode::new_session: {
+                // setsid detaches us from the controlling terminal. it fails with
+                // EPERM if we are already a process group leader, which is
+                // harmless -- we are then already in our own session.
+                sys(SYS_setsid);
+                return true;
+            }
+            case OpCode::die_with_parent: {
+                // PR_SET_PDEATHSIG fires when our PARENT dies, so it has to be
+                // set in the process that is actually the supervisor's child.
+                // spawn() forks a shepherd for the pid namespace, so this is set
+                // in the grandchild and tracks the shepherd -- which is what we
+                // want: if the shepherd goes, nothing is watching the sandbox.
+                if (::prctl(PR_SET_PDEATHSIG, SIGKILL, 0, 0, 0) < 0)
+                    return die(Errc::io_error, "die_with_parent", errno);
                 return true;
             }
             case OpCode::set_rlimit: {

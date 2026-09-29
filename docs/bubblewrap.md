@@ -51,12 +51,39 @@ and an escape needs to beat both.
 and requires identical guest-observable behaviour: same stdout, same exit code.
 it is wired into ctest and skips itself when bwrap is not installed.
 
-**25/25 passing** as of this writing, covering the tree layout (including hidden
+**36/36 passing** as of this writing, covering the tree layout (including hidden
 entries, so no staging directory may leak), what must be unreachable, path
-remapping, env handling, try-variants, exit-code fidelity, and namespaces.
+remapping, all three overlay kinds, env handling, try-variants, exit-code
+fidelity, namespaces, and `--argv0`/`--new-session`/`--die-with-parent`.
 
 stderr is deliberately not compared: the two tools word diagnostics differently
 and always will. what has to match is what the *guest* sees.
+
+### overlays
+
+all three kinds work and match bwrap exactly:
+
+| flag | upper layer | writes |
+|---|---|---|
+| `--overlay UP WORK DST` | the given directory | persist to the host |
+| `--tmp-overlay DST` | a fresh tmpfs we mount | discarded at exit |
+| `--ro-overlay DST` | none | refused (`EROFS`) |
+
+two details cost real time and are worth writing down:
+
+- **`userxattr` is mandatory in a user namespace.** without it overlayfs tries
+  to use `trusted.*` xattrs, which need `CAP_SYS_ADMIN` in the *init* namespace,
+  and the mount fails with a bare `EPERM`.
+- **layer paths need escaping.** the layers are a `:`-separated list inside a
+  comma-separated option string, so a path containing `:` or `,` silently
+  becomes two layers. claybin escapes both.
+
+the API differs from bwrap's here, deliberately. bwrap spells an overlay as
+accumulated state — `--overlay-src A --overlay-src B --overlay UP WORK DST` —
+and an `--overlay` with no preceding `--overlay-src` is an error it can only
+catch at runtime. in the library the layers are a **required argument**, so an
+overlay with no layers is not a representable state. the CLI still accepts
+bwrap's spelling and buffers the sources before calling the builder.
 
 ## what reading the bubblewrap source fixed
 
@@ -113,23 +140,29 @@ and fails in practice.
 
 ## what is still missing
 
-not yet implemented, and `--audit` says so rather than pretending:
+not implemented, and every one of them is *refused* rather than ignored where
+silently ignoring it would change the security outcome:
 
-- `--overlay` / `--ro-overlay` / `--tmp-overlay` (overlayfs mounts)
-- `--seccomp FD` / `--add-seccomp-fd` (we compile our own filter; accepting a
-  foreign BPF program is planned)
-- `--bind-data` / `--ro-bind-data` / `--file` (writing a file from an fd)
-- `--bind-fd` / `--ro-bind-fd` (binding by fd rather than path)
+- `--seccomp FD` / `--add-seccomp-fd` — **refused loudly.** claybin compiles its
+  own filter, and accepting the flag while running a different filter than the
+  caller supplied would be the worst possible failure. use `--profile`.
+- `--bind-data` / `--ro-bind-data` / `--file` — writing a file from an fd
+- `--bind-fd` / `--ro-bind-fd` — binding by fd rather than path
 - `--uid` / `--gid` beyond identity mapping
-- `--userns` / `--userns2` / `--pidns` (joining an existing namespace by fd)
-- `--new-session` (setsid)
-- `--die-with-parent`, `--as-pid-1`, `--lock-file`, `--sync-fd`
-- `--exec-label` / `--file-label` (SELinux)
-- `--chmod`, `--perms`, `--remount-ro`
-- `--json-status-fd` / `--info-fd`
+- `--userns` / `--userns2` / `--pidns` / `--userns-block-fd` — joining an
+  existing namespace by fd
+- `--cap-add` / `--cap-drop` — we drop the whole bounding set unconditionally
+- `--exec-label` / `--file-label` — SELinux
+- `--chmod` / `--perms` — parsed, not yet applied
+- `--as-pid-1`, `--lock-file`, `--sync-fd`, `--block-fd`, `--args`
+- `--info-fd` / `--json-status-fd` — machine-readable status
+- `--mqueue` — refused rather than ignored
+- `--disable-userns` / `--assert-userns-disabled`
 
-the overlay flags and `--seccomp FD` are the two that matter for flatpak. the
-rest are either niche or trivially addable.
+43 of bubblewrap's 68 flags are handled explicitly, plus every `--unshare-*`
+variant by prefix. the gap is mostly fd-passing and namespace-joining, which
+matter for flatpak's own supervisor but not for running a sandbox from a command
+line.
 
 ## the setuid question
 

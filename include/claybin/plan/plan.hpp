@@ -98,6 +98,8 @@ enum class OpCode : std::uint16_t {
     close_range,
     set_hostname,
     chdir,
+    new_session,      // setsid: detach from the host's controlling terminal
+    die_with_parent,  // PR_SET_PDEATHSIG, so an orphan cannot linger
     set_rlimit,
     set_ids,
     landlock_rule,
@@ -124,6 +126,8 @@ constexpr Phase phase_of(OpCode c) {
         case OpCode::close_range: return Phase::fds;
         case OpCode::set_hostname:
         case OpCode::chdir:
+        case OpCode::new_session:
+        case OpCode::die_with_parent:
         case OpCode::set_rlimit:
         case OpCode::set_ids: return Phase::process;
         case OpCode::landlock_rule:
@@ -152,6 +156,8 @@ constexpr const char* to_string(OpCode c) {
         case OpCode::close_range: return "close_range";
         case OpCode::set_hostname: return "set_hostname";
         case OpCode::chdir: return "chdir";
+        case OpCode::new_session: return "new_session";
+        case OpCode::die_with_parent: return "die_with_parent";
         case OpCode::set_rlimit: return "set_rlimit";
         case OpCode::set_ids: return "set_ids";
         case OpCode::landlock_rule: return "landlock_rule";

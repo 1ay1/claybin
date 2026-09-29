@@ -208,6 +208,10 @@ Result<Compiled> compile(const Policy<Sealed>& policy, const HostCapabilities& h
     }
 
     if (building_tree) {
+        // counts tmp_overlay scratch areas, so each gets its own tmpfs rather
+        // than sharing one and leaking changes between overlays.
+        std::size_t ovl_index = 0;
+
         // 1. mark everything SLAVE, not private.
         //
         //    slave means we still RECEIVE mounts from the host but never
@@ -372,6 +376,66 @@ Result<Compiled> compile(const Policy<Sealed>& policy, const HostCapabilities& h
                 }
                 case MountKind::mqueue:
                     break;
+
+                case MountKind::overlay:
+                case MountKind::tmp_overlay:
+                case MountKind::ro_overlay: {
+                    // overlayfs takes its layers as a comma-separated option
+                    // string, so a layer path containing a comma or a colon has
+                    // to be escaped or the kernel parses it as a separator and
+                    // silently mounts the wrong thing.
+                    auto esc = [](const std::string& p) {
+                        std::string o;
+                        for (char c : p) {
+                            if (c == ',' || c == ':' || c == '\\') o.push_back('\\');
+                            o.push_back(c);
+                        }
+                        return o;
+                    };
+
+                    std::string opts = "lowerdir=";
+                    bool first = true;
+                    for (const auto& l : m.lowers) {
+                        if (!first) opts += ":";
+                        first = false;
+                        opts += esc(l);
+                    }
+
+                    if (m.kind == MountKind::overlay) {
+                        opts += ",upperdir=" + esc(m.source);
+                        opts += ",workdir=" + esc(m.workdir);
+                    } else if (m.kind == MountKind::tmp_overlay) {
+                        // the upper and work layers live on a tmpfs we mount
+                        // ourselves, so every change the guest makes is
+                        // discarded when the sandbox exits. the tmpfs has to be
+                        // mounted BEFORE the overlay that uses it.
+                        std::string scratch = std::string(kStageBase) + "/ovl" +
+                                              std::to_string(ovl_index);
+                        b.op(OpCode::mkdir_p, MkdirOp{b.intern(scratch), 0755, 0});
+                        b.op(OpCode::mount,
+                             MountOp{b.intern("tmpfs"), b.intern(scratch), b.intern("tmpfs"),
+                                     Ref{}, kMsNosuid | kMsNodev});
+                        b.op(OpCode::mkdir_p, MkdirOp{b.intern(scratch + "/upper"), 0755, 0});
+                        b.op(OpCode::mkdir_p, MkdirOp{b.intern(scratch + "/work"), 0755, 0});
+                        opts += ",upperdir=" + esc(scratch + "/upper");
+                        opts += ",workdir=" + esc(scratch + "/work");
+                        ++ovl_index;
+                    }
+                    // ro_overlay gets no upperdir at all, which is what makes
+                    // the merged view unwritable.
+
+                    // userxattr is REQUIRED in a user namespace: without it the
+                    // kernel tries to use trusted.* xattrs, which need
+                    // CAP_SYS_ADMIN in the init namespace, and the mount fails
+                    // with EPERM for no visible reason.
+                    opts += ",userxattr";
+
+                    b.op(OpCode::mkdir_p, MkdirOp{b.intern(dst), 0755, 0});
+                    b.op(OpCode::mount,
+                         MountOp{b.intern("overlay"), b.intern(dst), b.intern("overlay"),
+                                 b.intern(opts), kMsNosuid | kMsNodev});
+                    break;
+                }
             }
         }
 
@@ -394,6 +458,15 @@ Result<Compiled> compile(const Policy<Sealed>& policy, const HostCapabilities& h
     // -- phase: process ----------------------------------------------------
     if (host.uts_namespaces && !d.hostname.empty())
         b.op(OpCode::set_hostname, SetHostnameOp{b.intern(d.hostname)});
+
+    // a new session detaches the guest from the host's controlling terminal.
+    // that is not cosmetic: a guest sharing a tty can inject keystrokes into it
+    // with TIOCSTI, which is a genuine escape when the host side is a shell.
+    if (d.new_session) b.op(OpCode::new_session, NoNewPrivsOp{0});
+
+    // and this makes an orphaned sandbox die rather than linger unsupervised.
+    if (d.die_with_parent) b.op(OpCode::die_with_parent, NoNewPrivsOp{0});
+
     b.op(OpCode::chdir, ChdirOp{b.intern(d.workdir)});
 
     // rlimits are a coarse backstop and nothing more. RLIMIT_AS caps address

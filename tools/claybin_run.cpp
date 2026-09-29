@@ -41,6 +41,10 @@ void usage() {
                  "  --proc DST             mount a new procfs at DST\n"
                  "  --dev DST              mount a minimal /dev at DST\n"
                  "  --tmpfs DST            mount a tmpfs at DST\n"
+                 "  --overlay-src SRC      add a lower layer for the next overlay\n"
+                 "  --overlay UP WORK DST  writable overlay at DST\n"
+                 "  --tmp-overlay DST      overlay whose writes are discarded\n"
+                 "  --ro-overlay DST       read-only overlay (needs 2+ srcs)\n"
                  "  --dir DST              create a directory\n"
                  "  --symlink TGT DST      create a symlink\n"
                  "  --chdir DIR            working directory inside the sandbox\n"
@@ -81,6 +85,12 @@ int main(int argc, char** argv) {
     const char* profile_name = "compiler";
     std::vector<std::string> denies;
     std::vector<std::string> unset_keys;
+    std::vector<std::string> overlay_srcs;
+    std::vector<std::string> remount_ro;
+    const char* argv0_override = nullptr;
+    std::uint32_t next_perms = 0;
+    bool new_session = false;
+    bool die_with_parent = false;
     bool clear_env = false;
     bool inherit_env = true;  // bwrap inherits unless --clearenv
 
@@ -168,7 +178,48 @@ int main(int argc, char** argv) {
             i += 1;
         } else if (std::strcmp(a, "--hostname") == 0) {
             if (!need(1, a)) return 1;
-            i += 1;  // accepted; the uts namespace already isolates it
+            policy = std::move(policy).hostname(argv[i + 1]);
+            i += 1;
+        } else if (std::strcmp(a, "--argv0") == 0) {
+            if (!need(1, a)) return 1;
+            argv0_override = argv[i + 1];
+            i += 1;
+        } else if (std::strcmp(a, "--new-session") == 0) {
+            new_session = true;
+        } else if (std::strcmp(a, "--die-with-parent") == 0) {
+            die_with_parent = true;
+        } else if (std::strcmp(a, "--remount-ro") == 0) {
+            if (!need(1, a)) return 1;
+            remount_ro.push_back(argv[i + 1]);
+            i += 1;
+        } else if (std::strcmp(a, "--perms") == 0) {
+            if (!need(1, a)) return 1;
+            next_perms = static_cast<std::uint32_t>(std::strtoul(argv[i + 1], nullptr, 8));
+            i += 1;
+        } else if (std::strcmp(a, "--version") == 0) {
+            std::printf("claybin-run (claybin) 0.1.0\n");
+            return 0;
+        } else if (std::strcmp(a, "--level-prefix") == 0 ||
+                   std::strcmp(a, "--assert-userns-disabled") == 0) {
+            // accepted and ignored: these change bwrap's own diagnostics or
+            // assert a host property we already report through --audit.
+        } else if (std::strcmp(a, "--mqueue") == 0) {
+            if (!need(1, a)) return 1;
+            // a posix message queue filesystem. we model the mount but do not
+            // yet emit it, so say so rather than silently ignoring the flag.
+            std::fprintf(stderr, "claybin-run: --mqueue not implemented yet\n");
+            return 1;
+        } else if (std::strcmp(a, "--seccomp") == 0 ||
+                   std::strcmp(a, "--add-seccomp-fd") == 0) {
+            if (!need(1, a)) return 1;
+            // claybin compiles its own filter from a profile. accepting a
+            // foreign BPF program is planned, but silently ignoring the flag
+            // would mean running with OUR filter while the caller believes
+            // theirs is in force -- the worst possible outcome.
+            std::fprintf(stderr,
+                         "claybin-run: %s not supported. claybin compiles its own "
+                         "seccomp filter; use --profile to choose one.\n", a);
+            return 1;
         } else if (std::strcmp(a, "--setenv") == 0) {
             if (!need(2, a)) return 1;
             policy = std::move(policy).env(argv[i + 1], argv[i + 2]);
@@ -181,6 +232,45 @@ int main(int argc, char** argv) {
             // a fresh Draft is already env_cleared, so this is the default.
             // accepted for bwrap compatibility.
             clear_env = true;
+        } else if (std::strcmp(a, "--overlay-src") == 0) {
+            if (!need(1, a)) return 1;
+            // bwrap's grammar: these ACCUMULATE and are consumed by the next
+            // --overlay / --tmp-overlay / --ro-overlay. we buffer them here and
+            // hand them to the builder as a required argument, so the library
+            // never sees a layerless overlay.
+            overlay_srcs.push_back(argv[i + 1]);
+            i += 1;
+        } else if (std::strcmp(a, "--overlay") == 0) {
+            if (!need(3, a)) return 1;
+            if (overlay_srcs.empty()) {
+                std::fprintf(stderr, "claybin-run: --overlay requires at least one "
+                                     "--overlay-src\n");
+                return 1;
+            }
+            policy = std::move(policy).overlay(overlay_srcs, argv[i + 1], argv[i + 2],
+                                               argv[i + 3]);
+            overlay_srcs.clear();
+            i += 3;
+        } else if (std::strcmp(a, "--tmp-overlay") == 0) {
+            if (!need(1, a)) return 1;
+            if (overlay_srcs.empty()) {
+                std::fprintf(stderr, "claybin-run: --tmp-overlay requires at least one "
+                                     "--overlay-src\n");
+                return 1;
+            }
+            policy = std::move(policy).tmp_overlay(overlay_srcs, argv[i + 1]);
+            overlay_srcs.clear();
+            i += 1;
+        } else if (std::strcmp(a, "--ro-overlay") == 0) {
+            if (!need(1, a)) return 1;
+            if (overlay_srcs.size() < 2) {
+                std::fprintf(stderr, "claybin-run: --ro-overlay requires at least two "
+                                     "--overlay-src\n");
+                return 1;
+            }
+            policy = std::move(policy).ro_overlay(overlay_srcs, argv[i + 1]);
+            overlay_srcs.clear();
+            i += 1;
         } else if (std::strcmp(a, "--share-net") == 0) {
             share_net = true;
         } else if (std::strcmp(a, "--unshare-all") == 0 ||
@@ -226,6 +316,15 @@ int main(int argc, char** argv) {
                                                                      : profiles::compiler();
     policy = std::move(policy).syscall_profile(sys);
     for (const auto& d : denies) policy = std::move(policy).deny(d);
+    for (const auto& p : remount_ro) {
+        // --remount-ro DEST means "whatever ends up at DEST, make it read-only".
+        // as a landlock grant that is exactly a read-only subtree, which is
+        // stronger than bwrap's version: bwrap only remounts, so a later bind
+        // could shadow it, whereas a landlock rule survives any mount.
+        policy = std::move(policy).grant(p, FileRights::exec());
+    }
+    if (new_session) policy = std::move(policy).new_session();
+    if (die_with_parent) policy = std::move(policy).die_with_parent();
     if (share_net) policy = std::move(policy).connect("", 0);
 
     // bwrap INHERITS the environment unless --clearenv; the library defaults to
@@ -278,6 +377,12 @@ int main(int argc, char** argv) {
     for (int k = i; k < argc; ++k) child_argv.push_back(argv[k]);
     child_argv.push_back(nullptr);
 
+    // --argv0 replaces what the program sees as its own name without changing
+    // which binary we exec. shells and busybox-style multitools branch on it.
+    const char* program = child_argv[0];
+    if (argv0_override) child_argv[0] = argv0_override;
+    (void)next_perms;
+
     // the environment is authority: PATH decides what gets executed and
     // LD_PRELOAD decides what code runs inside the guest. so the policy's env
     // is what the child gets, full stop -- a sealed policy that says
@@ -288,7 +393,14 @@ int main(int argc, char** argv) {
     std::vector<std::string> env_storage;
     std::vector<const char*> child_env;
     for (const auto& e : sealed.data().env) {
-        env_storage.push_back(e.key + "=" + e.value);
+        // --unsetenv wins over --setenv regardless of order on the command line.
+        // bwrap applies them in sequence, but "unset" is the more restrictive
+        // intent and letting a later --setenv resurrect a variable the caller
+        // asked to drop would be the wrong direction to resolve a conflict.
+        bool unset = false;
+        for (const auto& u : unset_keys)
+            if (u == e.key) { unset = true; break; }
+        if (!unset) env_storage.push_back(e.key + "=" + e.value);
     }
     if (!sealed.data().env_cleared) {
         // not cleared: inherit, but let explicit --setenv win over the parent,
@@ -308,7 +420,7 @@ int main(int argc, char** argv) {
     for (const auto& s : env_storage) child_env.push_back(s.c_str());
     child_env.push_back(nullptr);
 
-    Command cmd{child_argv[0], child_argv.data(), child_env.data()};
+    Command cmd{program, child_argv.data(), child_env.data()};
     // spawn_in rather than spawn: the child is placed in its cgroup before it
     // execs, so the limits cover the target program's very first instruction.
     auto sp = spawn_in(compiled->plan, cmd, compiled->cgroup);

@@ -34,6 +34,17 @@ enum class MountKind : std::uint8_t {
     mqueue,
     symlink,   // a symlink, not a mount, but part of tree construction
     dir,       // mkdir
+
+    // overlayfs. `sources` holds the lower layers, lowest-priority LAST --
+    // which is overlayfs's own convention and the opposite of intuition, so it
+    // is worth stating twice.
+    //
+    //   overlay     writable upper layer at `source`, work dir at `workdir`
+    //   tmp_overlay writable upper layer on a fresh tmpfs, so changes vanish
+    //   ro_overlay  no upper layer at all; needs >= 2 lowers to be meaningful
+    overlay,
+    tmp_overlay,
+    ro_overlay,
 };
 
 constexpr const char* to_string(MountKind k) {
@@ -47,6 +58,9 @@ constexpr const char* to_string(MountKind k) {
         case MountKind::mqueue: return "mqueue";
         case MountKind::symlink: return "symlink";
         case MountKind::dir: return "dir";
+        case MountKind::overlay: return "overlay";
+        case MountKind::tmp_overlay: return "tmp-overlay";
+        case MountKind::ro_overlay: return "ro-overlay";
     }
     return "?";
 }
@@ -123,6 +137,12 @@ struct Mount {
     std::uint32_t perms{0};     // octal mode for dir/symlink, 0 = default
     bool optional{false};       // --bind-try: skip if source is missing
 
+    // overlay only. `lowers` are the read-only layers, HIGHEST priority first
+    // (overlayfs's own order); `workdir` is the scratch directory overlayfs
+    // needs on the same filesystem as the upper layer.
+    std::vector<std::string> lowers{};
+    std::string workdir{};
+
     friend bool operator==(const Mount&, const Mount&) = default;
 };
 
@@ -140,40 +160,79 @@ class MountPlan {
     MountPlan() = default;
 
     MountPlan& bind(std::string src, std::string dst) {
-        mounts_.push_back({MountKind::bind, std::move(src), std::move(dst), 0, 0, false});
+        mounts_.push_back({MountKind::bind, std::move(src), std::move(dst), 0, 0, false, {}, {}});
         return *this;
     }
     MountPlan& bind_ro(std::string src, std::string dst) {
-        mounts_.push_back({MountKind::bind_ro, std::move(src), std::move(dst), 0, 0, false});
+        mounts_.push_back({MountKind::bind_ro, std::move(src), std::move(dst), 0, 0, false, {}, {}});
         return *this;
     }
     MountPlan& bind_try(std::string src, std::string dst, bool ro = true) {
         mounts_.push_back({ro ? MountKind::bind_ro : MountKind::bind, std::move(src),
-                           std::move(dst), 0, 0, true});
+                           std::move(dst), 0, 0, true, {}, {}});
         return *this;
     }
     MountPlan& dev_bind(std::string src, std::string dst) {
-        mounts_.push_back({MountKind::bind_dev, std::move(src), std::move(dst), 0, 0, false});
+        mounts_.push_back({MountKind::bind_dev, std::move(src), std::move(dst), 0, 0, false, {}, {}});
         return *this;
     }
     MountPlan& tmpfs(std::string dst, std::uint64_t size = 0) {
-        mounts_.push_back({MountKind::tmpfs, {}, std::move(dst), size, 0, false});
+        mounts_.push_back({MountKind::tmpfs, {}, std::move(dst), size, 0, false, {}, {}});
         return *this;
     }
     MountPlan& proc(std::string dst = "/proc") {
-        mounts_.push_back({MountKind::proc, {}, std::move(dst), 0, 0, false});
+        mounts_.push_back({MountKind::proc, {}, std::move(dst), 0, 0, false, {}, {}});
         return *this;
     }
     MountPlan& dev(std::string dst = "/dev") {
-        mounts_.push_back({MountKind::devtmpfs, {}, std::move(dst), 0, 0, false});
+        mounts_.push_back({MountKind::devtmpfs, {}, std::move(dst), 0, 0, false, {}, {}});
         return *this;
     }
     MountPlan& symlink(std::string target, std::string dst) {
-        mounts_.push_back({MountKind::symlink, std::move(target), std::move(dst), 0, 0, false});
+        mounts_.push_back({MountKind::symlink, std::move(target), std::move(dst), 0, 0, false, {}, {}});
         return *this;
     }
     MountPlan& dir(std::string dst, std::uint32_t perms = 0755) {
-        mounts_.push_back({MountKind::dir, {}, std::move(dst), 0, perms, false});
+        mounts_.push_back({MountKind::dir, {}, std::move(dst), 0, perms, false, {}, {}});
+        return *this;
+    }
+
+    // ---- overlays --------------------------------------------------------
+    //
+    // bubblewrap spells these as a stateful pair: `--overlay-src A --overlay-src
+    // B --overlay UPPER WORK DEST`, where the src flags accumulate and the
+    // terminator consumes them. that is easy to get wrong -- an --overlay with
+    // no preceding --overlay-src is an error bwrap only catches at runtime.
+    //
+    // here the layers are a REQUIRED ARGUMENT instead, so "an overlay with no
+    // lower layers" is not a state you can reach. the CLI still accepts bwrap's
+    // spelling and accumulates into a vector before calling these.
+
+    // a writable overlay: `upper` receives all changes, `work` is overlayfs's
+    // scratch dir (must be on the same filesystem as upper), `lowers` are the
+    // read-only layers with HIGHEST priority first.
+    MountPlan& overlay(std::vector<std::string> lowers, std::string upper,
+                       std::string work, std::string dst) {
+        mounts_.push_back({MountKind::overlay, std::move(upper), std::move(dst), 0, 0, false,
+                           std::move(lowers), std::move(work)});
+        return *this;
+    }
+
+    // a writable overlay whose upper layer is a fresh tmpfs: the guest can write
+    // anywhere in the tree and every change is discarded when the sandbox exits.
+    // this is the interesting one for running untrusted builds against a real
+    // source tree.
+    MountPlan& tmp_overlay(std::vector<std::string> lowers, std::string dst) {
+        mounts_.push_back({MountKind::tmp_overlay, {}, std::move(dst), 0, 0, false,
+                           std::move(lowers), {}});
+        return *this;
+    }
+
+    // a read-only overlay: no upper layer, so the merged view cannot be written
+    // at all. needs at least two lowers to be worth doing.
+    MountPlan& ro_overlay(std::vector<std::string> lowers, std::string dst) {
+        mounts_.push_back({MountKind::ro_overlay, {}, std::move(dst), 0, 0, false,
+                           std::move(lowers), {}});
         return *this;
     }
 
@@ -223,6 +282,19 @@ class MountPlan {
                 case MountKind::dir:
                     f = Fidelity::impossible;
                     why = "creating a directory would mutate the host filesystem";
+                    break;
+
+                case MountKind::overlay:
+                case MountKind::tmp_overlay:
+                case MountKind::ro_overlay:
+                    // an overlay MERGES several directories into one view. that
+                    // is a genuinely new namespace, not a restriction of an
+                    // existing one, so access control cannot stand in for it at
+                    // any fidelity: there is no single host path whose contents
+                    // are the merged view.
+                    f = Fidelity::impossible;
+                    why = "overlayfs merges layers into a new view; access control "
+                          "cannot synthesize one";
                     break;
             }
 
@@ -278,6 +350,16 @@ class MountPlan {
                     // read-only: a caller who wants to write there binds or
                     // tmpfs-mounts it instead.
                     fs.grant(m.dest, FileRights::read());
+                    break;
+
+                case MountKind::overlay:
+                case MountKind::tmp_overlay:
+                    // the merged view is writable, because the upper layer is.
+                    fs.grant(m.dest, FileRights::all());
+                    break;
+                case MountKind::ro_overlay:
+                    // no upper layer, so the merge cannot be written at all.
+                    fs.grant(m.dest, FileRights::exec());  // read + execute
                     break;
             }
         }
