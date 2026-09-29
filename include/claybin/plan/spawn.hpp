@@ -12,6 +12,7 @@
 #include <string_view>
 
 #include "claybin/core/error.hpp"
+#include "claybin/linux/cgroup.hpp"
 #include "claybin/plan/plan.hpp"
 
 namespace clay {
@@ -35,6 +36,15 @@ struct Spawned {
 // rather than returning, because a child that survived a failed sandbox setup
 // is unconfined and must not run the target program.
 Result<Spawned> spawn(const Plan& plan, const Command& cmd);
+
+// same, but also move the child into `cg` before it execs.
+//
+// the cgroup write happens in the PARENT, between fork and exec: writing to
+// sysfs is not async-signal-safe, and after a pivot_root the child cannot even
+// see /sys/fs/cgroup any more. the child waits on a pipe until we say go, so
+// the limits are guaranteed to be in force before the target program's first
+// instruction.
+Result<Spawned> spawn_in(const Plan& plan, const Command& cmd, const cgroup::Group& cg);
 
 // exit codes the child uses to report setup failure. chosen high to avoid
 // colliding with ordinary program exits.

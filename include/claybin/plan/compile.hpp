@@ -11,6 +11,7 @@
 
 #include "claybin/core/error.hpp"
 #include "claybin/core/witness.hpp"
+#include "claybin/linux/cgroup.hpp"
 #include "claybin/plan/plan.hpp"
 #include "claybin/policy/mounts.hpp"
 #include "claybin/policy/policy.hpp"
@@ -27,19 +28,30 @@ struct HostCapabilities {
     bool uts_namespaces{false};
     bool seccomp{false};
     bool seccomp_user_notif{false};
-    bool cgroup_v2{false};
+
+    // NOT a bool. "cgroup2 is mounted" and "we can actually use it" are
+    // different facts: cgroup v2 refuses to enable controllers in a cgroup that
+    // holds processes, so a caller launched into a shared cgroup (a terminal,
+    // a desktop session) cannot get limits no matter what claybin does. the
+    // earlier bool version of this field is exactly how a library ends up
+    // claiming `strong` on memory while the write is going to fail.
+    cgroup::Availability cgroups{cgroup::Availability::absent};
+    bool cgroup_memory{false};
+    bool cgroup_pids{false};
+
     std::uint32_t landlock_abi{0};  // 0 = absent
     bool no_new_privs{false};
 
     static HostCapabilities none() { return {}; }
 
-    // a modern linux box. the reference target.
+    // a modern linux box in a delegated scope. the reference target.
     static HostCapabilities modern_linux() {
         HostCapabilities h;
         h.user_namespaces = h.mount_namespaces = h.pid_namespaces = true;
         h.net_namespaces = h.uts_namespaces = true;
         h.seccomp = h.seccomp_user_notif = true;
-        h.cgroup_v2 = true;
+        h.cgroups = cgroup::Availability::delegated;
+        h.cgroup_memory = h.cgroup_pids = true;
         h.landlock_abi = 5;
         h.no_new_privs = true;
         return h;
@@ -60,6 +72,14 @@ struct Compiled {
     // interpretation was an exact stand-in or a weaker approximation. a plan
     // that could not be approximated at all makes compile() fail instead.
     Fidelity fidelity{Fidelity::exact};
+
+    // the cgroup the child should join, if the host allowed one. empty when
+    // limits are rlimit-only, and the guarantee report says `partial` then.
+    //
+    // this lives outside the Plan on purpose: creating it involves sysfs writes
+    // that are not async-signal-safe, so it happens in the parent and the only
+    // post-fork work is one write of a pid.
+    cgroup::Group cgroup{};
 
     // assert a floor, and fail if the host did not reach it.
     //

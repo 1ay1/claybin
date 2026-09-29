@@ -37,6 +37,7 @@ void usage() {
                  "  --bind SRC DST         bind SRC at DST, read-write\n"
                  "  --dev-bind SRC DST     bind allowing device nodes\n"
                  "  --ro-bind-try SRC DST  like --ro-bind, skip if SRC is missing\n"
+                 "  --bind-try SRC DST     like --bind, skip if SRC is missing\n"
                  "  --proc DST             mount a new procfs at DST\n"
                  "  --dev DST              mount a minimal /dev at DST\n"
                  "  --tmpfs DST            mount a tmpfs at DST\n"
@@ -52,6 +53,8 @@ void usage() {
                  "claybin additions:\n"
                  "  --profile NAME         syscall profile: base|proc|fs|compiler\n"
                  "  --deny PATH            punch a landlock hole inside a bind\n"
+                 "  --memory BYTES         memory cap (cgroup2 when available)\n"
+                 "  --processes N          max processes (cgroup2 pids.max)\n"
                  "  --audit                print the guarantee report and exit\n"
                  "  --require LEVEL        fail unless every wall reaches LEVEL\n");
 }
@@ -114,6 +117,14 @@ int main(int argc, char** argv) {
             if (!need(2, a)) return 1;
             policy = std::move(policy).bind_try(argv[i + 1], argv[i + 2], true);
             i += 2;
+        } else if (std::strcmp(a, "--bind-try") == 0) {
+            if (!need(2, a)) return 1;
+            policy = std::move(policy).bind_try(argv[i + 1], argv[i + 2], false);
+            i += 2;
+        } else if (std::strcmp(a, "--dev-bind-try") == 0) {
+            if (!need(2, a)) return 1;
+            policy = std::move(policy).bind_try(argv[i + 1], argv[i + 2], false);
+            i += 2;
         } else if (std::strcmp(a, "--proc") == 0) {
             if (!need(1, a)) return 1;
             policy = std::move(policy).proc_fs(argv[i + 1]);
@@ -131,6 +142,14 @@ int main(int argc, char** argv) {
         } else if (std::strcmp(a, "--size") == 0) {
             if (!need(1, a)) return 1;
             next_size = std::strtoull(argv[i + 1], nullptr, 10);
+            i += 1;
+        } else if (std::strcmp(a, "--memory") == 0) {
+            if (!need(1, a)) return 1;
+            policy = std::move(policy).memory(Bytes{std::strtoull(argv[i + 1], nullptr, 10)});
+            i += 1;
+        } else if (std::strcmp(a, "--processes") == 0) {
+            if (!need(1, a)) return 1;
+            policy = std::move(policy).processes(std::strtoull(argv[i + 1], nullptr, 10));
             i += 1;
         } else if (std::strcmp(a, "--dir") == 0) {
             if (!need(1, a)) return 1;
@@ -242,7 +261,9 @@ int main(int argc, char** argv) {
     child_argv.push_back(nullptr);
 
     Command cmd{child_argv[0], child_argv.data(), nullptr};
-    auto sp = spawn(compiled->plan, cmd);
+    // spawn_in rather than spawn: the child is placed in its cgroup before it
+    // execs, so the limits cover the target program's very first instruction.
+    auto sp = spawn_in(compiled->plan, cmd, compiled->cgroup);
     if (!sp) {
         std::fprintf(stderr, "claybin-run: failed to start: %s (%.*s) errno=%d\n",
                      to_string(sp.error().code).data(),

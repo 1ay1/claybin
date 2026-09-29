@@ -14,7 +14,7 @@ add_library(claybin STATIC
   src/plan/probe.cpp
 )
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
-  target_sources(claybin PRIVATE src/linux/apply.cpp src/linux/spawn.cpp)
+  target_sources(claybin PRIVATE src/linux/apply.cpp src/linux/spawn.cpp src/linux/cgroup.cpp)
 endif()
 target_include_directories(claybin PUBLIC include)
 target_compile_options(claybin PRIVATE
@@ -55,5 +55,6 @@ if(CLAYBIN_TESTS)
   if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
     claybin_test(escape_test)
     claybin_test(mount_test)
+    claybin_test(cgroup_test)
   endif()
 endif()

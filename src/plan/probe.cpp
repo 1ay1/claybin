@@ -4,6 +4,8 @@
 // described kernel, this file is the only place that asks the real one.
 #include "claybin/plan/compile.hpp"
 
+#include "claybin/linux/cgroup.hpp"
+
 #if defined(__linux__)
 #include <cerrno>
 #include <cstdio>
@@ -72,7 +74,6 @@ bool probe_cgroup2() {
     struct stat st {};
     return ::stat("/sys/fs/cgroup/cgroup.controllers", &st) == 0;
 }
-
 bool probe_no_new_privs() {
     // reading the current value is harmless and tells us the knob exists.
     return ::prctl(PR_GET_NO_NEW_PRIVS, 0, 0, 0, 0) >= 0;
@@ -89,7 +90,16 @@ HostCapabilities probe_host() {
     h.uts_namespaces = path_exists("/proc/self/ns/uts");
     h.seccomp = probe_seccomp();
     h.seccomp_user_notif = h.seccomp && probe_user_notif();
-    h.cgroup_v2 = probe_cgroup2();
+
+    // cgroups need the full delegation probe, not a stat: whether we can
+    // actually create a limited cgroup depends on how our caller was launched.
+    if (probe_cgroup2()) {
+        auto cg = cgroup::probe();
+        h.cgroups = cg.availability;
+        h.cgroup_memory = cg.memory;
+        h.cgroup_pids = cg.pids;
+    }
+
     h.landlock_abi = probe_landlock_abi();
     h.no_new_privs = probe_no_new_privs();
     return h;

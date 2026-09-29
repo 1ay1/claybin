@@ -4,6 +4,7 @@
 
 #include <cstdio>
 
+#include "claybin/linux/cgroup.hpp"
 #include "claybin/plan/compile.hpp"
 #include "claybin/policy/profiles.hpp"
 
@@ -20,7 +21,11 @@ int main() {
     std::printf("  net ns         %s\n", h.net_namespaces ? "yes" : "no");
     std::printf("  seccomp        %s\n", h.seccomp ? "yes" : "no");
     std::printf("  user_notif     %s\n", h.seccomp_user_notif ? "yes" : "no");
-    std::printf("  cgroup v2      %s\n", h.cgroup_v2 ? "yes" : "no");
+    std::printf("  cgroup v2      %s\n", cgroup::to_string(h.cgroups));
+    if (h.cgroups != cgroup::Availability::delegated) {
+        auto cg = cgroup::probe();
+        if (cg.reason[0]) std::printf("                 %s\n", cg.reason);
+    }
     std::printf("  no_new_privs   %s\n", h.no_new_privs ? "yes" : "no");
     if (h.landlock_abi)
         std::printf("  landlock       abi %u\n", h.landlock_abi);

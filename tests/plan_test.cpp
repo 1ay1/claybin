@@ -123,11 +123,19 @@ int main() {
         CHECK(g.strength(CapId::syscall_filter) == Enforcement::strong);
         CHECK(g.strength(CapId::net_isolation) == Enforcement::strong);  // no net -> netns
         CHECK(g.strength(CapId::privilege_drop) == Enforcement::strong);
-        // rlimits are a backstop, not a real memory limit: RLIMIT_AS caps
-        // address space and RLIMIT_NPROC is per-UID. until the cgroup writes
-        // exist these must NOT claim strong.
-        CHECK(g.strength(CapId::mem_limit) == Enforcement::partial);
-        CHECK(g.strength(CapId::pid_limit) == Enforcement::partial);
+        // resource limits: `strong` only when a real cgroup was created, which
+        // depends on how THIS process was launched (cgroup v2 refuses to
+        // delegate out of a cgroup holding processes). so assert the invariant
+        // rather than a fixed value: strong iff we got a cgroup.
+        if (c->cgroup.valid()) {
+            CHECK(g.strength(CapId::mem_limit) == Enforcement::strong);
+            CHECK(g.strength(CapId::pid_limit) == Enforcement::strong);
+        } else {
+            // rlimits only: RLIMIT_AS caps address space and RLIMIT_NPROC is
+            // per-UID, so neither is a real per-sandbox cap.
+            CHECK(g.strength(CapId::mem_limit) == Enforcement::partial);
+            CHECK(g.strength(CapId::pid_limit) == Enforcement::partial);
+        }
         // the line that must never be wrong: a process backend shares the kernel
         CHECK(g.strength(CapId::host_kernel_isolation) == Enforcement::none);
         CHECK(!g.witness<cap::HostKernelIsolation>().has_value());
@@ -151,6 +159,8 @@ int main() {
         old_kernel.seccomp = true;
         old_kernel.no_new_privs = true;
         old_kernel.landlock_abi = 0;  // no landlock
+        // and no usable cgroups either
+        old_kernel.cgroups = cgroup::Availability::unusable;
 
         auto pol = Policy<Draft>{}
                        .read("/usr")
@@ -252,6 +262,29 @@ int main() {
             // reserved for a separate kernel.
             for (std::size_t i = 0; i < kCapCount; ++i)
                 CHECK(g.strength(static_cast<CapId>(i)) < Enforcement::isolated);
+        }
+    }
+
+    // -- a host with no usable cgroups must say `partial`, never `strong` ---
+    {
+        HostCapabilities shared = HostCapabilities::modern_linux();
+        shared.cgroups = cgroup::Availability::unusable;
+        shared.cgroup_memory = shared.cgroup_pids = false;
+
+        auto pol = Policy<Draft>{}
+                       .read("/usr")
+                       .memory(512_MB)
+                       .processes(64)
+                       .syscall_profile(profiles::base())
+                       .seal();
+        auto c = compile(pol, shared);
+        CHECK(c.has_value());
+        if (c) {
+            CHECK(!c->cgroup.valid());
+            // rlimits still go in, but the claim is honest about what they are
+            CHECK(c->guarantees.strength(CapId::mem_limit) == Enforcement::partial);
+            CHECK(c->guarantees.strength(CapId::pid_limit) == Enforcement::partial);
+            CHECK(c->plan.has(OpCode::set_rlimit));
         }
     }
 

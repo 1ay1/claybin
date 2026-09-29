@@ -13,6 +13,10 @@
 namespace clay {
 
 Result<Spawned> spawn(const Plan& plan, const Command& cmd) {
+    return spawn_in(plan, cmd, cgroup::Group{});
+}
+
+Result<Spawned> spawn_in(const Plan& plan, const Command& cmd, const cgroup::Group& cg) {
     if (!cmd.program || !cmd.argv)
         return std::unexpected(Error{Errc::invalid_policy, "spawn: no program"});
     if (!plan.well_ordered())
@@ -25,6 +29,18 @@ Result<Spawned> spawn(const Plan& plan, const Command& cmd) {
     int report[2] = {-1, -1};
     if (::pipe2(report, O_CLOEXEC) < 0)
         return std::unexpected(Error{Errc::spawn_failed, "pipe2", errno});
+
+    // a second pipe, the other direction: the child blocks on it until the
+    // parent has put it in the cgroup. without this gate the child could exec
+    // and start allocating before its memory limit exists, which would make the
+    // limit advisory rather than enforced.
+    int gate[2] = {-1, -1};
+    const bool use_cgroup = cg.valid();
+    if (use_cgroup && ::pipe2(gate, O_CLOEXEC) < 0) {
+        ::close(report[0]);
+        ::close(report[1]);
+        return std::unexpected(Error{Errc::spawn_failed, "pipe2 gate", errno});
+    }
 
     // CLONE_PIDFD gives us a race-free handle on the child. without it, a pid
     // can be reused between exit and wait, and we would be signalling a
@@ -45,6 +61,10 @@ Result<Spawned> spawn(const Plan& plan, const Command& cmd) {
         if (pid < 0) {
             ::close(report[0]);
             ::close(report[1]);
+            if (use_cgroup) {
+                ::close(gate[0]);
+                ::close(gate[1]);
+            }
             return std::unexpected(Error{Errc::spawn_failed, "fork", errno});
         }
     }
@@ -56,6 +76,7 @@ Result<Spawned> spawn(const Plan& plan, const Command& cmd) {
         // into the caller's stack frame with a half-built sandbox in place,
         // which is the one outcome worse than failing to start.
         ::close(report[0]);
+        if (use_cgroup) ::close(gate[1]);
 
         struct Failure {
             int stage;  // 0 = plan, 1 = exec
@@ -63,6 +84,16 @@ Result<Spawned> spawn(const Plan& plan, const Command& cmd) {
             int sys_errno;
             char mech[32];
         } f{};
+
+        // wait for the parent to put us in our cgroup. a single byte, or EOF if
+        // the parent gave up. this must happen BEFORE any of the sandbox setup
+        // that allocates, so the memory cap covers everything we do.
+        if (use_cgroup) {
+            char go = 0;
+            ssize_t got = ::read(gate[0], &go, 1);
+            ::close(gate[0]);
+            if (got != 1) ::_exit(kExitPlanFailed);
+        }
 
         // the pid namespace needs a fork to ENTER: unshare(CLONE_NEWPID) puts
         // our children inside it and leaves us outside, and mounting procfs
@@ -122,6 +153,30 @@ Result<Spawned> spawn(const Plan& plan, const Command& cmd) {
 
     // ---- parent ----
     ::close(report[1]);
+
+    // put the child in its cgroup, then release it. doing this here rather than
+    // in the child is what keeps the post-fork path free of sysfs work.
+    if (use_cgroup) {
+        ::close(gate[0]);
+        auto att = cg.attach(static_cast<int>(pid));
+        if (!att) {
+            // could not enforce the limits we promised. kill the child rather
+            // than run it unlimited: it has not exec'd yet, so nothing of the
+            // caller's program has run.
+            ::close(gate[1]);
+            ::kill(static_cast<pid_t>(pid), SIGKILL);
+            int st = 0;
+            ::waitpid(static_cast<pid_t>(pid), &st, 0);
+            ::close(report[0]);
+            if (pidfd >= 0) ::close(pidfd);
+            return std::unexpected(att.error());
+        }
+        char go = 1;
+        ssize_t w = ::write(gate[1], &go, 1);
+        (void)w;
+        ::close(gate[1]);
+    }
+
     struct Failure {
         int stage, code, sys_errno;
         char mech[32];

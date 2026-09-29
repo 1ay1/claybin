@@ -343,23 +343,44 @@ Result<Compiled> compile(const Policy<Sealed>& policy, const HostCapabilities& h
     b.op(OpCode::chdir, ChdirOp{b.intern(d.workdir)});
 
     // rlimits are a coarse backstop and nothing more. RLIMIT_AS caps address
-    // space, not resident memory, so a policy that says "512 MB" is not really
-    // enforced until the cgroup writes exist. until then the report says
-    // `partial` and names rlimit, because claiming cgroup enforcement we never
-    // emitted is exactly the lie this report exists to prevent.
+    // space, not resident memory, so it is a floor under the cgroup, not a
+    // substitute for it. we set both when we can.
     const auto& r = d.resources;
     auto rlimit = [&](std::uint32_t res, std::uint64_t v) {
         b.op(OpCode::set_rlimit, SetRlimitOp{res, 0, v, v});
     };
+
+    // try for a real cgroup first, because whether we get one decides what the
+    // report may claim.
+    bool have_cgroup = false;
+    if (host.cgroups == cgroup::Availability::delegated &&
+        (!r.memory.is_unlimited() || !r.pids.is_unlimited())) {
+        auto g = cgroup::create(cgroup::probe(), r, "box");
+        if (g) {
+            out.cgroup = std::move(*g);
+            have_cgroup = out.cgroup.valid();
+        }
+        // a failure here is not fatal: rlimits still apply and the report will
+        // say `partial` rather than `strong`. but we must not pretend.
+    }
+
     if (!r.memory.is_unlimited()) {
         rlimit(kRlimitAs, r.memory.value());
-        report.record(CapId::mem_limit, Enforcement::partial, "rlimit-as");
+        if (have_cgroup && host.cgroup_memory)
+            // memory.max plus memory.swap.max=0: a cap that swap can defeat is
+            // not a cap.
+            report.record(CapId::mem_limit, Enforcement::strong, "cgroup2 memory.max");
+        else
+            report.record(CapId::mem_limit, Enforcement::partial, "rlimit-as");
     }
     if (!r.pids.is_unlimited()) {
         rlimit(kRlimitNproc, r.pids.value());
-        // RLIMIT_NPROC is per-UID, not per-sandbox: another process running as
-        // the same user counts against it. genuinely partial.
-        report.record(CapId::pid_limit, Enforcement::partial, "rlimit-nproc");
+        if (have_cgroup && host.cgroup_pids)
+            report.record(CapId::pid_limit, Enforcement::strong, "cgroup2 pids.max");
+        else
+            // RLIMIT_NPROC is per-UID, not per-sandbox: another process running
+            // as the same user counts against it. genuinely partial.
+            report.record(CapId::pid_limit, Enforcement::partial, "rlimit-nproc");
     }
     if (!r.open_files.is_unlimited()) rlimit(kRlimitNofile, r.open_files.value());
     if (!r.core_size.is_unlimited()) rlimit(kRlimitCore, r.core_size.value());
