@@ -8,8 +8,12 @@ it is **not** a runtime and it owns no loop. supervising a sandboxed process is
 an event-loop job, and that job belongs to [jaal](https://github.com/1ay1/jaal).
 see [docs/jaal.md](docs/jaal.md).
 
-status: early. the algebra, the typestate, and the seccomp compiler are real and
-tested. the linux mechanism installers are next.
+> **Status: early, and not ready to secure anything.** the policy algebra, the
+> typestate and the seccomp compiler are built and tested. the mechanisms that
+> actually enforce a policy — landlock, namespaces, cgroups — are not written
+> yet, so today claybin can *describe* and *compile* a sandbox but cannot put
+> one around a process. don't use it as a security boundary. it has not been
+> audited or reviewed.
 
 ```cpp
 #include <claybin/policy/policy.hpp>
@@ -17,17 +21,20 @@ tested. the linux mechanism installers are next.
 using namespace clay;
 using namespace clay::literals;
 
-auto policy = Policy{}
+auto policy = Policy<Draft>{}
     .read("/usr")
     .read_write("/workspace")
     .memory(512_MB)
     .processes(64)
     .wall_clock(30_s)
-    .seal();
+    .seal();            // consumes the draft; nothing can widen it now
 
 // composition is intersection. this can only ever be more restrictive.
-auto tighter = policy & profiles::minimal();
+auto tighter = policy & other_policy;
 ```
+
+(that example is [a test](tests/readme_example_test.cpp), so it cannot drift
+from the api.)
 
 ## why it is different
 
@@ -48,8 +55,14 @@ see [docs/design.md](docs/design.md).
 
 ## build
 
+no dependencies beyond a c++23 compiler and cmake.
+
 ```sh
 cmake -B build -DCMAKE_BUILD_TYPE=RelWithDebInfo
 cmake --build build -j
 ctest --test-dir build --output-on-failure
 ```
+
+## license
+
+MIT
