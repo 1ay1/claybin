@@ -7,7 +7,9 @@
 #include <cstring>
 
 #if defined(__linux__)
+#include <cstdlib>
 #include <fcntl.h>
+#include <sys/stat.h>
 #include <sys/wait.h>
 #include <unistd.h>
 #endif
@@ -216,6 +218,118 @@ int main(int argc, char** argv) {
     // a read-only bind must actually be read-only. the kernel ignores MS_RDONLY
     // on the initial bind, so this catches a missing remount.
     expect("usr_readonly", 1, "ro-bind must reject writes");
+
+    // ---- the symlink escape --------------------------------------------
+    //
+    // this one is not about what the GUEST can do -- it is about what claybin
+    // itself does while building the tree, before the guest exists.
+    //
+    // --file and --bind-data materialise a caller's fd at a guest path. that
+    // path is under our staging root, but the directories along the way can come
+    // from a bind the caller also asked for, and a symlink planted in one of
+    // those redirects the write. measured before the fix: a bind of a directory
+    // containing `out -> /tmp/victim` plus `--file 9 /work/out/canary` wrote the
+    // bytes to /tmp/victim/canary, on the HOST, outside the sandbox. bubblewrap
+    // refuses the same invocation.
+    //
+    // so the assertion is that setup FAILS. a test that spawns and inspects the
+    // guest cannot see this: by the time the guest runs, the damage is done and
+    // the guest's own view looks perfectly normal.
+    {
+        char dir[] = "/tmp/clay-symlink-XXXXXX";
+        if (::mkdtemp(dir) != nullptr) {
+            char evil[256], victim[256], canary[256], payload[256];
+            std::snprintf(evil, sizeof evil, "%s/evil", dir);
+            std::snprintf(victim, sizeof victim, "%s/victim", dir);
+            std::snprintf(canary, sizeof canary, "%s/victim/canary", dir);
+            std::snprintf(payload, sizeof payload, "%s/payload", dir);
+            ::mkdir(evil, 0755);
+            ::mkdir(victim, 0755);
+
+            // the canary the escape would overwrite, and the bytes it would use
+            static constexpr char kCanary[] = "UNTOUCHED";
+            int fd = ::open(canary, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+            CHECK(fd >= 0);
+            if (fd >= 0) {
+                ssize_t wr = ::write(fd, kCanary, sizeof kCanary - 1);
+                (void)wr;
+                ::close(fd);
+            }
+            fd = ::open(payload, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+            if (fd >= 0) {
+                ssize_t wr = ::write(fd, "PWNED", 5);
+                (void)wr;
+                ::close(fd);
+            }
+
+            // the trap: a symlink inside the directory that gets bound in,
+            // pointing back out at the victim.
+            char link[256];
+            std::snprintf(link, sizeof link, "%s/out", evil);
+            CHECK_EQ(::symlink(victim, link), 0);
+
+            int content = ::open(payload, O_RDONLY | O_CLOEXEC);
+            CHECK(content >= 0);
+            if (content >= 0) {
+                auto pol = Policy<Draft>{}
+                               .ro_bind("/usr", "/usr")
+                               .bind_try("/lib", "/lib")
+                               .bind_try("/lib64", "/lib64")
+                               .bind_try("/bin", "/bin")
+                               .bind(evil, "/work")
+                               .proc_fs("/proc")
+                               .dev_fs("/dev")
+                               .file_from_fd(BorrowedFd{content}, "/work/out/canary")
+                               .workdir("/")
+                               .syscall_profile(profiles::compiler())
+                               .seal();
+
+                auto c = compile(pol, probe_host());
+                CHECK(c.has_value());
+                if (c) {
+                    const char* av[] = {"/bin/true", nullptr};
+                    Command cmd{"/bin/true", av, nullptr};
+                    auto s = spawn(c->plan, cmd);
+                    if (s) {
+                        int st = 0;
+                        ::waitpid(s->pid, &st, 0);
+                        if (s->pidfd >= 0) ::close(s->pidfd);
+                        // setup must NOT have succeeded quietly. the child exits
+                        // with kExitPlanFailed when an op refuses.
+                        int code = WIFEXITED(st) ? WEXITSTATUS(st) : -1;
+                        if (code != kExitPlanFailed)
+                            std::fprintf(stderr,
+                                         "  symlink escape: setup did not refuse (exit %d)\n",
+                                         code);
+                        CHECK_EQ(code, kExitPlanFailed);
+                    }
+                }
+                ::close(content);
+            }
+
+            // whatever happened, the host file must be untouched. this is the
+            // check that actually matters -- the exit code is a proxy for it.
+            char buf[64] = {};
+            fd = ::open(canary, O_RDONLY);
+            if (fd >= 0) {
+                ssize_t n = ::read(fd, buf, sizeof buf - 1);
+                if (n < 0) n = 0;
+                buf[n] = '\0';
+                ::close(fd);
+            }
+            if (std::strcmp(buf, kCanary) != 0)
+                std::fprintf(stderr, "  *** ESCAPED: host file now reads '%s'\n", buf);
+            CHECK_EQ(std::strcmp(buf, kCanary), 0);
+
+            // tidy up
+            ::unlink(link);
+            ::unlink(canary);
+            ::unlink(payload);
+            ::rmdir(evil);
+            ::rmdir(victim);
+            ::rmdir(dir);
+        }
+    }
 
 #else
     (void)argc;

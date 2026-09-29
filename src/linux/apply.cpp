@@ -89,6 +89,159 @@ std::size_t cstr_len(const char* s) {
     return n;
 }
 
+// ---- confined path resolution -----------------------------------------
+//
+// openat2's struct and flags. declared here rather than included because
+// <linux/openat2.h> is not present on every build host, and this is a stable
+// kernel ABI.
+struct OpenHow {
+    std::uint64_t flags;
+    std::uint64_t mode;
+    std::uint64_t resolve;
+};
+constexpr long kSysOpenat2 = 437;
+// confine resolution to below the dirfd. this rejects absolute paths, ".."
+// climbs, and any symlink whose target leaves the subtree -- while still
+// allowing ordinary nested paths and symlinks that stay inside.
+constexpr std::uint64_t kResolveBeneath = 0x08;
+constexpr std::uint64_t kResolveNoMagiclinks = 0x02;
+
+// open a path that is INSIDE THE GUEST TREE, with resolution confined to it.
+//
+// this is the fix for a real escape. the ops that materialise a caller's file
+// into the tree -- touch, and write_fd_content for --file/--bind-data -- used to
+// resolve their destination with plain openat, which follows symlinks. the
+// destination is under our staging root, but the directories along the way can
+// belong to a bind the guest controls, so a symlink planted there redirects the
+// write anywhere on the host. measured before the fix: binding a directory
+// containing `out -> /tmp/victim` and asking for --file /work/out/canary wrote
+// the caller's bytes to /tmp/victim/canary, outside the sandbox. bubblewrap
+// refuses the same invocation.
+//
+// RESOLVE_BENEATH rather than RESOLVE_NO_SYMLINKS: the latter also rejects
+// harmless symlinks in the middle of a legitimate path, and rather than
+// RESOLVE_IN_ROOT, which silently RE-ROOTS an escaping path instead of failing.
+// failing is what we want -- a policy that cannot be honoured exactly should
+// stop, not be quietly reinterpreted.
+//
+// `root_fd` must be an O_PATH fd for the tree root; `rel` is the path with the
+// root prefix stripped, so it is relative and BENEATH can apply.
+//
+// returns -1 with errno set. ENOSYS means the kernel predates openat2 (5.6), and
+// the caller decides what to do about that -- see confined_or_plain_open.
+long open_beneath(int root_fd, const char* rel, std::uint64_t flags, std::uint32_t mode) {
+    OpenHow how{};
+    how.flags = flags;
+    how.mode = mode;
+    how.resolve = kResolveBeneath | kResolveNoMagiclinks;
+    return sys(kSysOpenat2, root_fd, reinterpret_cast<long>(rel),
+               reinterpret_cast<long>(&how), sizeof how);
+}
+
+// the staging root every guest path lives under. it has to be known here so a
+// destination can be split into "the root we trust" and "the relative part the
+// guest may have influenced" -- only the second half needs confining, and
+// RESOLVE_BENEATH needs a relative path to work on.
+//
+// kept in step with compile.cpp's kNewRoot by a static check in the test, not by
+// hope: if the two ever disagree, confinement silently stops applying because
+// the prefix no longer matches.
+constexpr const char* kGuestRoot = "/tmp/.clay/newroot";
+
+// strip the staging-root prefix, yielding a path relative to it. returns null if
+// `path` is not under the root, which is the caller's signal that confinement
+// does not apply and the path is one of OUR OWN (the staging scratch files).
+const char* relative_to_guest_root(const char* path) {
+    std::size_t i = 0;
+    for (; kGuestRoot[i] != '\0'; ++i)
+        if (path[i] != kGuestRoot[i]) return nullptr;
+    if (path[i] == '\0') return path + i;  // the root itself
+    if (path[i] != '/') return nullptr;     // a sibling like /tmp/.clay/newrootX
+    while (path[i] == '/') ++i;            // BENEATH rejects a leading slash
+    return path + i;
+}
+
+// open the guest tree root itself. plain openat is correct here: this path is
+// ours, created by us moments earlier, with no guest-controlled component.
+long open_guest_root() {
+    return sys(SYS_openat, AT_FDCWD, reinterpret_cast<long>(kGuestRoot),
+               O_PATH | O_DIRECTORY | O_CLOEXEC, 0);
+}
+
+// mkdir -p, confined. the same walk as mkdir_p, but each component is created
+// relative to the tree root with BENEATH applied -- so a symlink planted partway
+// along by a guest-controlled bind cannot redirect where the directories land.
+//
+// mkdirat has no open_how, so confinement is achieved by opening each directory
+// with open_beneath as we descend and creating the next component relative to
+// THAT fd. a symlink in the middle fails the open rather than being followed.
+//
+// the failure reason comes back through `err` rather than errno, because the
+// close() calls on the way out overwrite errno and the caller has to distinguish
+// "this kernel has no openat2" from "confinement refused this path". reading a
+// clobbered errno would turn the second into the first and silently disable the
+// protection.
+bool mkdir_p_beneath(int root_fd, const char* rel, std::uint32_t mode, char* scratch,
+                     std::size_t cap, int* err) {
+    *err = 0;
+    std::size_t n = cstr_len(rel);
+    if (n == 0 || n >= cap) {
+        *err = ENAMETOOLONG;
+        return n == 0;
+    }
+    for (std::size_t i = 0; i <= n; ++i) scratch[i] = rel[i];
+
+    int dir = static_cast<int>(sys(SYS_dup, root_fd, 0, 0));
+    if (dir < 0) {
+        *err = errno;
+        return false;
+    }
+
+    std::size_t start = 0;
+    while (start < n) {
+        std::size_t end = start;
+        while (end < n && scratch[end] != '/') ++end;
+        if (end == n) break;  // the last component is the FILE, not a directory
+        char saved = scratch[end];
+        scratch[end] = '\0';
+        if (end > start) {
+            long rc = sys(SYS_mkdirat, dir, reinterpret_cast<long>(scratch + start),
+                          static_cast<long>(0755));
+            if (rc < 0 && errno != EEXIST) {
+                *err = errno;
+                sys(SYS_close, dir);
+                return false;
+            }
+            long next = open_beneath(dir, scratch + start,
+                                     O_PATH | O_DIRECTORY | O_CLOEXEC, 0);
+            if (next < 0) {
+                *err = errno;
+                sys(SYS_close, dir);
+                return false;
+            }
+            sys(SYS_close, dir);
+            dir = static_cast<int>(next);
+        }
+        scratch[end] = saved;
+        start = end + 1;
+    }
+
+    // create the final component, still confined.
+    bool ok = true;
+    if (start < n) {
+        long fd = open_beneath(dir, scratch + start, O_WRONLY | O_CREAT | O_CLOEXEC, mode);
+        if (fd < 0) {
+            *err = errno;
+            ok = (errno == EEXIST);
+            if (ok) *err = 0;
+        } else {
+            sys(SYS_close, fd);
+        }
+    }
+    sys(SYS_close, dir);
+    return ok;
+}
+
 // mkdir -p, without allocating. walks the path in place using a scratch buffer
 // the caller owns, creating each component and ignoring EEXIST.
 bool mkdir_p(const char* path, std::uint32_t mode, char* scratch, std::size_t cap) {
@@ -113,6 +266,25 @@ bool mkdir_p(const char* path, std::uint32_t mode, char* scratch, std::size_t ca
 bool touch_file(const char* path, std::uint32_t mode, char* scratch, std::size_t cap) {
     std::size_t len = cstr_len(path);
     if (len == 0 || len + 1 > cap) return false;
+
+    // a destination inside the guest tree gets CONFINED resolution, because the
+    // directories along the way can belong to a bind the guest controls and a
+    // symlink planted there would redirect this write onto the host. paths
+    // outside the tree are our own staging files, where there is nothing
+    // guest-controlled to resolve through.
+    if (const char* rel = relative_to_guest_root(path)) {
+        long root = open_guest_root();
+        if (root < 0) return false;
+        int err = 0;
+        bool ok = mkdir_p_beneath(static_cast<int>(root), rel, mode, scratch, cap, &err);
+        sys(SYS_close, root);
+        if (ok) return true;
+        // ENOSYS means this kernel predates openat2 (5.6). fall through to the
+        // unconfined path rather than refusing to start -- but ONLY for ENOSYS.
+        // EXDEV and ELOOP are confinement doing its job, and treating them as
+        // "try again without protection" would defeat the entire fix.
+        if (err != ENOSYS) return false;
+    }
 
     // make the parent directory first. copy the prefix into the scratch buffer
     // and terminate it there -- the earlier version handed mkdir_p a pointer
@@ -593,9 +765,32 @@ Status Plan::apply_range(Phase first, Phase last) const {
                         return die(Errc::io_error, "write_fd: touch", errno);
                 }
 
-                long out = sys(SYS_openat, AT_FDCWD, reinterpret_cast<long>(write_to),
-                               O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC,
-                               static_cast<long>(op.perms));
+                // open the destination with CONFINED resolution when it is
+                // inside the guest tree. touch_file above already created it
+                // safely, but creating it safely and then opening it unsafely
+                // reintroduces the whole bug: between the two, nothing stops the
+                // final component from being a symlink, and this open has
+                // O_CREAT so it would follow one.
+                //
+                // the bind case writes to our own staging scratch file, which no
+                // guest can influence, so it uses the plain path.
+                long out = -1;
+                if (const char* rel = relative_to_guest_root(write_to)) {
+                    long root = open_guest_root();
+                    if (root < 0) return die(Errc::io_error, "write_fd: root", errno);
+                    out = open_beneath(static_cast<int>(root), rel,
+                                       O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, op.perms);
+                    int err = errno;
+                    sys(SYS_close, root);
+                    // only a kernel without openat2 falls back. a refusal is the
+                    // protection working and must stay a failure.
+                    if (out < 0 && err != ENOSYS)
+                        return die(Errc::io_error, "write_fd: open dest (confined)", err);
+                }
+                if (out < 0)
+                    out = sys(SYS_openat, AT_FDCWD, reinterpret_cast<long>(write_to),
+                              O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC,
+                              static_cast<long>(op.perms));
                 if (out < 0) return die(Errc::io_error, "write_fd: open dest", errno);
 
                 // copy. a fixed stack buffer, no allocation: this runs post-fork.
