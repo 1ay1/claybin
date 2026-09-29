@@ -80,6 +80,39 @@ enum class ArgCmp : std::uint8_t {
     any_set,   // (arg & mask) != 0      -- "any of these flags is present"
 };
 
+// how WIDE the kernel's own parameter is, which decides how much of the
+// register a rule may compare.
+//
+// this is not a detail. seccomp always sees a full 64-bit register, but the
+// kernel truncates it to the declared parameter type before using it -- and
+// ioctl's cmd is `unsigned int`. so `ioctl(fd, 0xdeadbeef00005412, ...)` runs as
+// TIOCSTI while a filter comparing all 64 bits sees a value that matches
+// nothing and lets it past. measured, not reasoned about: a both-halves rule on
+// TIOCGWINSZ denies 0x5413 and allows 0xdeadbeef00005413, which the kernel then
+// executes as TIOCGWINSZ.
+//
+// so the rule is: compare exactly as many bits as the kernel uses. for a 64-bit
+// parameter the high half must be checked, because ignoring it is the classic
+// bypass in the other direction. for a 32-bit one it must NOT be.
+enum class ArgWidth : std::uint8_t {
+    bits64,  // the default: pointers, size_t, flags on clone/mmap
+    bits32,  // int/unsigned int parameters. ioctl's request is the big one.
+};
+
+// an allow-list over one 32-bit argument: everything is denied except these
+// values. the inverse of an ArgRule, and the only workable shape for a syscall
+// as wide as ioctl -- there are thousands of requests and any driver can add
+// more, so enumerating the dangerous ones is a losing game.
+struct ArgAllowSet {
+    SysNr nr;
+    std::uint8_t arg_index;
+    std::vector<std::uint32_t> values;  // sorted, deduped
+    SysAction action;                   // what happens to everything else
+    std::uint16_t errno_value;
+
+    friend bool operator==(const ArgAllowSet&, const ArgAllowSet&) = default;
+};
+
 struct ArgRule {
     SysNr nr;
     std::uint8_t arg_index;   // 0-5
@@ -91,6 +124,7 @@ struct ArgRule {
     // same rule as plain equality, so `eq` just ignores it rather than forcing
     // every caller to spell out ~0.
     std::uint64_t mask{0};
+    ArgWidth width{ArgWidth::bits64};
 
     friend bool operator==(const ArgRule&, const ArgRule&) = default;
 };
@@ -104,6 +138,7 @@ inline void sort_arg_rules(std::vector<ArgRule>& v) {
         if (x.nr != y.nr) return x.nr < y.nr;
         if (x.arg_index != y.arg_index) return x.arg_index < y.arg_index;
         if (x.cmp != y.cmp) return x.cmp < y.cmp;
+        if (x.width != y.width) return x.width < y.width;
         if (x.mask != y.mask) return x.mask < y.mask;
         return x.value < y.value;
     });
@@ -159,9 +194,55 @@ class SyscallPolicy {
     // keystroke-injection escape and a broken isatty(). the argument rules are
     // checked BEFORE the per-syscall action, so a match here wins.
     SyscallPolicy& deny_arg(SysNr nr, std::uint8_t arg_index, std::uint64_t value,
-                            SysAction a = SysAction::errno_, std::uint16_t err = 1) {
-        return deny_arg_cmp(nr, arg_index, ArgCmp::eq, value, 0, a, err);
+                            SysAction a = SysAction::errno_, std::uint16_t err = 1,
+                            ArgWidth w = ArgWidth::bits64) {
+        return deny_arg_cmp(nr, arg_index, ArgCmp::eq, value, 0, a, err, w);
     }
+
+    // deny one value of a 32-BIT argument. ioctl's request is the case that
+    // matters: the kernel truncates cmd to `unsigned int`, so a rule that
+    // compares all 64 bits is bypassed by setting any high bit.
+    SyscallPolicy& deny_arg32(SysNr nr, std::uint8_t arg_index, std::uint32_t value,
+                              SysAction a = SysAction::errno_, std::uint16_t err = 1) {
+        return deny_arg_cmp(nr, arg_index, ArgCmp::eq, value, 0, a, err, ArgWidth::bits32);
+    }
+
+    // the inverse, and the shape a wide syscall really wants: everything about
+    // this argument is denied EXCEPT the listed values.
+    //
+    // a deny-list on ioctl is close to meaningless -- there are thousands of
+    // requests and any driver can add more -- so the useful policy is an
+    // allow-list. this takes the whole set at once because the emitted code is a
+    // single block: match any of these and fall through, otherwise deny.
+    SyscallPolicy& allow_arg32_only(SysNr nr, std::uint8_t arg_index,
+                                    std::span<const std::uint32_t> values,
+                                    SysAction a = SysAction::errno_, std::uint16_t err = 1) {
+        std::vector<std::uint32_t> v{values.begin(), values.end()};
+        std::sort(v.begin(), v.end());
+        v.erase(std::unique(v.begin(), v.end()), v.end());
+
+        for (auto& s : allow_sets_) {
+            if (s.nr == nr && s.arg_index == arg_index) {
+                // two allow-lists on the same argument intersect. allowing fewer
+                // values is more restrictive, and authority only ever narrows.
+                std::vector<std::uint32_t> both;
+                std::set_intersection(s.values.begin(), s.values.end(), v.begin(), v.end(),
+                                      std::back_inserter(both));
+                s.values = std::move(both);
+                s.action = clay::meet(s.action, a);
+                return *this;
+            }
+        }
+        allow_sets_.push_back({nr, arg_index, std::move(v), a, err});
+        std::sort(allow_sets_.begin(), allow_sets_.end(),
+                  [](const ArgAllowSet& x, const ArgAllowSet& y) {
+                      if (x.nr != y.nr) return x.nr < y.nr;
+                      return x.arg_index < y.arg_index;
+                  });
+        return *this;
+    }
+
+    const std::vector<ArgAllowSet>& arg_allow_sets() const { return allow_sets_; }
 
     // deny when the MASKED field of an argument equals a value. this is the one
     // that handles the flag syscalls: `(clone_flags & CLONE_NEWUSER)` is a field
@@ -171,8 +252,9 @@ class SyscallPolicy {
     //   any_set  "is ANY of these flags present"  -- clone(CLONE_NEWUSER|...)
     //   all_set  "are ALL of these set together"  -- mmap(PROT_WRITE|PROT_EXEC)
     SyscallPolicy& deny_arg_any(SysNr nr, std::uint8_t arg_index, std::uint64_t mask,
-                                SysAction a = SysAction::errno_, std::uint16_t err = 1) {
-        return deny_arg_cmp(nr, arg_index, ArgCmp::any_set, 0, mask, a, err);
+                                SysAction a = SysAction::errno_, std::uint16_t err = 1,
+                                ArgWidth w = ArgWidth::bits64) {
+        return deny_arg_cmp(nr, arg_index, ArgCmp::any_set, 0, mask, a, err, w);
     }
 
     // "all of these bits together" is just a masked equality where the expected
@@ -180,28 +262,37 @@ class SyscallPolicy {
     // alternative -- a `not_all` mode -- reads like the right thing and is the
     // exact negation of what a deny rule wants, which is a live trap.
     SyscallPolicy& deny_arg_all(SysNr nr, std::uint8_t arg_index, std::uint64_t mask,
-                                SysAction a = SysAction::errno_, std::uint16_t err = 1) {
-        return deny_arg_cmp(nr, arg_index, ArgCmp::masked_eq, mask, mask, a, err);
+                                SysAction a = SysAction::errno_, std::uint16_t err = 1,
+                                ArgWidth w = ArgWidth::bits64) {
+        return deny_arg_cmp(nr, arg_index, ArgCmp::masked_eq, mask, mask, a, err, w);
     }
 
     SyscallPolicy& deny_arg_masked(SysNr nr, std::uint8_t arg_index, std::uint64_t mask,
                                    std::uint64_t value, SysAction a = SysAction::errno_,
-                                   std::uint16_t err = 1) {
-        return deny_arg_cmp(nr, arg_index, ArgCmp::masked_eq, value & mask, mask, a, err);
+                                   std::uint16_t err = 1, ArgWidth w = ArgWidth::bits64) {
+        return deny_arg_cmp(nr, arg_index, ArgCmp::masked_eq, value & mask, mask, a, err, w);
     }
 
     SyscallPolicy& deny_arg_cmp(SysNr nr, std::uint8_t arg_index, ArgCmp cmp,
                                 std::uint64_t value, std::uint64_t mask,
-                                SysAction a = SysAction::errno_, std::uint16_t err = 1) {
+                                SysAction a = SysAction::errno_, std::uint16_t err = 1,
+                                ArgWidth w = ArgWidth::bits64) {
+        // a 32-bit rule can only talk about the low half, so anything the caller
+        // put above the line is a policy bug, not a value to compare: silently
+        // keeping it would emit a rule that matches nothing.
+        if (w == ArgWidth::bits32) {
+            value &= 0xffffffffull;
+            mask &= 0xffffffffull;
+        }
         for (auto& r : arg_rules_) {
             if (r.nr == nr && r.arg_index == arg_index && r.cmp == cmp && r.value == value &&
-                r.mask == mask) {
+                r.mask == mask && r.width == w) {
                 r.action = a;
                 r.errno_value = err;
                 return *this;
             }
         }
-        arg_rules_.push_back({nr, arg_index, value, a, err, cmp, mask});
+        arg_rules_.push_back({nr, arg_index, value, a, err, cmp, mask, w});
         sort_arg_rules(arg_rules_);
         return *this;
     }
@@ -251,7 +342,7 @@ class SyscallPolicy {
             bool have = false;
             for (auto& x : out.arg_rules_) {
                 if (x.nr == r.nr && x.arg_index == r.arg_index && x.cmp == r.cmp &&
-                    x.value == r.value && x.mask == r.mask) {
+                    x.value == r.value && x.mask == r.mask && x.width == r.width) {
                     x.action = clay::meet(x.action, r.action);
                     have = true;
                     break;
@@ -260,6 +351,33 @@ class SyscallPolicy {
             if (!have) out.arg_rules_.push_back(r);
         }
         sort_arg_rules(out.arg_rules_);
+
+        // allow-lists compose by INTERSECTION, which is the opposite direction
+        // from the deny rules above and for the same reason: fewer permitted
+        // values is more restrictive. a set present on only one side carries over
+        // unchanged, because the other side never spoke about that argument and
+        // silence is not permission to widen.
+        out.allow_sets_ = allow_sets_;
+        for (const auto& s : o.allow_sets_) {
+            bool have = false;
+            for (auto& x : out.allow_sets_) {
+                if (x.nr == s.nr && x.arg_index == s.arg_index) {
+                    std::vector<std::uint32_t> both;
+                    std::set_intersection(x.values.begin(), x.values.end(), s.values.begin(),
+                                          s.values.end(), std::back_inserter(both));
+                    x.values = std::move(both);
+                    x.action = clay::meet(x.action, s.action);
+                    have = true;
+                    break;
+                }
+            }
+            if (!have) out.allow_sets_.push_back(s);
+        }
+        std::sort(out.allow_sets_.begin(), out.allow_sets_.end(),
+                  [](const ArgAllowSet& x, const ArgAllowSet& y) {
+                      if (x.nr != y.nr) return x.nr < y.nr;
+                      return x.arg_index < y.arg_index;
+                  });
         return out;
     }
 
@@ -292,6 +410,7 @@ class SyscallPolicy {
     std::uint16_t default_errno_{1};
     std::vector<SyscallRule> rules_;
     std::vector<ArgRule> arg_rules_;
+    std::vector<ArgAllowSet> allow_sets_;
 };
 
 static_assert(Lattice<SyscallPolicy>);

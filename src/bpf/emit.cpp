@@ -168,6 +168,25 @@ Result<Program> compile(const SyscallPolicy& policy, std::uint32_t arch) {
         auto mlo = static_cast<std::uint32_t>(r.mask & 0xffffffffu);
         auto mhi = static_cast<std::uint32_t>(r.mask >> 32);
 
+        // a 32-bit kernel parameter must be compared in the low half ONLY.
+        //
+        // this is not an optimisation, it is the fix for a real bypass. the
+        // kernel truncates the register to the declared parameter type before
+        // using it, so ioctl(fd, 0xdeadbeef00005412) runs as TIOCSTI -- while a
+        // filter that also requires the high half to be zero sees a value
+        // matching nothing and waves it through. measured on 7.2: a both-halves
+        // rule denies 0x5413 and allows 0xdeadbeef00005413, which the kernel
+        // then executes as TIOCGWINSZ.
+        //
+        // the inverse mistake is just as real, which is why this is per-rule and
+        // not a blanket policy: for a genuinely 64-bit argument, ignoring the
+        // high half is the classic seccomp bypass in the other direction.
+        const bool narrow = r.width == ArgWidth::bits32;
+        if (narrow) {
+            hi = 0;
+            mhi = 0;
+        }
+
         std::vector<Insn> body;
         bool dead = false;  // a rule whose predicate can never be true
 
@@ -175,8 +194,10 @@ Result<Program> compile(const SyscallPolicy& policy, std::uint32_t arch) {
             case ArgCmp::eq:
                 body.push_back(ld_abs(arg_lo_off(r.arg_index)));
                 body.push_back(jeq(lo, 0, kFail));
-                body.push_back(ld_abs(arg_hi_off(r.arg_index)));
-                body.push_back(jeq(hi, 0, kFail));
+                if (!narrow) {
+                    body.push_back(ld_abs(arg_hi_off(r.arg_index)));
+                    body.push_back(jeq(hi, 0, kFail));
+                }
                 break;
 
             case ArgCmp::masked_eq:
@@ -202,7 +223,12 @@ Result<Program> compile(const SyscallPolicy& policy, std::uint32_t arch) {
                 // (arg & mask) != 0: a match as soon as EITHER half has a bit, so
                 // the first half's test jumps forward to the verdict on success
                 // rather than falling through.
-                if (r.mask == 0) {
+                //
+                // the emptiness test is on the TRUNCATED halves, not r.mask: a
+                // 32-bit rule whose mask lived entirely above the line asks about
+                // bits the kernel never reads, so it can never fire and must be
+                // dropped rather than emitted against the high half.
+                if (mlo == 0 && mhi == 0) {
                     dead = true;  // nothing can be masked out of nothing
                     break;
                 }
@@ -250,6 +276,63 @@ Result<Program> compile(const SyscallPolicy& policy, std::uint32_t arch) {
         if (body.size() > 0xff)
             return std::unexpected(Error{Errc::too_many_rules, "seccomp: arg rule too large"});
         out.push_back(jeq(r.nr, 0, static_cast<std::uint8_t>(body.size())));
+        out.insert(out.end(), body.begin(), body.end());
+    }
+
+    // ---- argument allow-lists --------------------------------------------
+    //
+    // the inverse shape: everything about this argument is denied except the
+    // listed values. for a syscall as wide as ioctl this is the only workable
+    // policy -- there are thousands of requests and any loaded driver can add
+    // more, so a deny-list is a list of the escapes somebody already thought of.
+    //
+    // these go AFTER the deny rules so a deny still wins on a value that appears
+    // in both. that ordering is what lets a caller allow a broad set and then
+    // carve one value back out of it.
+    //
+    // shape is [match value -> fall through]* , ret(deny), ld nr. every hit jumps
+    // past the deny to the restore, so the allowed path costs one compare per
+    // listed value and lands on the interval tree exactly as if nothing happened.
+    for (const auto& s : policy.arg_allow_sets()) {
+        if (s.values.empty()) {
+            // an empty allow-list denies the syscall outright. that is a real
+            // policy -- the intersection of two disjoint allow-lists -- so it is
+            // emitted rather than skipped, otherwise composing two policies could
+            // silently GRANT the syscall back.
+            out.push_back(jeq(s.nr, 0, 2));
+            out.push_back(ret(action_to_ret(s.action, s.errno_value)));
+            out.push_back(ld_abs(kOffNr));
+            continue;
+        }
+
+        std::vector<Insn> body;
+        body.push_back(ld_abs(arg_lo_off(s.arg_index)));
+        // note there is no high-half check anywhere in here, and that is the
+        // point: the allow-list is for 32-bit arguments, and the kernel truncates
+        // them. requiring the high half to be zero would let
+        // ioctl(fd, 0xdeadbeef00005412) past the filter to run as TIOCSTI.
+        for (std::uint32_t v : s.values) body.push_back(jeq(v, kMatch, 0));
+        body.push_back(ret(action_to_ret(s.action, s.errno_value)));
+
+        std::size_t match_at = body.size();  // the accumulator restore
+        body.push_back(ld_abs(kOffNr));
+
+        for (std::size_t i = 0; i < body.size(); ++i) {
+            auto fix = [&](std::uint8_t& t) {
+                if (t == kMatch) t = static_cast<std::uint8_t>(match_at - i - 1);
+            };
+            fix(body[i].jt);
+            fix(body[i].jf);
+        }
+
+        // an 8-bit jump offset caps how many values one block can hold. this is
+        // reachable -- an allow-list of 300 ioctls is a reasonable thing to write
+        // -- so it is a real error and not a defensive check.
+        if (body.size() > 0xff)
+            return std::unexpected(
+                Error{Errc::too_many_rules, "seccomp: argument allow-list too long"});
+
+        out.push_back(jeq(s.nr, 0, static_cast<std::uint8_t>(body.size())));
         out.insert(out.end(), body.begin(), body.end());
     }
 

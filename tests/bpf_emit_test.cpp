@@ -388,5 +388,177 @@ int main() {
         }
     }
 
+    // -- 32-bit arguments, and the bypass that comes from ignoring width ----
+    //
+    // seccomp sees a full 64-bit register, but the kernel truncates it to the
+    // declared parameter type before using it. ioctl's cmd is `unsigned int`, so
+    // ioctl(fd, 0xdeadbeef00005412) really does run TIOCSTI -- while a filter
+    // that also requires the high half to be zero sees a value matching nothing
+    // and waves it through.
+    //
+    // this was a live bug in claybin's own TIOCSTI rule, confirmed against the
+    // kernel before the fix: a both-halves rule denied 0x5413 and allowed
+    // 0xdeadbeef00005413, which the kernel then executed as TIOCGWINSZ.
+    {
+        static constexpr std::uint64_t kHighGarbage = 0xdeadbeef00000000ull;
+
+        // a 32-bit rule ignores the high half, so garbage above the line does not
+        // help the attacker.
+        SyscallPolicy narrow;
+        narrow.set_default(SysAction::allow);
+        narrow.allow(16);
+        narrow.deny_arg32(16, 1, 0x5412 /* TIOCSTI */);
+
+        auto np = compile(narrow, kAuditArchX86_64);
+        CHECK(np.has_value());
+        if (np) {
+            std::uint64_t plain[6] = {0, 0x5412, 0, 0, 0, 0};
+            CHECK_EQ(evaluate_with_args(*np, 16, kAuditArchX86_64, plain), kRetErrno | 1);
+            std::uint64_t dressed[6] = {0, kHighGarbage | 0x5412, 0, 0, 0, 0};
+            CHECK_EQ(evaluate_with_args(*np, 16, kAuditArchX86_64, dressed), kRetErrno | 1);
+            // a different request is still allowed: the rule is about one value,
+            // not about the low half generally.
+            std::uint64_t other[6] = {0, 0x5413, 0, 0, 0, 0};
+            CHECK_EQ(evaluate_with_args(*np, 16, kAuditArchX86_64, other), kRetAllow);
+        }
+
+        // the 64-bit form must keep checking the high half, because for a real
+        // 64-bit argument ignoring it is the classic bypass in the other
+        // direction. so the two widths genuinely differ, and the difference is
+        // pinned here rather than left to whoever edits the emitter next.
+        SyscallPolicy wide;
+        wide.set_default(SysAction::allow);
+        wide.allow(16);
+        wide.deny_arg(16, 1, 0x5412);
+
+        auto wp = compile(wide, kAuditArchX86_64);
+        CHECK(wp.has_value());
+        if (wp) {
+            std::uint64_t plain[6] = {0, 0x5412, 0, 0, 0, 0};
+            CHECK_EQ(evaluate_with_args(*wp, 16, kAuditArchX86_64, plain), kRetErrno | 1);
+            std::uint64_t dressed[6] = {0, kHighGarbage | 0x5412, 0, 0, 0, 0};
+            CHECK_EQ(evaluate_with_args(*wp, 16, kAuditArchX86_64, dressed), kRetAllow);
+        }
+    }
+
+    // -- argument allow-lists ----------------------------------------------
+    {
+        static constexpr std::uint32_t kAllowed[] = {0x5401, 0x5413, 0x541B};
+
+        SyscallPolicy p;
+        p.set_default(SysAction::errno_, 1);
+        for (SysNr nr = 0; nr < 64; ++nr) p.allow(nr);
+        p.allow_arg32_only(16, 1, std::span<const std::uint32_t>{kAllowed});
+
+        auto prog = compile(p, kAuditArchX86_64);
+        CHECK(prog.has_value());
+        if (prog) {
+            for (std::uint32_t v : kAllowed) {
+                std::uint64_t a[6] = {0, v, 0, 0, 0, 0};
+                CHECK_EQ(evaluate_with_args(*prog, 16, kAuditArchX86_64, a), kRetAllow);
+                // and the same value with high garbage: still allowed, because the
+                // kernel would truncate it to exactly this request anyway. the
+                // allow-list must not be MORE permissive for a dressed-up value
+                // than for a plain one, nor less.
+                std::uint64_t d[6] = {0, 0xdeadbeef00000000ull | v, 0, 0, 0, 0};
+                CHECK_EQ(evaluate_with_args(*prog, 16, kAuditArchX86_64, d), kRetAllow);
+            }
+
+            // everything else is denied, including the escapes a deny-list would
+            // have had to name: TIOCSTI, TIOCLINUX, TIOCCONS, TIOCSCTTY.
+            for (std::uint32_t v : {0x5412u, 0x541Cu, 0x541Du, 0x540Eu, 0u, 0xffffffffu}) {
+                std::uint64_t a[6] = {0, v, 0, 0, 0, 0};
+                CHECK_EQ(evaluate_with_args(*prog, 16, kAuditArchX86_64, a), kRetErrno | 1);
+            }
+
+            // other syscalls are untouched: the block must restore the
+            // accumulator, or the tree after it reads an argument as a syscall
+            // number.
+            for (SysNr nr = 0; nr < 64; ++nr) {
+                if (nr == 16) continue;
+                std::uint64_t a[6] = {0, 0x5412, 0, 0, 0, 0};
+                CHECK_EQ(evaluate_with_args(*prog, nr, kAuditArchX86_64, a), kRetAllow);
+            }
+        }
+
+        // a deny rule still wins over the allow-list, so a caller can allow a
+        // broad set and carve one value back out.
+        SyscallPolicy carved = p;
+        carved.deny_arg32(16, 1, 0x5413, SysAction::errno_, 13 /* EACCES */);
+        auto cp = compile(carved, kAuditArchX86_64);
+        CHECK(cp.has_value());
+        if (cp) {
+            std::uint64_t a[6] = {0, 0x5413, 0, 0, 0, 0};
+            CHECK_EQ(evaluate_with_args(*cp, 16, kAuditArchX86_64, a), kRetErrno | 13);
+            std::uint64_t b[6] = {0, 0x5401, 0, 0, 0, 0};
+            CHECK_EQ(evaluate_with_args(*cp, 16, kAuditArchX86_64, b), kRetAllow);
+        }
+
+        // allow-lists compose by INTERSECTION. two policies meeting can only ever
+        // permit fewer values -- if it were union, composing two sealed policies
+        // would GRANT authority, which is the one thing the lattice forbids.
+        static constexpr std::uint32_t kOther[] = {0x5413, 0x541B, 0x5414};
+        SyscallPolicy q;
+        q.set_default(SysAction::errno_, 1);
+        for (SysNr nr = 0; nr < 64; ++nr) q.allow(nr);
+        q.allow_arg32_only(16, 1, std::span<const std::uint32_t>{kOther});
+
+        auto mp = compile(p.meet(q), kAuditArchX86_64);
+        CHECK(mp.has_value());
+        if (mp) {
+            // in both lists -> allowed
+            for (std::uint32_t v : {0x5413u, 0x541Bu}) {
+                std::uint64_t a[6] = {0, v, 0, 0, 0, 0};
+                CHECK_EQ(evaluate_with_args(*mp, 16, kAuditArchX86_64, a), kRetAllow);
+            }
+            // in only one -> denied
+            for (std::uint32_t v : {0x5401u, 0x5414u}) {
+                std::uint64_t a[6] = {0, v, 0, 0, 0, 0};
+                CHECK_EQ(evaluate_with_args(*mp, 16, kAuditArchX86_64, a), kRetErrno | 1);
+            }
+        }
+
+        // disjoint allow-lists intersect to nothing, which denies the syscall
+        // outright. it has to be EMITTED rather than skipped as empty, or the
+        // composition would silently hand the syscall back.
+        static constexpr std::uint32_t kDisjoint[] = {0x9999};
+        SyscallPolicy z;
+        z.set_default(SysAction::errno_, 1);
+        for (SysNr nr = 0; nr < 64; ++nr) z.allow(nr);
+        z.allow_arg32_only(16, 1, std::span<const std::uint32_t>{kDisjoint});
+
+        auto zp = compile(p.meet(z), kAuditArchX86_64);
+        CHECK(zp.has_value());
+        if (zp) {
+            for (std::uint32_t v : {0x5401u, 0x5413u, 0x9999u}) {
+                std::uint64_t a[6] = {0, v, 0, 0, 0, 0};
+                CHECK_EQ(evaluate_with_args(*zp, 16, kAuditArchX86_64, a), kRetErrno | 1);
+            }
+        }
+    }
+
+    // the profile's ioctl allow-list: isatty works, the tty escapes do not.
+    {
+        auto prog = compile(profiles::base(), kAuditArchX86_64);
+        CHECK(prog.has_value());
+        if (prog) {
+            // TCGETS is what isatty() actually calls. if this breaks, every
+            // program that checks for a terminal breaks with it.
+            std::uint64_t tcgets[6] = {1, 0x5401, 0, 0, 0, 0};
+            CHECK_EQ(evaluate_with_args(*prog, 16, kAuditArchX86_64, tcgets), kRetAllow);
+            std::uint64_t winsz[6] = {1, 0x5413, 0, 0, 0, 0};
+            CHECK_EQ(evaluate_with_args(*prog, 16, kAuditArchX86_64, winsz), kRetAllow);
+
+            // the keystroke-injection family, plain and dressed in high garbage.
+            for (std::uint32_t v : {0x5412u /* TIOCSTI */, 0x541Cu /* TIOCLINUX */,
+                                    0x541Du /* TIOCCONS */, 0x540Eu /* TIOCSCTTY */}) {
+                std::uint64_t a[6] = {1, v, 0, 0, 0, 0};
+                CHECK_EQ(evaluate_with_args(*prog, 16, kAuditArchX86_64, a), kRetErrno | 1);
+                std::uint64_t d[6] = {1, 0xdeadbeef00000000ull | v, 0, 0, 0, 0};
+                CHECK_EQ(evaluate_with_args(*prog, 16, kAuditArchX86_64, d), kRetErrno | 1);
+            }
+        }
+    }
+
     return finish("bpf_emit_test");
 }

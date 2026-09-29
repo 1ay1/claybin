@@ -356,6 +356,49 @@ inline int tiocsti_inject() {
     return kBlocked;
 }
 
+inline int tiocsti_high_bits() {
+    // the same escape, dressed up to slip past a filter that compares all 64 bits
+    // of the request.
+    //
+    // ioctl's cmd is `unsigned int` in the kernel, so the register is TRUNCATED
+    // before use: 0xdeadbeef00005412 runs as TIOCSTI. claybin had exactly this
+    // bug -- the old TIOCSTI deny rule required the high half to be zero, saw a
+    // value matching nothing, and let it through.
+    //
+    // the allow-list that replaced it is immune by SHAPE rather than by a flag:
+    // it compares the low half only, so a dressed-up value lands on the same
+    // entry the kernel will truncate it to, and anything not on the list is
+    // denied whatever is above the line. that is the real argument for the
+    // allow-list -- getting this wrong is invisible in a deny-list and
+    // impossible in an allow-list. bpf_emit_test pins the deny-rule side, where
+    // the difference is observable.
+    //
+    // the raw syscall, not glibc's ioctl(), because the wrapper takes an
+    // `unsigned long` request and would drop the high bits before the kernel
+    // ever sees them -- which would make this test pass for the wrong reason.
+    char c = 'X';
+    long r = ::syscall(SYS_ioctl, 0, 0xdeadbeef00005412ull, &c);
+    return r == 0 ? kEscaped : kBlocked;
+}
+
+inline int isatty_still_works() {
+    // not an escape: a REGRESSION check, and the reason the ioctl allow-list has
+    // to be an allow-list of the right things rather than an empty one.
+    //
+    // TCGETS is what isatty() calls. a sandbox that blocks it breaks every
+    // program that checks whether its output is a terminal, which is most of
+    // them. "blocked" here would mean the policy is too tight to use, so the
+    // polarity is deliberately inverted: reaching the kernel is the PASS.
+    struct termios_probe {
+        unsigned char pad[64];
+    } t{};
+    long r = ::syscall(SYS_ioctl, 1, 0x5401 /* TCGETS */, &t);
+    // ENOTTY means it reached the kernel and the fd simply is not a terminal,
+    // which is the expected answer under a pipe. EPERM means seccomp ate it.
+    if (r == 0 || errno == ENOTTY || errno == EINVAL) return kBlocked;  // "ok"
+    return kEscaped;                                                    // "broken"
+}
+
 inline int tioclinux_inject() {
     // TIOCLINUX subcommand 2 can do the same via the selection buffer.
     char arg[2] = {2, 0};
@@ -525,6 +568,12 @@ inline const Attack* table(std::size_t& count) {
 
         // terminal
         {"tty.tiocsti", tiocsti_inject, false},
+        // the same request with high garbage above the 32-bit line. the kernel
+        // truncates, so this really is TIOCSTI -- a filter comparing all 64 bits
+        // is bypassed by it.
+        {"tty.tiocsti_high_bits", tiocsti_high_bits, false},
+        // inverted polarity: this one fails if the sandbox is too TIGHT.
+        {"tty.isatty_not_broken", isatty_still_works, false},
         {"tty.tioclinux", tioclinux_inject, false},
         {"tty.tioccons", tioccons_steal, false},
 

@@ -154,29 +154,59 @@ inline SyscallPolicy base() {
                      246u /* kexec_load */, 169u /* reboot */})
         p.kill(nr);
 
-    // ---- dangerous ioctls, denied by ARGUMENT ----------------------------
+    // ---- ioctl, restricted by ARGUMENT to an allow-list -------------------
     //
     // ioctl has to stay allowed: isatty() calls it, and so does every program
-    // that checks whether stdout is a terminal. but a handful of requests are
-    // outright escapes, and without argument filtering the only choices were
-    // "allow the escape" or "break isatty for everyone".
+    // that checks whether stdout is a terminal. but it is the widest syscall in
+    // the kernel -- thousands of requests, and any loaded driver adds more -- so
+    // a deny-list is a list of the escapes somebody already thought of. this is
+    // an allow-list instead: everything is EPERM except the requests a normal
+    // program genuinely needs.
     //
-    // TIOCSTI is the important one. it pushes a byte into a terminal's input
-    // queue -- so a guest sharing a controlling terminal with an interactive
-    // shell can TYPE INTO THAT SHELL, and whatever it types runs outside the
-    // sandbox. modern kernels gate it behind dev.tty.legacy_tiocsti, but a
-    // sandbox that relies on a host sysctl is not a sandbox, so we deny it
-    // ourselves. new_session() also fixes this; defence in depth means doing
-    // both, since a caller may reasonably want to keep the tty.
+    // that closes the ones a deny-list would have to name one at a time, most
+    // importantly TIOCSTI. TIOCSTI pushes a byte into a terminal's input queue,
+    // so a guest sharing a controlling terminal with an interactive shell can
+    // TYPE INTO THAT SHELL and have it run outside the sandbox. modern kernels
+    // gate it behind dev.tty.legacy_tiocsti, but a sandbox that relies on a host
+    // sysctl is not a sandbox. TIOCLINUX does the same thing via its subcommand
+    // TIOCL_SETSEL, TIOCCONS redirects console output, and TIOCSCTTY steals a
+    // controlling terminal -- none of which are on this list, so none need
+    // naming.
     //
-    // TIOCLINUX can do the same thing via its subcommand 2 (TIOCL_SETSEL),
-    // and TIOCCONS redirects console output.
-    static constexpr std::uint64_t kTiocsti = 0x5412;
-    static constexpr std::uint64_t kTioclinux = 0x541C;
-    static constexpr std::uint64_t kTioccons = 0x541D;
-    static constexpr std::uint64_t kTiocsctty = 0x540E;
-    for (std::uint64_t req : {kTiocsti, kTioclinux, kTioccons, kTiocsctty})
-        p.deny_arg(16 /* ioctl */, 1 /* request */, req, SysAction::errno_, 1 /* EPERM */);
+    // these are 32-BIT comparisons. ioctl's cmd is `unsigned int` and the kernel
+    // truncates the register before using it, so a rule that also requires the
+    // high half to be zero is bypassed by ioctl(fd, 0xdeadbeef00005412), which
+    // runs as TIOCSTI. that is measured, not theoretical.
+    //
+    // values from asm-generic/ioctls.h.
+    static constexpr std::uint32_t kIoctlAllowed[] = {
+        // terminal attributes. isatty() is TCGETS, and every shell and libc
+        // startup path touches these.
+        0x5401,  // TCGETS
+        0x5402,  // TCSETS
+        0x5403,  // TCSETSW
+        0x5404,  // TCSETSF
+        0x5405,  // TCGETA
+        0x5409,  // TCSBRK
+        0x540A,  // TCXONC
+        0x540B,  // TCFLSH
+        // window size. anything that formats output for a terminal asks.
+        0x5413,  // TIOCGWINSZ
+        0x5414,  // TIOCSWINSZ
+        // process group and session. job control, and read-only queries.
+        0x540F,  // TIOCGPGRP
+        0x5410,  // TIOCSPGRP
+        0x5429,  // TIOCGSID
+        // descriptor state. these act on the fd, not on any device.
+        0x541B,  // FIONREAD
+        0x5421,  // FIONBIO
+        0x5450,  // FIONCLEX
+        0x5451,  // FIOCLEX
+        0x5411,  // TIOCOUTQ
+    };
+    p.allow_arg32_only(16 /* ioctl */, 1 /* request */,
+                       std::span<const std::uint32_t>{kIoctlAllowed}, SysAction::errno_,
+                       1 /* EPERM */);
 
     // W^X: no mapping may be writable and executable at the same time.
     //

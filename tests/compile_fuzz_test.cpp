@@ -86,12 +86,39 @@ Policy<Sealed> gen_policy(Rng& r) {
     if (r.coin(20)) d = std::move(d).open_files(1 + r.below(65536));
 
     // syscall profile
-    switch (r.below(5)) {
-        case 0: d = std::move(d).syscall_profile(profiles::base()); break;
-        case 1: d = std::move(d).syscall_profile(profiles::with_processes()); break;
-        case 2: d = std::move(d).syscall_profile(profiles::with_filesystem()); break;
-        case 3: d = std::move(d).syscall_profile(profiles::with_network()); break;
-        default: d = std::move(d).syscall_profile(profiles::compiler()); break;
+    {
+        SyscallPolicy sys;
+        switch (r.below(5)) {
+            case 0: sys = profiles::base(); break;
+            case 1: sys = profiles::with_processes(); break;
+            case 2: sys = profiles::with_filesystem(); break;
+            case 3: sys = profiles::with_network(); break;
+            default: sys = profiles::compiler(); break;
+        }
+
+        // every profile already carries the ioctl allow-list, so that shape is
+        // covered on every iteration. these extra ones are for the shapes a real
+        // profile does not happen to contain: a set on an argument other than 1,
+        // an EMPTY set (which must deny the syscall outright rather than be
+        // skipped), a single-value set, and a set on a syscall that also has a
+        // deny rule -- where the deny has to win.
+        if (r.coin(35)) {
+            SysNr nr = 200 + r.below(60);
+            auto arg = static_cast<std::uint8_t>(r.below(6));
+            std::size_t n = r.below(5);  // deliberately includes 0
+            std::vector<std::uint32_t> vals;
+            for (std::size_t i = 0; i < n; ++i) vals.push_back(r.below(0x6000));
+            sys.allow(nr);
+            sys.allow_arg32_only(nr, arg, std::span<const std::uint32_t>{vals},
+                                 r.coin(50) ? SysAction::errno_ : SysAction::kill_process,
+                                 static_cast<std::uint16_t>(1 + r.below(30)));
+            // sometimes carve one of the permitted values back out, so the
+            // deny-beats-allow ordering gets exercised rather than assumed.
+            if (!vals.empty() && r.coin(40))
+                sys.deny_arg32(nr, arg, vals[r.below(vals.size())]);
+        }
+
+        d = std::move(d).syscall_profile(std::move(sys));
     }
 
     // hardening toggles
@@ -236,11 +263,85 @@ bool check_plan(const Compiled& c, const Policy<Sealed>& pol, std::uint64_t seed
                 for (const auto& ar : pol.data().syscalls.arg_rules())
                     if (ar.nr == nr) has_arg_rule = true;
                 if (has_arg_rule) continue;
+                // same for an allow-list, and for a sharper reason: evaluate()
+                // leaves the arguments zeroed, and 0 is not usually a permitted
+                // value, so the number-only oracle would disagree on every one.
+                // these are checked properly below instead of being waved past.
+                bool has_allow_set = false;
+                for (const auto& as : pol.data().syscalls.arg_allow_sets())
+                    if (as.nr == nr) has_allow_set = true;
+                if (has_allow_set) continue;
                 if (got != want) {
                     std::fprintf(stderr, "  seed %llu: seccomp disagrees at nr=%u (%#x vs %#x)\n",
                                  static_cast<unsigned long long>(seed), nr, got, want);
                     ok = false;
                     break;
+                }
+            }
+
+            // the allow-lists, checked on their own terms: every listed value
+            // must reach the syscall's number-only verdict, and a value that is
+            // not listed must get the set's action.
+            //
+            // the listed values are also checked with high garbage above the
+            // 32-bit line, because the kernel truncates a 32-bit parameter and an
+            // allow-list that answered differently for a dressed-up value would
+            // be either a bypass or a spurious denial.
+            for (const auto& as : pol.data().syscalls.arg_allow_sets()) {
+                if (as.nr >= 512) continue;
+                std::uint32_t base = bpf::action_to_ret(
+                    pol.data().syscalls.action_for(as.nr), pol.data().syscalls.errno_for(as.nr));
+                std::uint32_t denied = bpf::action_to_ret(as.action, as.errno_value);
+
+                // a deny rule on the same argument outranks the allow-list, so a
+                // value covered by one is not this check's business.
+                auto carved_out = [&](std::uint32_t v) {
+                    for (const auto& ar : pol.data().syscalls.arg_rules())
+                        if (ar.nr == as.nr && ar.arg_index == as.arg_index &&
+                            (ar.value & 0xffffffffu) == v)
+                            return true;
+                    return false;
+                };
+
+                for (std::uint32_t v : as.values) {
+                    if (carved_out(v)) continue;
+                    for (std::uint64_t high : {0ull, 0xdeadbeef00000000ull}) {
+                        std::uint64_t args[6] = {0, 0, 0, 0, 0, 0};
+                        args[as.arg_index] = high | v;
+                        std::uint32_t g =
+                            bpf::evaluate_with_args(*prog, as.nr, bpf::kAuditArchX86_64, args);
+                        if (g != base) {
+                            std::fprintf(stderr,
+                                         "  seed %llu: allow-list denied a listed value "
+                                         "nr=%u arg%u=%#llx (%#x vs %#x)\n",
+                                         static_cast<unsigned long long>(seed), as.nr,
+                                         as.arg_index,
+                                         static_cast<unsigned long long>(high | v), g, base);
+                            ok = false;
+                            break;
+                        }
+                    }
+                    if (!ok) break;
+                }
+
+                // a value nobody listed must be denied. pick one that is really
+                // absent rather than assuming any particular number is.
+                std::uint32_t absent = 0x7f000000u;
+                while (std::find(as.values.begin(), as.values.end(), absent) != as.values.end())
+                    ++absent;
+                if (ok && !carved_out(absent)) {
+                    std::uint64_t args[6] = {0, 0, 0, 0, 0, 0};
+                    args[as.arg_index] = absent;
+                    std::uint32_t g =
+                        bpf::evaluate_with_args(*prog, as.nr, bpf::kAuditArchX86_64, args);
+                    if (g != denied) {
+                        std::fprintf(stderr,
+                                     "  seed %llu: allow-list let an unlisted value past "
+                                     "nr=%u arg%u=%#x (%#x vs %#x)\n",
+                                     static_cast<unsigned long long>(seed), as.nr, as.arg_index,
+                                     absent, g, denied);
+                        ok = false;
+                    }
                 }
             }
         }
