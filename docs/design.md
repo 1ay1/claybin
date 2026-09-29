@@ -1,6 +1,8 @@
 # claybin design
 
-a portable capability runtime. the sandbox is one implementation of it.
+an authority compiler. it computes what a process may do and installs the
+mechanisms that enforce it. it owns no loop — see [jaal.md](jaal.md) for why
+that is a deliberate boundary and not a missing feature.
 
 ## the one idea
 
@@ -44,8 +46,10 @@ illegal states are unrepresentable, enforced by phantom phase tags:
     Policy<Sealed>           immutable, meet-able, hashable, auditable
       | compile(backend)     fallible, allocates, does all the thinking
     Plan                     POD. no pointers to heap. memcpy-safe across fork
-      | spawn()
-    Child                    affine. move-only. dtor kills + reaps via pidfd
+
+the chain ends at `Plan` on purpose. a `Plan` is a value you can apply as many
+times as you like; it does not own a process, so claybin never has to reap one.
+process ownership is the loop's job.
 
 builder methods are rvalue-qualified, so a draft threads linearly through the
 chain instead of being aliased and mutated behind your back.
@@ -77,6 +81,10 @@ async-signal-safe by construction, because there is nothing else in there.
 cost of a spawn ends up being the kernel's cost plus a few microseconds, and the
 policy work is paid once even if you spawn ten thousand children from the same
 compiled plan.
+
+note what is NOT here: waiting. `plan.apply()` runs in the child and returns or
+execs. reaping the child, pumping its output and timing it out belong to whoever
+owns the event loop.
 
 ## seccomp
 
@@ -123,3 +131,7 @@ what the microvm backend is for, and the guarantee report says
 - not a container runtime. no images, no registries, no orchestration.
 - no oci, no daemon, no root helper.
 - no dependency the user did not ask for.
+- **no event loop.** no reactor, no thread pool, no process supervision. a
+  security library that grows a loop ends up with a worse one than a library
+  written for the job, and its races get hidden behind the security story. the
+  supervisor is a jaal program; see [jaal.md](jaal.md).
