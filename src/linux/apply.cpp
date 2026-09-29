@@ -33,6 +33,14 @@
 #include <unistd.h>
 
 namespace clay {
+
+// which fd kReportFdSentinel stands for. a file-scope global rather than a
+// parameter because apply() is called from the post-fork path where we cannot
+// allocate and do not want to thread state through every op.
+static std::uint32_t g_report_fd = 0xffffffffu;
+
+void Plan::set_report_fd(int fd) { g_report_fd = static_cast<std::uint32_t>(fd); }
+
 namespace {
 
 // ---- raw syscall wrappers. no libc wrappers: several of them touch errno
@@ -704,10 +712,50 @@ Status Plan::apply_range(Phase first, Phase last) const {
             case OpCode::close_range: {
                 CloseRangeOp op{};
                 if (!decode(payload, op)) return die(Errc::invalid_policy, "close_range", 0);
-                // a leaked fd is a capability the sandbox never agreed to grant,
-                // so failure here is fatal rather than best-effort.
-                if (sys(SYS_close_range, op.lo, op.hi, 0) < 0)
-                    return die(Errc::io_error, "close_range", errno);
+
+                // a leaked fd is a capability the sandbox never agreed to grant:
+                // landlock mediates path RESOLUTION, and an already-open fd needs
+                // none, so no wall we build can revoke one. closing them is the
+                // only option.
+                //
+                // two kinds must survive, though:
+                //   - the landlock ruleset fd, created before this op and used
+                //     after it.
+                //   - spawn()'s report pipe, or a later failure reaches the
+                //     parent as a bare exit code with no reason attached.
+                //
+                // close_range() cannot express an exception, so rather than walk
+                // /proc/self/fd (which needs dirent parsing in a no-allocation
+                // context, and which I got wrong the first time in a way that
+                // silently closed stdout) we sort the small keep set and issue
+                // close_range over the gaps between them. bounded, obvious, and
+                // impossible to get subtly wrong.
+                std::uint32_t keep[16];
+                std::uint32_t nkeep = 0;
+                if (ll_fd >= 0) keep[nkeep++] = static_cast<std::uint32_t>(ll_fd);
+                for (std::uint32_t k = 0; k < op.keep_count && nkeep < 16; ++k) {
+                    std::uint32_t want = op.keep[k];
+                    if (want == kReportFdSentinel) want = g_report_fd;
+                    if (want != 0xffffffffu) keep[nkeep++] = want;
+                }
+                // insertion sort; nkeep is tiny and this needs no allocation.
+                for (std::uint32_t i2 = 1; i2 < nkeep; ++i2) {
+                    std::uint32_t v = keep[i2];
+                    std::uint32_t j = i2;
+                    while (j > 0 && keep[j - 1] > v) { keep[j] = keep[j - 1]; --j; }
+                    keep[j] = v;
+                }
+
+                std::uint32_t from = op.lo;
+                for (std::uint32_t k = 0; k < nkeep; ++k) {
+                    if (keep[k] < from) continue;
+                    if (keep[k] > from)
+                        sys(SYS_close_range, static_cast<long>(from),
+                            static_cast<long>(keep[k] - 1), 0);
+                    from = keep[k] + 1;
+                }
+                if (from <= op.hi)
+                    sys(SYS_close_range, static_cast<long>(from), static_cast<long>(op.hi), 0);
                 return true;
             }
             case OpCode::set_hostname: {
@@ -798,6 +846,30 @@ Status Plan::apply_range(Phase first, Phase last) const {
                 }
                 sys(SYS_close, fd);
                 if (rc < 0) return die(Errc::permission_denied, "landlock_add_rule", errno);
+                return true;
+            }
+            case OpCode::landlock_net_rule: {
+                LandlockNetRuleOp op{};
+                if (!decode(payload, op)) return die(Errc::invalid_policy, "landlock_net", 0);
+                if (ll_fd < 0) return die(Errc::invalid_policy, "landlock_net: no ruleset", 0);
+
+                // LANDLOCK_RULE_NET_PORT == 2. the port goes in host byte order,
+                // which is worth stating because every other network API in the
+                // kernel wants network order and getting it wrong here silently
+                // permits a completely different port.
+                struct NetPortAttr {
+                    std::uint64_t allowed_access;
+                    std::uint64_t port;
+                } attr{op.allowed, op.port};
+                if (sys(kSysLandlockAddRule, ll_fd, 2 /* NET_PORT */,
+                        reinterpret_cast<long>(&attr), 0) < 0) {
+                    // an older kernel that reported abi>=4 but lacks net support
+                    // gives EINVAL. that is a degradation, not a failure: the
+                    // filesystem rules still hold, and compile() already declined
+                    // to claim `strong` unless every port was expressible.
+                    if (errno != EINVAL)
+                        return die(Errc::permission_denied, "landlock_net_rule", errno);
+                }
                 return true;
             }
             case OpCode::landlock_enforce: {

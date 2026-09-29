@@ -78,6 +78,11 @@ Result<Spawned> spawn_in(const Plan& plan, const Command& cmd, const cgroup::Gro
         ::close(report[0]);
         if (use_cgroup) ::close(gate[1]);
 
+        // tell the plan which fd to spare when it closes inherited descriptors.
+        // without this the close would take our own failure channel with it, and
+        // every later error would reach the parent as a bare exit code.
+        Plan::set_report_fd(report[1]);
+
         struct Failure {
             int stage;  // 0 = plan, 1 = exec
             int code;

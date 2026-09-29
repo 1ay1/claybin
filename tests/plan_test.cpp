@@ -217,8 +217,11 @@ int main() {
         CHECK(c.error().code == Errc::unsupported);
     }
 
-    // -- granting network drops the netns, and downgrades the claim -------
+    // -- granting network: per-port gets landlock, blanket does not --------
     {
+        // a SPECIFIC port is expressible as a landlock net rule, so granting it
+        // does not cost us enforcement -- this is the one case where allowing
+        // network still reports `strong`, and it is something a netns cannot do.
         auto pol = Policy<Draft>{}
                        .read("/usr")
                        .connect("api.github.com", 443)
@@ -226,9 +229,38 @@ int main() {
                        .seal();
         auto c = compile(pol, HostCapabilities::modern_linux());
         CHECK(c.has_value());
-        // we no longer have an empty netns, so the guarantee is weaker and the
-        // report must not keep claiming `strong`.
-        CHECK(c->guarantees.strength(CapId::net_isolation) == Enforcement::partial);
+        if (c) {
+            CHECK(c->guarantees.strength(CapId::net_isolation) == Enforcement::strong);
+            CHECK(c->plan.has(OpCode::landlock_net_rule));
+        }
+    }
+    {
+        // a BLANKET grant means any port, which landlock cannot express, so the
+        // report must fall back to partial rather than imply per-port control.
+        auto pol = Policy<Draft>{}
+                       .read("/usr")
+                       .connect("", 0)  // any host, any port
+                       .syscall_profile(profiles::base())
+                       .seal();
+        auto c = compile(pol, HostCapabilities::modern_linux());
+        CHECK(c.has_value());
+        if (c) CHECK(c->guarantees.strength(CapId::net_isolation) == Enforcement::partial);
+    }
+    {
+        // and on an abi too old for net rules, likewise partial.
+        auto old = HostCapabilities::modern_linux();
+        old.landlock_abi = 3;
+        auto pol = Policy<Draft>{}
+                       .read("/usr")
+                       .connect("api.github.com", 443)
+                       .syscall_profile(profiles::base())
+                       .seal();
+        auto c = compile(pol, old);
+        CHECK(c.has_value());
+        if (c) {
+            CHECK(c->guarantees.strength(CapId::net_isolation) == Enforcement::partial);
+            CHECK(!c->plan.has(OpCode::landlock_net_rule));
+        }
     }
 
     // -- no claim without a corresponding op ------------------------------

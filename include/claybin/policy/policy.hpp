@@ -94,6 +94,14 @@ struct PolicyData {
     // than surviving as a stray process nobody is watching.
     bool die_with_parent{false};
 
+    // close every inherited descriptor above stderr before the guest runs.
+    //
+    // ON BY DEFAULT, and that is a deliberate difference from bubblewrap. an
+    // inherited fd is authority the sandbox never granted and that no wall can
+    // revoke: landlock mediates path resolution, and an open fd needs none. a
+    // caller who forgot they had a keyfile open has already lost.
+    bool close_inherited_fds{true};
+
     // capabilities to KEEP in the bounding set. bottom (drop everything) is the
     // default and the right answer for almost every sandbox; --cap-add exists
     // because flatpak occasionally needs CAP_NET_BIND_SERVICE and similar.
@@ -145,6 +153,8 @@ struct PolicyData {
         // composing policies must not be able to turn a protection off.
         r.new_session = new_session || o.new_session;
         r.die_with_parent = die_with_parent || o.die_with_parent;
+        // hardening: whichever side wants it, wins.
+        r.close_inherited_fds = close_inherited_fds || o.close_inherited_fds;
         // capabilities are authority, so this is a real meet: a capability
         // survives only if BOTH sides kept it.
         r.keep_caps = keep_caps.meet(o.keep_caps);
@@ -314,6 +324,13 @@ class Policy<Draft> {
         data_.net.allow(std::move(host), port, kNetConnect);
         return std::move(*this);
     }
+    // allow TCP bind on one port. enforced by landlock from abi 4, which is
+    // finer than anything a network namespace can express -- a netns is
+    // all-or-nothing, this is per-port.
+    Policy&& bind_port(std::uint16_t port) && {
+        data_.net.allow("", port, kNetBind);
+        return std::move(*this);
+    }
     Policy&& unix_sockets() && {
         data_.net.allow_any(kNetUnixSocket);
         return std::move(*this);
@@ -395,6 +412,15 @@ class Policy<Draft> {
     // thing that was supposed to be watching it.
     Policy&& die_with_parent() && {
         data_.die_with_parent = true;
+        return std::move(*this);
+    }
+    // let the guest inherit the caller's open descriptors.
+    //
+    // named to be uncomfortable, because it should be: every inherited fd is
+    // authority no wall can revoke. only `--bind-fd` and friends need this, and
+    // they arrange it for themselves.
+    Policy&& unsafe_inherit_fds() && {
+        data_.close_inherited_fds = false;
         return std::move(*this);
     }
 

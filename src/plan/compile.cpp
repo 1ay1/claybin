@@ -73,6 +73,12 @@ std::uint64_t to_landlock(FileRights r, std::uint32_t abi) {
     return out;
 }
 
+// landlock network access bits (abi 4+). these mediate TCP bind and connect by
+// PORT, which is a genuine second wall on top of the network namespace: a netns
+// is all-or-nothing, landlock net is per-port.
+constexpr std::uint64_t kLlBindTcp = 1ull << 0;
+constexpr std::uint64_t kLlConnectTcp = 1ull << 1;
+
 // the full set of rights a ruleset governs, for this abi. anything not in here
 // is simply not mediated by landlock, so the report must not claim it is.
 //
@@ -602,6 +608,28 @@ Result<Compiled> compile(const Policy<Sealed>& policy, const HostCapabilities& h
     // be set, so this phase has to come first. it fails with a bare EPERM
     // otherwise, which is almost impossible to diagnose from the symptom.
     if (host.no_new_privs) {
+        // close inherited descriptors FIRST, while we still can name them.
+        //
+        // THIS IS A REAL HOLE BUBBLEWRAP LEAVES OPEN. an inherited fd is a
+        // capability the sandbox never granted, and it bypasses every wall we
+        // build: landlock mediates path RESOLUTION, and an already-open fd needs
+        // none. a supervisor holding a descriptor on a private key when it spawns
+        // a guest has handed that key over, and no mount or landlock policy takes
+        // it back.
+        //
+        // bwrap closes only the fds it knows about; claybin closes everything,
+        // because "fds the caller forgot" is exactly the dangerous set.
+        //
+        // it goes here rather than in the fds phase because the mount phase uses
+        // --file source descriptors and the landlock ruleset fd is already open:
+        // closing earlier takes out the descriptors the rest of the plan needs.
+        if (d.close_inherited_fds) {
+            CloseRangeOp cr{3, 0xffffffffu, 0, {}};
+            if (cr.keep_count < sizeof cr.keep / sizeof cr.keep[0])
+                cr.keep[cr.keep_count++] = kReportFdSentinel;
+            b.op(OpCode::close_range, cr);
+        }
+
         b.op(OpCode::no_new_privs, NoNewPrivsOp{0});
         // the bounding set: everything NOT in keep_caps is dropped, so a caller
         // who says nothing gets the empty set. forbidden_caps() is masked out
@@ -630,6 +658,16 @@ Result<Compiled> compile(const Policy<Sealed>& policy, const HostCapabilities& h
     // -- phase: landlock ---------------------------------------------------
     if (host.landlock_abi > 0) {
         const std::uint64_t handled = handled_access(host.landlock_abi);
+
+        // landlock can also mediate TCP bind/connect by port, from abi 4. that is
+        // a real second wall rather than a nicety: a network namespace is
+        // all-or-nothing, so "this process may reach exactly port 443" has no
+        // netns expression at all. combining them gives a guest with no netns
+        // isolation (because it needs SOME network) a per-port restriction it
+        // could not otherwise have.
+        std::uint64_t handled_net = 0;
+        const bool want_net_rules = host.landlock_abi >= 4 && wants_net;
+        if (want_net_rules) handled_net = kLlBindTcp | kLlConnectTcp;
 
         // when a tree was built, landlock rules apply to the SANDBOX paths, not
         // the host ones, because that is what exists after the pivot. the mount
@@ -661,12 +699,45 @@ Result<Compiled> compile(const Policy<Sealed>& policy, const HostCapabilities& h
             if (allowed == 0) continue;  // a pure deny needs no rule: absence is denial
             b.op(OpCode::landlock_rule, LandlockRuleOp{b.intern(g.path), allowed});
         }
+        // network rules, one per allowed port. a port of 0 means "any", which
+        // landlock cannot express -- so in that case we install no net rules and
+        // the report says `partial` rather than pretending the ports were
+        // enforced.
+        bool net_fully_enforced = want_net_rules;
+        if (want_net_rules) {
+            if (d.net.blanket().any(kNetConnect) || d.net.blanket().any(kNetBind)) {
+                // a blanket grant is "any port", so per-port rules would be a
+                // lie by omission.
+                net_fully_enforced = false;
+            } else {
+                for (const auto& e : d.net.endpoints()) {
+                    if (e.port == 0) {
+                        net_fully_enforced = false;
+                        continue;
+                    }
+                    std::uint64_t allowed = 0;
+                    if (e.ops.any(kNetConnect)) allowed |= kLlConnectTcp;
+                    if (e.ops.any(kNetBind)) allowed |= kLlBindTcp;
+                    if (allowed == 0) continue;
+                    b.op(OpCode::landlock_net_rule,
+                         LandlockNetRuleOp{allowed, e.port, 0});
+                }
+            }
+        }
+
         b.op(OpCode::landlock_enforce,
-             LandlockEnforceOp{handled, 0, host.landlock_abi, 0});
+             LandlockEnforceOp{handled, net_fully_enforced ? handled_net : 0,
+                               host.landlock_abi, 0});
 
         report.record(CapId::fs_read, Enforcement::strong, "landlock");
         report.record(CapId::fs_write, Enforcement::strong, "landlock");
         report.record(CapId::fs_exec, Enforcement::strong, "landlock");
+        if (net_fully_enforced) {
+            // per-port TCP control, which a netns cannot give us. this is the one
+            // case where granting network does NOT mean giving up enforcement.
+            report.record(CapId::net_isolation, Enforcement::strong,
+                          "landlock net (per-port TCP)");
+        }
     } else if (!building_tree) {
         degrade(CapId::fs_read);
         degrade(CapId::fs_write);

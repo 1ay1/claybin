@@ -75,8 +75,10 @@ void usage() {
                  "  --size BYTES           size for the next --tmpfs\n"
                  "\n"
                  "claybin additions:\n"
-                 "  --profile NAME         syscall profile: base|proc|fs|compiler\n"
+                 "  --profile NAME         syscall profile: base|proc|fs|net|compiler|compiler-net\n"
                  "  --deny PATH            punch a landlock hole inside a bind\n"
+                 "  --allow-port PORT      allow TCP connect to PORT only (landlock, abi4+)\n"
+                 "  --allow-bind-port PORT allow TCP bind to PORT only\n"
                  "  --memory BYTES         memory cap (cgroup2 when available)\n"
                  "  --processes N          max processes (cgroup2 pids.max)\n"
                  "  --audit                print the guarantee report and exit\n"
@@ -441,6 +443,31 @@ int main(int argc, char** argv) {
             }
             args_fd = fd;
             i += 1;
+        } else if (std::strcmp(a, "--allow-port") == 0) {
+            if (!need(1, a)) return 1;
+            // a claybin addition with no bubblewrap equivalent: grant TCP connect
+            // to ONE port and let landlock enforce it. bwrap's --share-net is
+            // all-or-nothing because a network namespace is all-or-nothing;
+            // landlock (abi 4+) mediates per port, so this is a genuinely finer
+            // boundary than the mount-namespace model can express.
+            auto port = static_cast<std::uint16_t>(std::strtoul(eargv[i + 1], nullptr, 10));
+            if (port == 0) {
+                std::fprintf(stderr,
+                             "claybin-run: --allow-port 0 means 'any port', which landlock "
+                             "cannot enforce. use --share-net if that is what you want.\n");
+                return 1;
+            }
+            policy = std::move(policy).connect("", port);
+            i += 1;
+        } else if (std::strcmp(a, "--allow-bind-port") == 0) {
+            if (!need(1, a)) return 1;
+            auto port = static_cast<std::uint16_t>(std::strtoul(eargv[i + 1], nullptr, 10));
+            if (port == 0) {
+                std::fprintf(stderr, "claybin-run: --allow-bind-port 0 is not enforceable\n");
+                return 1;
+            }
+            policy = std::move(policy).bind_port(port);
+            i += 1;
         } else if (std::strcmp(a, "--setenv") == 0) {
             if (!need(2, a)) return 1;
             policy = std::move(policy).env(eargv[i + 1], eargv[i + 2]);
@@ -531,10 +558,13 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    SyscallPolicy sys = std::strcmp(profile_name, "base") == 0       ? profiles::base()
-                        : std::strcmp(profile_name, "proc") == 0     ? profiles::with_processes()
-                        : std::strcmp(profile_name, "fs") == 0       ? profiles::with_filesystem()
-                                                                     : profiles::compiler();
+    SyscallPolicy sys = std::strcmp(profile_name, "base") == 0   ? profiles::base()
+                        : std::strcmp(profile_name, "proc") == 0 ? profiles::with_processes()
+                        : std::strcmp(profile_name, "fs") == 0   ? profiles::with_filesystem()
+                        : std::strcmp(profile_name, "net") == 0  ? profiles::with_network()
+                        : std::strcmp(profile_name, "compiler-net") == 0
+                            ? profiles::compiler_with_network()
+                            : profiles::compiler();
     policy = std::move(policy).syscall_profile(sys);
     for (const auto& d : denies) policy = std::move(policy).deny(d);
     for (const auto& p : remount_ro) {

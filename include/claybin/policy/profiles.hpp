@@ -178,6 +178,35 @@ inline SyscallPolicy compiler() {
     return p;
 }
 
+// base plus TCP client sockets.
+//
+// pair this with a per-port `connect()` grant: landlock (abi 4+) then mediates
+// which ports are reachable, so "this program may talk to exactly 443" is
+// enforced by the kernel rather than merely described. seccomp alone can only
+// say "sockets yes or no" -- the port granularity comes from landlock, and the
+// two together are what a netns cannot give you.
+//
+// like with_filesystem(), this has NO execve: it is for a process restricting
+// itself. use compiler_with_network() when spawn() has to exec into it.
+inline SyscallPolicy with_network() {
+    SyscallPolicy p = with_filesystem();
+    for (SysNr nr : {41u /* socket */, 42u /* connect */, 43u /* accept */,
+                     44u /* sendto */, 45u /* recvfrom */, 46u /* sendmsg */,
+                     47u /* recvmsg */, 48u /* shutdown */, 49u /* bind */,
+                     50u /* listen */, 51u /* getsockname */, 52u /* getpeername */,
+                     54u /* setsockopt */, 55u /* getsockopt */, 288u /* accept4 */,
+                     299u /* recvmmsg */, 307u /* sendmmsg */})
+        p.allow(nr);
+    return p;
+}
+
+// the shape an agent-run build wants: files, subprocesses, and brokered network.
+inline SyscallPolicy compiler_with_network() {
+    SyscallPolicy p = with_network();
+    for (SysNr nr : {56u, 57u, 58u, 59u, 61u, 62u, 322u}) p.allow(nr);
+    return p;
+}
+
 #else
 
 // the profiles are syscall-number tables, so they are arch-specific by nature.
@@ -186,6 +215,8 @@ inline SyscallPolicy base() { return SyscallPolicy::nothing(); }
 inline SyscallPolicy with_processes() { return SyscallPolicy::nothing(); }
 inline SyscallPolicy with_filesystem() { return SyscallPolicy::nothing(); }
 inline SyscallPolicy compiler() { return SyscallPolicy::nothing(); }
+inline SyscallPolicy with_network() { return SyscallPolicy::nothing(); }
+inline SyscallPolicy compiler_with_network() { return SyscallPolicy::nothing(); }
 
 #endif
 

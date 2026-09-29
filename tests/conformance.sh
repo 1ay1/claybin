@@ -285,6 +285,79 @@ else
     printf '          clay   %s\n' "$c_json"
 fi
 
+# ---- where claybin is STRONGER than bubblewrap -------------------------------
+# these are not conformance cases -- bwrap cannot do them at all -- so they are
+# asserted directly. they are the reason to use claybin rather than bwrap.
+
+# 1. INHERITED FD LEAK. an open descriptor is authority no wall can revoke:
+#    landlock mediates path RESOLUTION and an already-open fd needs none. bwrap
+#    closes only the fds it knows about, so a caller who forgot they had a
+#    keyfile open has handed it to the guest. claybin closes the whole range.
+SECRET=$(mktemp)
+echo "topsecret" > "$SECRET"
+leak_clay=$($CLAY $BASE --proc /proc --chdir / \
+            -- /bin/sh -c 'for f in /proc/self/fd/*; do readlink $f; done' \
+            7<"$SECRET" 2>/dev/null | grep -c "$SECRET" || true)
+leak_bwrap=$($BWRAP $BASE --proc /proc --chdir / \
+             -- /bin/sh -c 'for f in /proc/self/fd/*; do readlink $f; done' \
+             7<"$SECRET" 2>/dev/null | grep -c "$SECRET" || true)
+if [ "$leak_clay" = "0" ]; then
+    PASS=$((PASS+1))
+    printf '  ok    no inherited fd leak (bwrap leaks %s here)\n' "$leak_bwrap"
+else
+    FAIL=$((FAIL+1))
+    printf '  FAIL  an inherited fd reached the guest\n'
+fi
+rm -f "$SECRET"
+
+# 2. PER-PORT NETWORK. a network namespace is all-or-nothing, so bwrap can only
+#    offer --share-net. landlock (abi 4+) mediates TCP by port, so claybin can
+#    say "exactly 443" and have the kernel enforce it.
+NT=$(mktemp -u)
+cat > "$NT.c" <<'NTEOF'
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <errno.h>
+#include <unistd.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+int main(int argc, char** argv) {
+    int port = atoi(argv[1]);
+    int s = socket(AF_INET, SOCK_STREAM, 0);
+    if (s < 0) { printf("socket: %s\n", strerror(errno)); return 2; }
+    struct sockaddr_in a; memset(&a, 0, sizeof a);
+    a.sin_family = AF_INET; a.sin_port = htons(port);
+    inet_pton(AF_INET, "127.0.0.1", &a.sin_addr);
+    int r = connect(s, (struct sockaddr*)&a, sizeof a);
+    printf("port %d: %s\n", port, r == 0 ? "connected" : strerror(errno));
+    close(s);
+    return 0;
+}
+NTEOF
+if cc -O0 -o "$NT" "$NT.c" 2>/dev/null; then
+    ok443=$($CLAY $BASE --bind-try "$NT" /nt --profile compiler-net \
+            --allow-port 443 --chdir / -- /nt 443 2>&1 | head -1)
+    no80=$($CLAY $BASE --bind-try "$NT" /nt --profile compiler-net \
+           --allow-port 443 --chdir / -- /nt 80 2>&1 | head -1)
+    # granted port: the kernel lets the connect through, so "refused" (nothing
+    # listening) is a PASS. ungranted port: landlock denies it outright.
+    case "$ok443" in *refused*|*connected*) a=1 ;; *) a=0 ;; esac
+    case "$no80" in *"Permission denied"*) b=1 ;; *) b=0 ;; esac
+    if [ "$a" = "1" ] && [ "$b" = "1" ]; then
+        PASS=$((PASS+1))
+        printf '  ok    per-port TCP control (bwrap has no equivalent)\n'
+    else
+        FAIL=$((FAIL+1))
+        printf '  FAIL  per-port network: 443=[%s] 80=[%s]\n' "$ok443" "$no80"
+    fi
+else
+    SKIP=$((SKIP+1))
+    printf '  skip  per-port TCP control (no cc)\n'
+fi
+rm -f "$NT" "$NT.c"
+
 # ---- claybin is deliberately stricter ---------------------------------------
 check_stricter "--not-a-security-boundary" \
     $BASE --not-a-security-boundary --chdir / -- /usr/bin/true

@@ -99,7 +99,9 @@ enum class OpCode : std::uint16_t {
     pivot_into_newroot,
     umount,
     dup2,
-    close_range,
+    close_range,    // close inherited descriptors. see Phase::fds for the order
+                    // reasoning: this has to be LATE, after every fd the plan
+                    // itself needs has been used.
     set_hostname,
     chdir,
     new_session,      // setsid: detach from the host's controlling terminal
@@ -107,6 +109,9 @@ enum class OpCode : std::uint16_t {
     set_rlimit,
     set_ids,
     landlock_rule,
+    // landlock network rule (abi 4+): mediate TCP bind/connect by PORT. a real
+    // second wall over a netns, which is all-or-nothing.
+    landlock_net_rule,
     landlock_enforce,
     drop_caps,
     no_new_privs,
@@ -127,8 +132,13 @@ constexpr Phase phase_of(OpCode c) {
         case OpCode::pivot_root:
         case OpCode::pivot_into_newroot:
         case OpCode::umount: return Phase::mounts;
-        case OpCode::dup2:
-        case OpCode::close_range: return Phase::fds;
+        case OpCode::dup2: return Phase::fds;
+        // close_range lives in privdrop, not fds. it has to run AFTER the mount
+        // phase (which uses --file source fds) and after the landlock ruleset fd
+        // exists, or it closes the very descriptors the rest of the plan needs.
+        // putting it next to the other "give up capability" ops is also the
+        // honest description of what it is.
+        case OpCode::close_range: return Phase::privdrop;
         case OpCode::set_hostname:
         case OpCode::chdir:
         case OpCode::new_session:
@@ -136,6 +146,7 @@ constexpr Phase phase_of(OpCode c) {
         case OpCode::set_rlimit:
         case OpCode::set_ids: return Phase::process;
         case OpCode::landlock_rule:
+        case OpCode::landlock_net_rule:
         case OpCode::landlock_enforce: return Phase::landlock;
         case OpCode::drop_caps:
         case OpCode::no_new_privs: return Phase::privdrop;
@@ -167,6 +178,7 @@ constexpr const char* to_string(OpCode c) {
         case OpCode::set_rlimit: return "set_rlimit";
         case OpCode::set_ids: return "set_ids";
         case OpCode::landlock_rule: return "landlock_rule";
+        case OpCode::landlock_net_rule: return "landlock_net";
         case OpCode::landlock_enforce: return "landlock_enforce";
         case OpCode::drop_caps: return "drop_caps";
         case OpCode::no_new_privs: return "no_new_privs";
@@ -257,7 +269,18 @@ struct Dup2Op {
 struct CloseRangeOp {
     std::uint32_t lo;
     std::uint32_t hi;
+    // descriptors to spare. close_range() itself cannot express an exception, so
+    // apply() walks /proc/self/fd when this is non-empty. small and fixed: the
+    // only things that ever need sparing are spawn's report pipe and any --file
+    // source not yet copied.
+    std::uint32_t keep_count;
+    std::uint32_t keep[13];
 };
+
+// a placeholder in CloseRangeOp::keep that spawn() rewrites to its own report
+// pipe fd at apply time. the compiler cannot know that number -- the pipe does
+// not exist until spawn runs -- so it reserves a slot instead.
+inline constexpr std::uint32_t kReportFdSentinel = 0xfffffffeu;
 struct SetHostnameOp {
     Ref name;
 };
@@ -277,6 +300,12 @@ struct SetIdsOp {
 struct LandlockRuleOp {
     Ref path;
     std::uint64_t allowed;  // landlock access bits
+};
+// a network rule: which TCP operations are permitted on one port.
+struct LandlockNetRuleOp {
+    std::uint64_t allowed;
+    std::uint16_t port;
+    std::uint16_t _pad[3];
 };
 struct LandlockEnforceOp {
     std::uint64_t handled_fs;   // access rights the ruleset governs
@@ -401,6 +430,11 @@ class Plan {
     Status apply_from(Phase start) const { return apply_range(start, Phase::count_); }
 
     Status apply_range(Phase first, Phase last) const;
+
+    // tell apply() which fd the kReportFdSentinel slot stands for. set by
+    // spawn() in the child, before apply, because the pipe does not exist when
+    // the plan is compiled.
+    static void set_report_fd(int fd);
 
   private:
     friend class PlanBuilder;
