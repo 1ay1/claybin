@@ -3,7 +3,9 @@
 
 #include "harness.hpp"
 
+#include "claybin/plan/compile.hpp"
 #include "claybin/policy/policy.hpp"
+#include "claybin/policy/profiles.hpp"
 
 using namespace clay;
 using namespace clay::literals;
@@ -12,18 +14,31 @@ using namespace clay::test;
 int main() {
     // --- README: the headline example ------------------------------------
     auto policy = Policy<Draft>{}
-                      .read("/usr")
-                      .read_write("/workspace")
+                      .ro_bind("/usr", "/usr")        // build a tree, bubblewrap-style
+                      .bind("/workspace", "/work")
+                      .deny("/work/.git")             // ...and punch a landlock hole in it
+                      .tmpfs("/tmp", 64_MB)
                       .memory(512_MB)
-                      .processes(64)
-                      .wall_clock(30_s)
+                      .syscall_profile(profiles::compiler())
                       .seal();
 
-    // composition is intersection. this can only ever be more restrictive.
-    auto tighter = policy & Policy<Sealed>::nothing();
+    auto compiled = compile(policy, HostCapabilities::modern_linux());
+    CHECK(compiled.has_value());
+    if (!compiled) return finish("readme_example_test");
 
+    auto ok = compiled->require(Enforcement::strong,
+                                {CapId::fs_read, CapId::syscall_filter});
+    CHECK(ok.has_value());
+
+    // the tree was built, and both walls are in the plan
+    CHECK(compiled->plan.has(OpCode::pivot_root));
+    CHECK(compiled->plan.has(OpCode::landlock_enforce));
+    CHECK(compiled->plan.has(OpCode::seccomp_install));
+    CHECK(compiled->plan.well_ordered());
+
+    // composition is intersection: it can only ever be more restrictive.
+    auto tighter = policy & Policy<Sealed>::nothing();
     CHECK(policy.subsumes(tighter));
-    CHECK(policy.data().fs.effective("/workspace/a.c").subsumes(FileRights::write()));
     CHECK(tighter.data().fs.is_nothing());
 
     return finish("readme_example_test");

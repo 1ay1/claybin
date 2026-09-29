@@ -3,6 +3,7 @@
 #if defined(__linux__)
 
 #include <cerrno>
+#include <csignal>
 #include <fcntl.h>
 #include <sched.h>
 #include <sys/syscall.h>
@@ -63,7 +64,40 @@ Result<Spawned> spawn(const Plan& plan, const Command& cmd) {
             char mech[32];
         } f{};
 
-        auto st = plan.apply();
+        // the pid namespace needs a fork to ENTER: unshare(CLONE_NEWPID) puts
+        // our children inside it and leaves us outside, and mounting procfs
+        // requires membership. the plan's own unshare op already created the
+        // namespace (along with user/mount/net), so here we only need to step
+        // into it before the mount phase runs.
+        //
+        // apply_until() runs the namespace phase, we fork, then the grandchild
+        // runs the rest -- mounts included -- as a real member of the new pid
+        // namespace, and as its pid 1.
+        auto st = plan.apply_until(Phase::mounts);
+        if (st) {
+            pid_t inner = ::fork();
+            if (inner < 0) {
+                f.stage = 0;
+                f.sys_errno = errno;
+                for (int k = 0; k < 8; ++k) f.mech[k] = "pid-fork"[k];
+                ssize_t ig = ::write(report[1], &f, sizeof f);
+                (void)ig;
+                ::_exit(kExitPlanFailed);
+            }
+            if (inner > 0) {
+                // the outer child is only a shepherd: it waits for the real
+                // sandboxed process and mirrors its exit status, so the
+                // caller's waitpid() still means what they expect.
+                ::close(report[1]);
+                int wst = 0;
+                ::waitpid(inner, &wst, 0);
+                if (WIFSIGNALED(wst)) ::_exit(128 + WTERMSIG(wst));
+                ::_exit(WIFEXITED(wst) ? WEXITSTATUS(wst) : 1);
+            }
+            // grandchild: finish the plan from the mount phase on
+            st = plan.apply_from(Phase::mounts);
+        }
+
         if (!st) {
             f.stage = 0;
             f.code = static_cast<int>(st.error().code);

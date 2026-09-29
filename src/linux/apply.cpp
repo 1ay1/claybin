@@ -58,6 +58,59 @@ std::size_t cstr_len(const char* s) {
     return n;
 }
 
+// mkdir -p, without allocating. walks the path in place using a scratch buffer
+// the caller owns, creating each component and ignoring EEXIST.
+bool mkdir_p(const char* path, std::uint32_t mode, char* scratch, std::size_t cap) {
+    std::size_t len = cstr_len(path);
+    if (len == 0 || len + 1 > cap) return false;
+    for (std::size_t i = 0; i <= len; ++i) scratch[i] = path[i];
+
+    for (std::size_t i = 1; i <= len; ++i) {
+        if (scratch[i] != '/' && i != len) continue;
+        char saved = scratch[i];
+        scratch[i] = '\0';
+        long rc = sys(SYS_mkdirat, AT_FDCWD, reinterpret_cast<long>(scratch),
+                      static_cast<long>(mode));
+        if (rc < 0 && errno != EEXIST) return false;
+        scratch[i] = saved;
+    }
+    return true;
+}
+
+// create an empty regular file, parents included. bind-mounting a device node
+// needs a file to land on, not a directory.
+bool touch_file(const char* path, std::uint32_t mode, char* scratch, std::size_t cap) {
+    std::size_t len = cstr_len(path);
+    if (len == 0 || len + 1 > cap) return false;
+
+    // make the parent directory first. copy the prefix into the scratch buffer
+    // and terminate it there -- the earlier version handed mkdir_p a pointer
+    // PAST the string it had just written, so the parent was never created and
+    // the bind mount failed with ENOENT.
+    std::size_t last_slash = 0;
+    for (std::size_t i = 0; i < len; ++i)
+        if (path[i] == '/') last_slash = i;
+    if (last_slash > 0) {
+        for (std::size_t i = 0; i < last_slash; ++i) scratch[i] = path[i];
+        scratch[last_slash] = '\0';
+        // walk it inline rather than recursing: one buffer, no aliasing.
+        for (std::size_t i = 1; i <= last_slash; ++i) {
+            if (scratch[i] != '/' && i != last_slash) continue;
+            char saved = scratch[i];
+            scratch[i] = '\0';
+            long rc = sys(SYS_mkdirat, AT_FDCWD, reinterpret_cast<long>(scratch), 0755);
+            if (rc < 0 && errno != EEXIST) return false;
+            scratch[i] = saved;
+        }
+    }
+
+    long fd = sys(SYS_openat, AT_FDCWD, reinterpret_cast<long>(path),
+                  O_WRONLY | O_CREAT | O_CLOEXEC, static_cast<long>(mode));
+    if (fd < 0) return errno == EEXIST;
+    sys(SYS_close, fd);
+    return true;
+}
+
 // render "N N 1\n" for a uid/gid map without touching snprintf, which may
 // allocate. the buffer is caller-owned and stack-allocated.
 std::size_t render_identity_map(char* buf, std::size_t cap, unsigned id) {
@@ -118,7 +171,7 @@ constexpr int kLandlockRuleTypePathBeneath = 1;
 
 }  // namespace
 
-Status Plan::apply() const {
+Status Plan::apply_range(Phase first, Phase last) const {
     // capture our identity BEFORE anything runs. once unshare(CLONE_NEWUSER)
     // succeeds we are in a namespace with no map yet, so getuid() returns the
     // overflow uid (65534) rather than who we actually are -- and writing that
@@ -172,6 +225,10 @@ Status Plan::apply() const {
     }
 
     bool ok = for_each([&](OpCode code, std::span<const std::byte> payload) {
+        // phase window: spawn() splits the plan so it can fork into the pid
+        // namespace between the namespace and mount phases.
+        Phase p = phase_of(code);
+        if (p < first || p >= last) return true;
         switch (code) {
             case OpCode::unshare: {
                 UnshareOp op{};
@@ -205,6 +262,38 @@ Status Plan::apply() const {
                     return die(Errc::permission_denied, "write_file", errno);
                 return true;
             }
+            case OpCode::mkdir_p: {
+                MkdirOp op{};
+                if (!decode(payload, op)) return die(Errc::invalid_policy, "mkdir", 0);
+                const char* p = cstr(op.path);
+                if (!p) return die(Errc::invalid_policy, "mkdir", 0);
+                char scratch[4096];
+                if (!mkdir_p(p, op.mode, scratch, sizeof scratch))
+                    return die(Errc::io_error, "mkdir", errno);
+                return true;
+            }
+            case OpCode::touch: {
+                MkdirOp op{};
+                if (!decode(payload, op)) return die(Errc::invalid_policy, "touch", 0);
+                const char* p = cstr(op.path);
+                if (!p) return die(Errc::invalid_policy, "touch", 0);
+                char scratch[4096];
+                if (!touch_file(p, op.mode, scratch, sizeof scratch))
+                    return die(Errc::io_error, "touch", errno);
+                return true;
+            }
+            case OpCode::symlink_at: {
+                SymlinkOp op{};
+                if (!decode(payload, op)) return die(Errc::invalid_policy, "symlink", 0);
+                const char* tgt = cstr(op.target);
+                const char* lnk = cstr(op.linkpath);
+                if (!tgt || !lnk) return die(Errc::invalid_policy, "symlink", 0);
+                if (sys(SYS_symlinkat, reinterpret_cast<long>(tgt), AT_FDCWD,
+                        reinterpret_cast<long>(lnk)) < 0 &&
+                    errno != EEXIST)
+                    return die(Errc::io_error, "symlink", errno);
+                return true;
+            }
             case OpCode::mount: {
                 MountOp op{};
                 if (!decode(payload, op)) return die(Errc::invalid_policy, "mount", 0);
@@ -213,10 +302,20 @@ Status Plan::apply() const {
                 const char* fst = cstr(op.fstype);
                 const char* dat = op.data.len ? cstr(op.data) : nullptr;
                 if (!src || !tgt || !fst) return die(Errc::invalid_policy, "mount", 0);
+
+                // our own "may fail" bit, above the kernel's flag range. a
+                // device node missing on this host, or a --bind-try whose
+                // source is absent, is not a security failure: the path simply
+                // is not there, which is the safe direction.
+                constexpr std::uint64_t kOptional = 1ull << 56;
+                const bool optional = (op.flags & kOptional) != 0;
+                const std::uint64_t flags = op.flags & ~kOptional;
+
                 if (sys(SYS_mount, reinterpret_cast<long>(src), reinterpret_cast<long>(tgt),
-                        reinterpret_cast<long>(fst), static_cast<long>(op.flags),
-                        reinterpret_cast<long>(dat)) < 0)
-                    return die(Errc::permission_denied, "mount", errno);
+                        reinterpret_cast<long>(fst), static_cast<long>(flags),
+                        reinterpret_cast<long>(dat)) < 0) {
+                    if (!optional) return die(Errc::permission_denied, "mount", errno);
+                }
                 return true;
             }
             case OpCode::pivot_root: {
@@ -225,8 +324,17 @@ Status Plan::apply() const {
                 const char* nr = cstr(op.new_root);
                 const char* po = cstr(op.put_old);
                 if (!nr || !po) return die(Errc::invalid_policy, "pivot_root", 0);
+                // pivot_root requires the new root to be a mount point and the
+                // cwd to be inside it, otherwise it returns EINVAL for reasons
+                // that are very hard to read off the symptom.
+                if (sys(SYS_chdir, reinterpret_cast<long>(nr)) < 0)
+                    return die(Errc::io_error, "pivot_root: chdir", errno);
                 if (sys(SYS_pivot_root, reinterpret_cast<long>(nr), reinterpret_cast<long>(po)) < 0)
                     return die(Errc::permission_denied, "pivot_root", errno);
+                // land somewhere valid inside the new tree before the old root
+                // is detached.
+                if (sys(SYS_chdir, reinterpret_cast<long>("/")) < 0)
+                    return die(Errc::io_error, "pivot_root: chdir /", errno);
                 return true;
             }
             case OpCode::umount: {
@@ -236,6 +344,11 @@ Status Plan::apply() const {
                 if (!t) return die(Errc::invalid_policy, "umount", 0);
                 if (sys(SYS_umount2, reinterpret_cast<long>(t), static_cast<long>(op.flags)) < 0)
                     return die(Errc::permission_denied, "umount", errno);
+                // detaching the old root is not optional: while it is mounted,
+                // the entire host filesystem is reachable through it and the
+                // pivot bought us nothing. so also remove the mount point, and
+                // treat a failure as fatal rather than cosmetic.
+                sys(SYS_unlinkat, AT_FDCWD, reinterpret_cast<long>(t), 0x200 /* AT_REMOVEDIR */);
                 return true;
             }
             case OpCode::dup2: {
@@ -377,7 +490,7 @@ Status Plan::apply() const {
 
 namespace clay {
 
-Status Plan::apply() const {
+Status Plan::apply_range(Phase, Phase) const {
     return std::unexpected(Error{Errc::unsupported, "plan::apply: linux only"});
 }
 

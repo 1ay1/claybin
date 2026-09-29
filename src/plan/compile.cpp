@@ -88,6 +88,35 @@ std::uint64_t handled_access(std::uint32_t abi) {
     return h;
 }
 
+constexpr std::uint64_t kMsRdonly = 1;
+constexpr std::uint64_t kMsNosuid = 2;
+constexpr std::uint64_t kMsNodev = 4;
+constexpr std::uint64_t kMsNoexec = 8;
+constexpr std::uint64_t kMsRemount = 32;
+constexpr std::uint64_t kMsBind = 4096;
+constexpr std::uint64_t kMsRec = 16384;
+constexpr std::uint64_t kMsPrivate = 1ull << 18;
+
+// our own flag, well above the kernel's range. marks a mount that may fail
+// without failing the sandbox: a device node that does not exist on this host,
+// or a --bind-try source. apply() strips it before the syscall.
+constexpr std::uint64_t kClayMountOptional = 1ull << 56;
+
+// where the new root is assembled before we pivot into it.
+//
+// this is a tmpfs we mount ourselves inside our private mount namespace, so it
+// needs no privilege and no pre-existing writable directory. mounting it at a
+// path the caller might also use would be a problem, so we mount OVER a
+// well-known always-present directory and assemble inside that.
+//
+// /tmp is the only directory guaranteed to exist and be writable everywhere,
+// and mounting our own tmpfs over it inside a private namespace is invisible to
+// the host and to any /tmp the caller asks for (theirs is mounted later, deeper
+// in the tree).
+constexpr const char* kStageBase = "/tmp";
+constexpr const char* kStageRoot = "/tmp/.clay-root";
+constexpr const char* kOldRoot = "/tmp/.clay-root/.clay-old";
+
 }  // namespace
 
 Result<Compiled> compile(const Policy<Sealed>& policy, const HostCapabilities& host) {
@@ -153,6 +182,137 @@ Result<Compiled> compile(const Policy<Sealed>& policy, const HostCapabilities& h
         report.record(CapId::net_isolation, Enforcement::partial, "policy-only");
     }
 
+    // -- phase: mounts -----------------------------------------------------
+    //
+    // this is the bubblewrap model: build a whole new tree out of binds and
+    // pivot into it, so the host filesystem is not merely restricted but
+    // absent. what is not mounted cannot be named, which is a stronger and much
+    // easier-to-audit property than "is denied".
+    const bool building_tree = !d.mounts.empty();
+    if (building_tree) {
+        if (!host.mount_namespaces)
+            return std::unexpected(
+                Error{Errc::unsupported, "mounts require a mount namespace"});
+
+        // 1. make our whole tree private, or every mount we do would propagate
+        //    back to the host. bwrap does this first too, and skipping it is a
+        //    classic container-escape-by-accident.
+        b.op(OpCode::mount, MountOp{b.intern("none"), b.intern("/"), b.intern("none"),
+                                    Ref{}, kMsRec | kMsPrivate});
+
+        // 2. a private tmpfs over /tmp, then the staging root inside it. doing
+        //    it this way means we never need a writable directory on the host:
+        //    the tmpfs is ours, in our own namespace, and the caller's own /tmp
+        //    mount (if any) lands deeper in the tree and is unaffected.
+        b.op(OpCode::mount, MountOp{b.intern("tmpfs"), b.intern(kStageBase),
+                                    b.intern("tmpfs"), Ref{}, kMsNosuid | kMsNodev});
+        b.op(OpCode::mkdir_p, MkdirOp{b.intern(kStageRoot), 0755, 0});
+        b.op(OpCode::mount, MountOp{b.intern("tmpfs"), b.intern(kStageRoot),
+                                    b.intern("tmpfs"), Ref{}, kMsNosuid | kMsNodev});
+        // the pivot target has to exist inside the new root
+        b.op(OpCode::mkdir_p, MkdirOp{b.intern(kOldRoot), 0755, 0});
+
+        // 3. every requested mount, rebased under the staging root
+        for (const auto& m : d.mounts.mounts()) {
+            std::string dst = std::string(kStageRoot) + path::normalize(m.dest);
+            switch (m.kind) {
+                case MountKind::bind:
+                case MountKind::bind_ro:
+                case MountKind::bind_dev: {
+                    std::uint64_t flags = kMsBind | kMsRec;
+                    if (m.kind != MountKind::bind_dev) flags |= kMsNodev;
+                    if (m.kind == MountKind::bind_ro) flags |= kMsRdonly;
+                    // nosuid always: a suid binary inside the sandbox is a
+                    // privilege path we never want, and no_new_privs alone does
+                    // not cover a nested userns.
+                    flags |= kMsNosuid;
+                    if (m.optional) flags |= kClayMountOptional;
+                    // the mount point must exist; a fresh tmpfs root is empty.
+                    b.op(OpCode::mkdir_p, MkdirOp{b.intern(dst), 0755, 0});
+                    b.op(OpCode::mount, MountOp{b.intern(m.source), b.intern(dst),
+                                                b.intern("none"), Ref{}, flags});
+                    // a read-only bind needs a second remount: the kernel
+                    // ignores MS_RDONLY on the initial bind, which is a
+                    // notorious way to end up with a writable "read-only" mount.
+                    if (m.kind == MountKind::bind_ro)
+                        b.op(OpCode::mount,
+                             MountOp{b.intern("none"), b.intern(dst), b.intern("none"), Ref{},
+                                     kMsBind | kMsRec | kMsRemount | kMsRdonly | kMsNosuid});
+                    break;
+                }
+                case MountKind::tmpfs: {
+                    b.op(OpCode::mkdir_p, MkdirOp{b.intern(dst), 0755, 0});
+                    b.op(OpCode::mount, MountOp{b.intern("tmpfs"), b.intern(dst),
+                                                b.intern("tmpfs"), Ref{},
+                                                kMsNosuid | kMsNodev});
+                    break;
+                }
+                case MountKind::proc: {
+                    // a fresh procfs shows only our own pid namespace, so the
+                    // guest cannot see or signal host processes through /proc.
+                    //
+                    // NOTE: this requires being a MEMBER of the pid namespace,
+                    // not merely its creator. unshare(CLONE_NEWPID) puts our
+                    // CHILDREN in the new namespace and leaves us outside it,
+                    // so mounting procfs here fails with EPERM. spawn() does a
+                    // second fork after apply() for exactly this reason.
+                    b.op(OpCode::mkdir_p, MkdirOp{b.intern(dst), 0755, 0});
+                    b.op(OpCode::mount, MountOp{b.intern("proc"), b.intern(dst),
+                                                b.intern("proc"), Ref{},
+                                                kMsNosuid | kMsNodev | kMsNoexec});
+                    break;
+                }
+                case MountKind::devtmpfs: {
+                    // a tmpfs, then bind the handful of device nodes a program
+                    // actually needs. binding individual nodes rather than
+                    // mounting devtmpfs means /dev/mem and friends are simply
+                    // absent rather than present-but-denied.
+                    b.op(OpCode::mkdir_p, MkdirOp{b.intern(dst), 0755, 0});
+                    b.op(OpCode::mount, MountOp{b.intern("tmpfs"), b.intern(dst),
+                                                b.intern("tmpfs"), Ref{},
+                                                kMsNosuid | kMsNoexec});
+                    for (const char* node : {"null", "zero", "full", "random", "urandom", "tty"}) {
+                        std::string host_node = std::string("/dev/") + node;
+                        std::string sand_node = dst + "/" + node;
+                        // a bind mount needs the target to EXIST and to be the
+                        // same kind of thing, so a device node needs an empty
+                        // regular file to land on, not a directory.
+                        b.op(OpCode::touch, MkdirOp{b.intern(sand_node), 0600, 0});
+                        // optional: /dev/tty does not exist when there is no
+                        // controlling terminal, and a missing device node is not
+                        // a security failure -- it just is not there. the flag
+                        // tells apply() to skip rather than abort.
+                        b.op(OpCode::mount,
+                             MountOp{b.intern(host_node), b.intern(sand_node), b.intern("none"),
+                                     Ref{}, kMsBind | kMsNosuid | kClayMountOptional});
+                    }
+                    report.record(CapId::device_isolation, Enforcement::strong, "dev allowlist");
+                    break;
+                }
+                case MountKind::symlink: {
+                    b.op(OpCode::symlink_at,
+                         SymlinkOp{b.intern(m.source), b.intern(dst)});
+                    break;
+                }
+                case MountKind::dir: {
+                    b.op(OpCode::mkdir_p, MkdirOp{b.intern(dst), m.perms ? m.perms : 0755u, 0});
+                    break;
+                }
+                case MountKind::mqueue:
+                    break;
+            }
+        }
+
+        // 4. pivot into the new tree and detach the old one. after this the
+        //    host filesystem is not reachable by any path.
+        b.op(OpCode::pivot_root,
+             PivotRootOp{b.intern(kStageRoot), b.intern(kOldRoot)});
+        b.op(OpCode::umount, UmountOp{b.intern("/.clay-old"), 2 /* MNT_DETACH */});
+
+        report.record(CapId::fs_read, Enforcement::strong, "mount-ns");
+        report.record(CapId::fs_write, Enforcement::strong, "mount-ns");
+    }
+
     // -- phase: process ----------------------------------------------------
     if (host.uts_namespaces && !d.hostname.empty())
         b.op(OpCode::set_hostname, SetHostnameOp{b.intern(d.hostname)});
@@ -209,8 +369,25 @@ Result<Compiled> compile(const Policy<Sealed>& policy, const HostCapabilities& h
     // -- phase: landlock ---------------------------------------------------
     if (host.landlock_abi > 0) {
         const std::uint64_t handled = handled_access(host.landlock_abi);
-        const auto& grants = d.fs.grants();
-        for (const auto& g : grants) {
+
+        // when a tree was built, landlock rules apply to the SANDBOX paths, not
+        // the host ones, because that is what exists after the pivot. the mount
+        // plan already describes exactly those, so fold its implied grants in
+        // and let meet() keep whichever is tighter.
+        FsAuthority effective = d.fs;
+        if (building_tree) {
+            FsAuthority implied = d.mounts.implied_authority();
+            // the new root itself needs to be listable, or readdir("/") fails
+            // and anything that walks the tree looks broken for no visible
+            // reason. it is a tmpfs containing only what we mounted, so this
+            // grants nothing the caller did not already ask for.
+            implied.grant("/", FileRights::read());
+            // if the caller said nothing about access, the mounts decide it.
+            // otherwise intersect: a path must be both mounted AND granted.
+            effective = d.fs.is_nothing() ? implied : d.fs.meet(implied);
+        }
+
+        for (const auto& g : effective.grants()) {
             // a rule may only allow what the ruleset handles. masking here
             // rather than trusting the translation keeps a future FileRights
             // bit from silently breaking every sandbox.
@@ -224,7 +401,7 @@ Result<Compiled> compile(const Policy<Sealed>& policy, const HostCapabilities& h
         report.record(CapId::fs_read, Enforcement::strong, "landlock");
         report.record(CapId::fs_write, Enforcement::strong, "landlock");
         report.record(CapId::fs_exec, Enforcement::strong, "landlock");
-    } else {
+    } else if (!building_tree) {
         degrade(CapId::fs_read);
         degrade(CapId::fs_write);
         degrade(CapId::fs_exec);

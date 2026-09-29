@@ -17,6 +17,7 @@
 #include "claybin/core/error.hpp"
 #include "claybin/core/lattice.hpp"
 #include "claybin/policy/filesystem.hpp"
+#include "claybin/policy/mounts.hpp"
 #include "claybin/policy/resources.hpp"
 #include "claybin/policy/syscalls.hpp"
 
@@ -66,6 +67,11 @@ struct PolicyData {
     ProcOps proc{};
     Isolation isolation{Isolation::process};
 
+    // the filesystem tree to build, bubblewrap-style. orthogonal to `fs`:
+    // mounts decide what is VISIBLE, landlock decides what is ACCESSIBLE.
+    // empty means "inherit the host tree" and rely on landlock alone.
+    MountPlan mounts{};
+
     // environment is authority too: PATH, LD_PRELOAD and friends are an
     // execution channel. default is empty, opt in by name.
     std::vector<EnvVar> env{};
@@ -84,6 +90,18 @@ struct PolicyData {
         // stronger isolation wins, and stronger is the larger enum value.
         r.isolation = isolation > o.isolation ? isolation : o.isolation;
         r.env_cleared = env_cleared || o.env_cleared;
+
+        // mounts are an ordered construction, not a set, so there is no
+        // meaningful intersection of two trees. take whichever side has one;
+        // if both do, the caller has asked for something undefined and
+        // compile() rejects it rather than inventing a tree.
+        if (mounts.empty())
+            r.mounts = o.mounts;
+        else if (o.mounts.empty())
+            r.mounts = mounts;
+        else
+            r.mounts = mounts;  // marked as a conflict by compile()
+
         // env intersects: a var survives only if both sides agree on it exactly.
         for (const auto& a : env)
             for (const auto& b : o.env)
@@ -118,6 +136,23 @@ class Policy<Draft> {
     // ceilings, so a draft starts unlimited and the caller tightens explicitly.
     Policy() { data_.resources = ResourceLimits::everything(); }
 
+    Policy(const Policy&) = default;
+    Policy& operator=(const Policy&) = default;
+    Policy(Policy&&) noexcept = default;
+
+    // self-move must be a no-op, not a wipe.
+    //
+    // the builders are rvalue-qualified and return `Policy&&`, which makes the
+    // natural loop body `p = std::move(p).bind(a, b);` a SELF-move-assignment.
+    // the implicit operator= would move each vector member onto itself and
+    // leave it empty, so a CLI parser accumulating mounts in a loop would
+    // silently end up with none -- a sandbox missing exactly the walls the user
+    // asked for. guard it.
+    Policy& operator=(Policy&& o) noexcept {
+        if (this != &o) data_ = std::move(o.data_);
+        return *this;
+    }
+
     // -- filesystem ---------------------------------------------------------
     Policy&& read(std::string_view p) && {
         data_.fs.grant(p, FileRights::read());
@@ -138,6 +173,49 @@ class Policy<Draft> {
     // punch a hole inside an already-granted subtree.
     Policy&& deny(std::string_view p) && {
         data_.fs.deny(p);
+        return std::move(*this);
+    }
+
+    // -- filesystem tree construction (the bubblewrap model) ---------------
+    //
+    // these build a NEW root from binds, rather than restricting the host's.
+    // naming follows bwrap so a port is mechanical: --ro-bind is ro_bind, and
+    // so on. each bind also implies the matching landlock grant, so the tree
+    // and the access policy stay in sync without saying everything twice.
+    Policy&& ro_bind(std::string src, std::string dst) && {
+        data_.mounts.bind_ro(std::move(src), std::move(dst));
+        return std::move(*this);
+    }
+    Policy&& bind(std::string src, std::string dst) && {
+        data_.mounts.bind(std::move(src), std::move(dst));
+        return std::move(*this);
+    }
+    Policy&& dev_bind(std::string src, std::string dst) && {
+        data_.mounts.dev_bind(std::move(src), std::move(dst));
+        return std::move(*this);
+    }
+    Policy&& bind_try(std::string src, std::string dst, bool ro = true) && {
+        data_.mounts.bind_try(std::move(src), std::move(dst), ro);
+        return std::move(*this);
+    }
+    Policy&& tmpfs(std::string dst, Bytes size = Bytes::unlimited()) && {
+        data_.mounts.tmpfs(std::move(dst), size.is_unlimited() ? 0 : size.value());
+        return std::move(*this);
+    }
+    Policy&& proc_fs(std::string dst = "/proc") && {
+        data_.mounts.proc(std::move(dst));
+        return std::move(*this);
+    }
+    Policy&& dev_fs(std::string dst = "/dev") && {
+        data_.mounts.dev(std::move(dst));
+        return std::move(*this);
+    }
+    Policy&& symlink(std::string target, std::string dst) && {
+        data_.mounts.symlink(std::move(target), std::move(dst));
+        return std::move(*this);
+    }
+    Policy&& mkdir(std::string dst, std::uint32_t perms = 0755) && {
+        data_.mounts.dir(std::move(dst), perms);
         return std::move(*this);
     }
 

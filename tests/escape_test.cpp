@@ -125,6 +125,14 @@ Outcome run_in_sandbox(const Policy<Sealed>& pol, const char* attack, const char
     if (o.exited) o.code = WEXITSTATUS(status);
     o.signalled = WIFSIGNALED(status);
     if (o.signalled) o.sig = WTERMSIG(status);
+    // spawn() forks a shepherd to enter the pid namespace, and a shepherd
+    // cannot re-raise a signal death as a signal death without also dying to
+    // it, so it relays 128+signo instead. treat that as a kill, which is what
+    // it means.
+    if (o.exited && o.code > 128 && o.code < 160) {
+        o.signalled = true;
+        o.sig = o.code - 128;
+    }
     return o;
 }
 

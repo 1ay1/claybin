@@ -79,6 +79,9 @@ enum class OpCode : std::uint16_t {
     unshare = 1,
     write_file,     // uid_map, gid_map, setgroups: small writes with no libc
     mount,
+    mkdir_p,        // create a mount point (and its parents) inside the new tree
+    touch,          // create an empty file as a bind target for a device node
+    symlink_at,     // /lib -> usr/lib, the usr-merge layout every distro needs
     pivot_root,
     umount,
     dup2,
@@ -99,6 +102,9 @@ constexpr Phase phase_of(OpCode c) {
         case OpCode::unshare:
         case OpCode::write_file: return Phase::namespaces;
         case OpCode::mount:
+        case OpCode::mkdir_p:
+        case OpCode::touch:
+        case OpCode::symlink_at:
         case OpCode::pivot_root:
         case OpCode::umount: return Phase::mounts;
         case OpCode::dup2:
@@ -121,6 +127,9 @@ constexpr const char* to_string(OpCode c) {
         case OpCode::unshare: return "unshare";
         case OpCode::write_file: return "write_file";
         case OpCode::mount: return "mount";
+        case OpCode::mkdir_p: return "mkdir_p";
+        case OpCode::touch: return "touch";
+        case OpCode::symlink_at: return "symlink";
         case OpCode::pivot_root: return "pivot_root";
         case OpCode::umount: return "umount";
         case OpCode::dup2: return "dup2";
@@ -176,6 +185,15 @@ struct MountOp {
 struct PivotRootOp {
     Ref new_root;
     Ref put_old;
+};
+struct MkdirOp {
+    Ref path;
+    std::uint32_t mode;
+    std::uint32_t _pad;
+};
+struct SymlinkOp {
+    Ref target;
+    Ref linkpath;
 };
 struct UmountOp {
     Ref target;
@@ -320,7 +338,18 @@ class Plan {
     // apply the plan in the current process. POST-FORK ONLY: async-signal-safe,
     // allocation-free, and it must not be called on a process you want to keep.
     // defined in src/linux/apply.cpp; other platforms get a stub that refuses.
-    Status apply() const;
+    Status apply() const { return apply_range(Phase::namespaces, Phase::count_); }
+
+    // apply only the ops strictly before `stop`. needed because entering a pid
+    // namespace requires a fork between the namespace phase and the mount
+    // phase: unshare(CLONE_NEWPID) makes our CHILDREN members, not us, and
+    // mounting procfs requires membership.
+    Status apply_until(Phase stop) const { return apply_range(Phase::namespaces, stop); }
+
+    // apply the ops from `start` onward.
+    Status apply_from(Phase start) const { return apply_range(start, Phase::count_); }
+
+    Status apply_range(Phase first, Phase last) const;
 
   private:
     friend class PlanBuilder;
