@@ -225,5 +225,168 @@ int main() {
         }
     }
 
+    // -- masked argument rules ---------------------------------------------
+    //
+    // equality alone cannot express the interesting policies. every flag syscall
+    // packs independent bits into one register, so "deny CLONE_NEWUSER" is a bit
+    // test and an equality test against CLONE_NEWUSER is bypassed by setting any
+    // other harmless flag alongside it.
+    //
+    // this is checked against a SPEC written straight from the definition of each
+    // comparison, over a value set chosen to hit every edge: the mask alone, the
+    // mask plus noise, a subset of the mask, each half in isolation, and values
+    // that only differ above the 32-bit line.
+    {
+        auto spec_matches = [](ArgCmp cmp, std::uint64_t mask, std::uint64_t value,
+                               std::uint64_t arg) {
+            switch (cmp) {
+                case ArgCmp::eq: return arg == value;
+                case ArgCmp::masked_eq: return (arg & mask) == (value & mask);
+                case ArgCmp::any_set: return (arg & mask) != 0;
+            }
+            return false;
+        };
+
+        static constexpr std::uint64_t kMasks[] = {
+            0x20000000ull,           // CLONE_NEWUSER: one bit, low half
+            0x6ull,                  // PROT_WRITE|PROT_EXEC: two adjacent bits
+            0xf0000000ull,           // all the top clone namespace bits
+            0x100000000ull,          // one bit, HIGH half only
+            0x300000000ull,          // two bits, high half only
+            0x100000001ull,          // straddles the halves: the interesting one
+            0xffffffffffffffffull,   // everything
+        };
+        static constexpr std::uint64_t kArgs[] = {
+            0,
+            1,
+            0x6ull,
+            0x2ull,
+            0x4ull,
+            0x7ull,
+            0x20000000ull,
+            0x20000f00ull,
+            0xf0000000ull,
+            0x100000000ull,
+            0x100000001ull,
+            0x300000000ull,
+            0x200000000ull,
+            0xffffffffffffffffull,
+        };
+
+        for (ArgCmp cmp : {ArgCmp::masked_eq, ArgCmp::any_set}) {
+            for (std::uint64_t mask : kMasks) {
+                for (std::uint64_t value : kArgs) {
+                    SyscallPolicy p;
+                    p.set_default(SysAction::allow);
+                    p.allow(56);
+                    p.deny_arg_cmp(56, 0, cmp, cmp == ArgCmp::masked_eq ? (value & mask) : 0,
+                                   mask, SysAction::errno_, 1);
+
+                    auto prog = compile(p, kAuditArchX86_64);
+                    CHECK(prog.has_value());
+                    if (!prog) return finish("bpf_emit_test");
+
+                    for (std::uint64_t arg : kArgs) {
+                        std::uint64_t args[6] = {arg, 0, 0, 0, 0, 0};
+                        std::uint32_t got =
+                            evaluate_with_args(*prog, 56, kAuditArchX86_64, args);
+                        bool want_deny = spec_matches(cmp, mask,
+                                                      cmp == ArgCmp::masked_eq ? value : 0, arg);
+                        std::uint32_t want = want_deny ? (kRetErrno | 1) : kRetAllow;
+                        if (got != want) {
+                            std::fprintf(stderr,
+                                         "  cmp=%d mask=%#llx value=%#llx arg=%#llx: "
+                                         "got %#x want %#x\n",
+                                         static_cast<int>(cmp),
+                                         static_cast<unsigned long long>(mask),
+                                         static_cast<unsigned long long>(value),
+                                         static_cast<unsigned long long>(arg), got, want);
+                            CHECK_EQ(got, want);
+                            return finish("bpf_emit_test");
+                        }
+                        ++g_checks;
+                    }
+                }
+            }
+        }
+    }
+
+    // a masked rule whose predicate can never be true must not be emitted at
+    // all. `(arg & 0) == 1` is such a rule: masking a bit away cannot leave it
+    // set. emitting it would be worse than useless -- the block would clobber
+    // the accumulator and the tree after it would read an argument as a syscall
+    // number.
+    {
+        SyscallPolicy p;
+        p.set_default(SysAction::errno_, 1);
+        for (SysNr nr = 0; nr < 64; ++nr) p.allow(nr);
+        p.deny_arg_cmp(56, 0, ArgCmp::masked_eq, 1, 0);      // impossible
+        p.deny_arg_cmp(57, 0, ArgCmp::any_set, 0, 0);        // (arg & 0) != 0
+
+        auto prog = compile(p, kAuditArchX86_64);
+        CHECK(prog.has_value());
+        if (!prog) return finish("bpf_emit_test");
+
+        for (SysNr nr = 0; nr < 64; ++nr) {
+            std::uint64_t args[6] = {0xffffffffffffffffull, 0, 0, 0, 0, 0};
+            CHECK_EQ(evaluate_with_args(*prog, nr, kAuditArchX86_64, args), kRetAllow);
+        }
+    }
+
+    // the profiles must actually stop the namespace and W^X moves.
+    {
+        auto prog = compile(profiles::with_processes(), kAuditArchX86_64);
+        CHECK(prog.has_value());
+        if (prog) {
+            // the real pthread_create flag set, from linux/sched.h. it must be
+            // allowed: a sandbox that cannot start a thread is not usable, and
+            // CLONE_VM (0x100) sits close enough to CLONE_NEWNS (0x20000) that
+            // getting the mask wrong breaks exactly this case.
+            constexpr std::uint64_t kPthread = 0x00000100ull |  // CLONE_VM
+                                               0x00000200ull |  // CLONE_FS
+                                               0x00000400ull |  // CLONE_FILES
+                                               0x00000800ull |  // CLONE_SIGHAND
+                                               0x00010000ull;   // CLONE_THREAD
+            std::uint64_t thread[6] = {kPthread, 0, 0, 0, 0, 0};
+            CHECK_EQ(evaluate_with_args(*prog, 56, kAuditArchX86_64, thread), kRetAllow);
+
+            // a plain fork-like clone with no flags at all is fine too.
+            std::uint64_t plain[6] = {0, 0, 0, 0, 0, 0};
+            CHECK_EQ(evaluate_with_args(*prog, 56, kAuditArchX86_64, plain), kRetAllow);
+
+            // CLONE_NEWUSER alone, and hidden inside a legitimate thread clone:
+            // both denied. the second is the case equality filtering misses.
+            constexpr std::uint64_t kNewUser = 0x10000000ull;
+            std::uint64_t newuser[6] = {kNewUser, 0, 0, 0, 0, 0};
+            CHECK_EQ(evaluate_with_args(*prog, 56, kAuditArchX86_64, newuser), kRetErrno | 1);
+            std::uint64_t hidden[6] = {kNewUser | kPthread, 0, 0, 0, 0, 0};
+            CHECK_EQ(evaluate_with_args(*prog, 56, kAuditArchX86_64, hidden), kRetErrno | 1);
+
+            // CLONE_NEWNS, the mount namespace, is the other one that matters.
+            std::uint64_t newns[6] = {0x00020000ull, 0, 0, 0, 0, 0};
+            CHECK_EQ(evaluate_with_args(*prog, 56, kAuditArchX86_64, newns), kRetErrno | 1);
+
+            // CLONE_IO is 0x80000000 and is NOT a namespace, so it stays allowed.
+            // it is adjacent to the namespace bits, which makes it the natural
+            // off-by-one if the mask is ever edited by hand.
+            std::uint64_t clone_io[6] = {0x80000000ull, 0, 0, 0, 0, 0};
+            CHECK_EQ(evaluate_with_args(*prog, 56, kAuditArchX86_64, clone_io), kRetAllow);
+
+            // clone3 has to be ENOSYS, not EPERM: glibc probes it and falls back
+            // to clone, and the fallback only happens on ENOSYS.
+            CHECK_EQ(evaluate(*prog, 435, kAuditArchX86_64), kRetErrno | 38);
+
+            // W^X. PROT_READ|PROT_WRITE and PROT_READ|PROT_EXEC are both fine;
+            // the two together are not, with or without extra bits.
+            std::uint64_t rw[6] = {0, 0, 0x1 | 0x2, 0, 0, 0};
+            CHECK_EQ(evaluate_with_args(*prog, 9, kAuditArchX86_64, rw), kRetAllow);
+            std::uint64_t rx[6] = {0, 0, 0x1 | 0x4, 0, 0, 0};
+            CHECK_EQ(evaluate_with_args(*prog, 9, kAuditArchX86_64, rx), kRetAllow);
+            std::uint64_t rwx[6] = {0, 0, 0x1 | 0x2 | 0x4, 0, 0, 0};
+            CHECK_EQ(evaluate_with_args(*prog, 9, kAuditArchX86_64, rwx), kRetErrno | 1);
+            CHECK_EQ(evaluate_with_args(*prog, 10, kAuditArchX86_64, rwx), kRetErrno | 1);
+        }
+    }
+
     return finish("bpf_emit_test");
 }

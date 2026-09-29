@@ -67,15 +67,47 @@ struct SyscallRule {
 // only thing that is actually sound.
 // ---------------------------------------------------------------------------
 
+// how an argument rule compares the register against `value`.
+//
+// equality alone is not enough for the interesting cases. the flag syscalls --
+// clone, mmap, openat, socket -- pack independent bits into one register, and an
+// attacker only has to set one extra harmless bit for an equality test to miss.
+// `clone(CLONE_NEWUSER|CLONE_VM)` is not equal to `CLONE_NEWUSER`, so a policy
+// that denies the latter by equality is trivially bypassed.
+enum class ArgCmp : std::uint8_t {
+    eq,        // arg == value
+    masked_eq, // (arg & mask) == value  -- an exact field within the register
+    any_set,   // (arg & mask) != 0      -- "any of these flags is present"
+};
+
 struct ArgRule {
     SysNr nr;
     std::uint8_t arg_index;   // 0-5
     std::uint64_t value;      // the value to match
     SysAction action;         // what to do when it MATCHES
     std::uint16_t errno_value;
+    ArgCmp cmp{ArgCmp::eq};
+    // only read for the masked comparisons. an all-ones mask with cmp==eq is the
+    // same rule as plain equality, so `eq` just ignores it rather than forcing
+    // every caller to spell out ~0.
+    std::uint64_t mask{0};
 
     friend bool operator==(const ArgRule&, const ArgRule&) = default;
 };
+
+// a stable total order over argument rules. it exists so two policies built by
+// different paths compare equal, and so composition is deterministic. the
+// comparison order is arbitrary but must cover every field that rule identity
+// depends on, otherwise meet() can drop a distinct rule as a duplicate.
+inline void sort_arg_rules(std::vector<ArgRule>& v) {
+    std::sort(v.begin(), v.end(), [](const ArgRule& x, const ArgRule& y) {
+        if (x.nr != y.nr) return x.nr < y.nr;
+        if (x.arg_index != y.arg_index) return x.arg_index < y.arg_index;
+        if (x.cmp != y.cmp) return x.cmp < y.cmp;
+        if (x.mask != y.mask) return x.mask < y.mask;
+        return x.value < y.value;
+    });
+}
 
 class SyscallPolicy {
   public:
@@ -128,19 +160,49 @@ class SyscallPolicy {
     // checked BEFORE the per-syscall action, so a match here wins.
     SyscallPolicy& deny_arg(SysNr nr, std::uint8_t arg_index, std::uint64_t value,
                             SysAction a = SysAction::errno_, std::uint16_t err = 1) {
+        return deny_arg_cmp(nr, arg_index, ArgCmp::eq, value, 0, a, err);
+    }
+
+    // deny when the MASKED field of an argument equals a value. this is the one
+    // that handles the flag syscalls: `(clone_flags & CLONE_NEWUSER)` is a field
+    // test, and no amount of extra harmless bits makes it miss.
+    //
+    // the two masked forms answer two different questions:
+    //   any_set  "is ANY of these flags present"  -- clone(CLONE_NEWUSER|...)
+    //   all_set  "are ALL of these set together"  -- mmap(PROT_WRITE|PROT_EXEC)
+    SyscallPolicy& deny_arg_any(SysNr nr, std::uint8_t arg_index, std::uint64_t mask,
+                                SysAction a = SysAction::errno_, std::uint16_t err = 1) {
+        return deny_arg_cmp(nr, arg_index, ArgCmp::any_set, 0, mask, a, err);
+    }
+
+    // "all of these bits together" is just a masked equality where the expected
+    // value IS the mask, so it needs no comparison mode of its own. the obvious
+    // alternative -- a `not_all` mode -- reads like the right thing and is the
+    // exact negation of what a deny rule wants, which is a live trap.
+    SyscallPolicy& deny_arg_all(SysNr nr, std::uint8_t arg_index, std::uint64_t mask,
+                                SysAction a = SysAction::errno_, std::uint16_t err = 1) {
+        return deny_arg_cmp(nr, arg_index, ArgCmp::masked_eq, mask, mask, a, err);
+    }
+
+    SyscallPolicy& deny_arg_masked(SysNr nr, std::uint8_t arg_index, std::uint64_t mask,
+                                   std::uint64_t value, SysAction a = SysAction::errno_,
+                                   std::uint16_t err = 1) {
+        return deny_arg_cmp(nr, arg_index, ArgCmp::masked_eq, value & mask, mask, a, err);
+    }
+
+    SyscallPolicy& deny_arg_cmp(SysNr nr, std::uint8_t arg_index, ArgCmp cmp,
+                                std::uint64_t value, std::uint64_t mask,
+                                SysAction a = SysAction::errno_, std::uint16_t err = 1) {
         for (auto& r : arg_rules_) {
-            if (r.nr == nr && r.arg_index == arg_index && r.value == value) {
+            if (r.nr == nr && r.arg_index == arg_index && r.cmp == cmp && r.value == value &&
+                r.mask == mask) {
                 r.action = a;
                 r.errno_value = err;
                 return *this;
             }
         }
-        arg_rules_.push_back({nr, arg_index, value, a, err});
-        std::sort(arg_rules_.begin(), arg_rules_.end(), [](const ArgRule& x, const ArgRule& y) {
-            if (x.nr != y.nr) return x.nr < y.nr;
-            if (x.arg_index != y.arg_index) return x.arg_index < y.arg_index;
-            return x.value < y.value;
-        });
+        arg_rules_.push_back({nr, arg_index, value, a, err, cmp, mask});
+        sort_arg_rules(arg_rules_);
         return *this;
     }
 
@@ -188,7 +250,8 @@ class SyscallPolicy {
         for (const auto& r : o.arg_rules_) {
             bool have = false;
             for (auto& x : out.arg_rules_) {
-                if (x.nr == r.nr && x.arg_index == r.arg_index && x.value == r.value) {
+                if (x.nr == r.nr && x.arg_index == r.arg_index && x.cmp == r.cmp &&
+                    x.value == r.value && x.mask == r.mask) {
                     x.action = clay::meet(x.action, r.action);
                     have = true;
                     break;
@@ -196,12 +259,7 @@ class SyscallPolicy {
             }
             if (!have) out.arg_rules_.push_back(r);
         }
-        std::sort(out.arg_rules_.begin(), out.arg_rules_.end(),
-                  [](const ArgRule& x, const ArgRule& y) {
-                      if (x.nr != y.nr) return x.nr < y.nr;
-                      if (x.arg_index != y.arg_index) return x.arg_index < y.arg_index;
-                      return x.value < y.value;
-                  });
+        sort_arg_rules(out.arg_rules_);
         return out;
     }
 

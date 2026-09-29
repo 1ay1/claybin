@@ -18,6 +18,17 @@ constexpr Insn jge(std::uint32_t k, std::uint8_t jt, std::uint8_t jf) {
 }
 constexpr Insn ja(std::uint32_t off) { return Insn{kJmp | kJa, 0, 0, off}; }
 constexpr Insn ret(std::uint32_t k) { return Insn{kRet | kK, 0, 0, k}; }
+constexpr Insn jset(std::uint32_t k, std::uint8_t jt, std::uint8_t jf) {
+    return Insn{kJmp | kJset | kK, jt, jf, k};
+}
+constexpr Insn and_k(std::uint32_t k) { return Insn{kAlu | kAnd | kK, 0, 0, k}; }
+
+// placeholder jump targets inside an argument-rule block, patched once the
+// block's length is known. 0xfe/0xff are safe as sentinels because a block is
+// never more than a handful of instructions long, so a real offset can never
+// collide with them.
+constexpr std::uint8_t kMatch = 0xfe;  // -> the ret that applies the action
+constexpr std::uint8_t kFail = 0xff;   // -> the accumulator restore, rule missed
 
 // x86_64 tags x32 syscalls with this bit. filtering on the number alone while
 // ignoring it is the classic seccomp bypass, so we reject the whole range.
@@ -140,28 +151,106 @@ Result<Program> compile(const SyscallPolicy& policy, std::uint32_t arch) {
     // these are exceptions carved out of an otherwise-allowed syscall, so they
     // have to be checked FIRST -- the tree would say `allow` and return.
     //
-    // each rule is: is this the right syscall number, is the arg's low half
-    // equal, is its high half equal. checking only the low half is a real
-    // bypass: an attacker sets the high bits, the comparison misses, and the
-    // syscall still does what they wanted.
+    // every comparison is done in TWO halves, low then high, because seccomp_data
+    // gives us a 64-bit register and classic BPF only has a 32-bit accumulator.
+    // checking only the low half is a real bypass: an attacker sets the high
+    // bits, the comparison misses, and the syscall still does what they wanted.
     //
-    // the accumulator holds the syscall number on entry here and must hold it
-    // again on exit, because the tree that follows depends on that.
+    // block shape is always [checks..., ret(action), ld nr]. the trailing load
+    // restores the accumulator, because the interval tree that follows needs the
+    // syscall number and every check here clobbered it with an argument. two
+    // sentinels stand in for the jump targets while the block is being built,
+    // since its length is not known until the last check is emitted.
     for (const auto& r : policy.arg_rules()) {
         std::uint32_t act = action_to_ret(r.action, r.errno_value);
         auto lo = static_cast<std::uint32_t>(r.value & 0xffffffffu);
         auto hi = static_cast<std::uint32_t>(r.value >> 32);
+        auto mlo = static_cast<std::uint32_t>(r.mask & 0xffffffffu);
+        auto mhi = static_cast<std::uint32_t>(r.mask >> 32);
 
-        // if nr != this rule's, skip the whole block (6 instructions ahead)
-        out.push_back(jeq(r.nr, 0, 6));
-        out.push_back(ld_abs(arg_lo_off(r.arg_index)));
-        out.push_back(jeq(lo, 0, 3));  // low mismatch -> reload nr and move on
-        out.push_back(ld_abs(arg_hi_off(r.arg_index)));
-        out.push_back(jeq(hi, 0, 1));  // high mismatch -> reload nr and move on
-        out.push_back(ret(act));
-        // restore the accumulator: every path that falls through here has
-        // clobbered it with an argument, and the tree needs the syscall number.
-        out.push_back(ld_abs(kOffNr));
+        std::vector<Insn> body;
+        bool dead = false;  // a rule whose predicate can never be true
+
+        switch (r.cmp) {
+            case ArgCmp::eq:
+                body.push_back(ld_abs(arg_lo_off(r.arg_index)));
+                body.push_back(jeq(lo, 0, kFail));
+                body.push_back(ld_abs(arg_hi_off(r.arg_index)));
+                body.push_back(jeq(hi, 0, kFail));
+                break;
+
+            case ArgCmp::masked_eq:
+                // (arg & mask) == value, per half. a half with a zero mask is
+                // vacuously true when the expected value is zero there, and
+                // impossible when it is not -- masking away a bit cannot leave it
+                // set, so such a rule is dead and emitting it would be a lie.
+                for (int half = 0; half < 2; ++half) {
+                    std::uint32_t m = half ? mhi : mlo;
+                    std::uint32_t v = half ? hi : lo;
+                    if (m == 0) {
+                        if (v != 0) dead = true;
+                        continue;
+                    }
+                    body.push_back(ld_abs(half ? arg_hi_off(r.arg_index)
+                                               : arg_lo_off(r.arg_index)));
+                    body.push_back(and_k(m));
+                    body.push_back(jeq(v & m, 0, kFail));
+                }
+                break;
+
+            case ArgCmp::any_set:
+                // (arg & mask) != 0: a match as soon as EITHER half has a bit, so
+                // the first half's test jumps forward to the verdict on success
+                // rather than falling through.
+                if (r.mask == 0) {
+                    dead = true;  // nothing can be masked out of nothing
+                    break;
+                }
+                if (mlo != 0 && mhi != 0) {
+                    body.push_back(ld_abs(arg_lo_off(r.arg_index)));
+                    body.push_back(jset(mlo, kMatch, 0));
+                    body.push_back(ld_abs(arg_hi_off(r.arg_index)));
+                    body.push_back(jset(mhi, 0, kFail));
+                } else if (mlo != 0) {
+                    body.push_back(ld_abs(arg_lo_off(r.arg_index)));
+                    body.push_back(jset(mlo, 0, kFail));
+                } else {
+                    body.push_back(ld_abs(arg_hi_off(r.arg_index)));
+                    body.push_back(jset(mhi, 0, kFail));
+                }
+                break;
+        }
+
+        if (dead) continue;
+
+        std::size_t match_at = body.size();  // where ret(act) will land
+        body.push_back(ret(act));
+        std::size_t fail_at = body.size();  // the accumulator restore
+        body.push_back(ld_abs(kOffNr));
+
+        // resolve the sentinels now that both targets are known. offsets are
+        // relative to the instruction AFTER the jump, hence the -1.
+        for (std::size_t i = 0; i < body.size(); ++i) {
+            auto fix = [&](std::uint8_t& t) {
+                if (t == kMatch)
+                    t = static_cast<std::uint8_t>(match_at - i - 1);
+                else if (t == kFail)
+                    t = static_cast<std::uint8_t>(fail_at - i - 1);
+            };
+            fix(body[i].jt);
+            fix(body[i].jf);
+        }
+
+        // wrong syscall: skip the block whole. the accumulator is untouched on
+        // this path, so control lands directly on the tree with nr still loaded.
+        //
+        // a jump offset is 8 bits. blocks top out at 6 instructions, so this is
+        // unreachable -- but it is a silent miscompile if it ever is not, and a
+        // seccomp filter that jumps to the wrong place fails OPEN.
+        if (body.size() > 0xff)
+            return std::unexpected(Error{Errc::too_many_rules, "seccomp: arg rule too large"});
+        out.push_back(jeq(r.nr, 0, static_cast<std::uint8_t>(body.size())));
+        out.insert(out.end(), body.begin(), body.end());
     }
 
     TreeEmitter emitter{prog.intervals, prog.default_ret};
@@ -208,15 +297,20 @@ std::uint32_t evaluate_with_args(const Program& prog, std::uint32_t nr, std::uin
             ++pc;
         } else if (cls == kRet) {
             return in.k;
+        } else if (cls == kAlu) {
+            if ((in.code & 0xf0) != kAnd) break;  // only AND is ever emitted
+            acc &= in.k;
+            ++pc;
         } else if (cls == kJmp) {
             std::uint16_t op = in.code & 0xf0;
             if (op == kJa) {
                 pc += 1 + in.k;
             } else {
-                bool taken = (op == kJeq)   ? (acc == in.k)
-                             : (op == kJgt) ? (acc > in.k)
-                             : (op == kJge) ? (acc >= in.k)
-                                            : false;
+                bool taken = (op == kJeq)    ? (acc == in.k)
+                             : (op == kJgt)  ? (acc > in.k)
+                             : (op == kJge)  ? (acc >= in.k)
+                             : (op == kJset) ? ((acc & in.k) != 0)
+                                             : false;
                 pc += 1 + (taken ? in.jt : in.jf);
             }
         } else {

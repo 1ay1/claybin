@@ -21,6 +21,7 @@
 #include <sched.h>
 #include <signal.h>
 #include <sys/ioctl.h>
+#include <sys/mman.h>
 #include <sys/mount.h>
 #include <sys/prctl.h>
 #include <sys/ptrace.h>
@@ -153,6 +154,93 @@ inline int setuid_escape() {
     // we are uid 0 -- but can we actually do anything with it?
     return read_path("/etc/shadow") == kEscaped ? kEscaped : kBlocked;
 }
+
+inline int clone_userns() {
+    // the sibling of unshare, and the one that gets forgotten. a filter that
+    // denies unshare but allows clone with unrestricted flags has not closed
+    // anything: clone(CLONE_NEWUSER) is the same escape with a different entry
+    // point, and it hands back a namespace where we hold capabilities.
+    //
+    // CLONE_NEWUSER|SIGCHLD. a raw syscall, not glibc's clone() wrapper, because
+    // the wrapper wants a stack and a function and we only care about the errno.
+    long rc = ::syscall(SYS_clone, 0x10000000ul /* CLONE_NEWUSER */ | 17ul /* SIGCHLD */,
+                        0ul, 0ul, 0ul, 0ul);
+    if (rc == 0) ::_exit(0);  // we are the child: leave, the parent reports
+    if (rc > 0) {
+        int st = 0;
+        ::waitpid(static_cast<pid_t>(rc), &st, 0);
+        return kEscaped;
+    }
+    return kBlocked;
+}
+
+inline int clone_newns() {
+    // a mount namespace is the first step of a remount-something-writable escape.
+    long rc = ::syscall(SYS_clone, 0x00020000ul /* CLONE_NEWNS */ | 17ul, 0ul, 0ul, 0ul, 0ul);
+    if (rc == 0) ::_exit(0);
+    if (rc > 0) {
+        int st = 0;
+        ::waitpid(static_cast<pid_t>(rc), &st, 0);
+        return kEscaped;
+    }
+    return kBlocked;
+}
+
+inline int clone3_userns() {
+    // clone3 is the hole under the clone flag rules. its flags live in a struct
+    // in MEMORY, so seccomp cannot read them -- and dereferencing the pointer to
+    // check would be unsound, because the guest can rewrite it after the check.
+    //
+    // so clone3 has to be denied outright, which is what makes the clone mask
+    // meaningful. if this escapes, the clone rules are decoration.
+    struct CloneArgs {
+        std::uint64_t flags;
+        std::uint64_t pidfd;
+        std::uint64_t child_tid;
+        std::uint64_t parent_tid;
+        std::uint64_t exit_signal;
+        std::uint64_t stack;
+        std::uint64_t stack_size;
+        std::uint64_t tls;
+    } a{};
+    a.flags = 0x10000000ull;  // CLONE_NEWUSER
+    a.exit_signal = 17;       // SIGCHLD
+
+    long rc = ::syscall(435 /* clone3 */, &a, sizeof a);
+    if (rc == 0) ::_exit(0);
+    if (rc > 0) {
+        int st = 0;
+        ::waitpid(static_cast<pid_t>(rc), &st, 0);
+        return kEscaped;
+    }
+    // ENOSYS is the RIGHT denial here, not just any failure: glibc probes clone3
+    // and only falls back to clone when the kernel says the syscall is missing.
+    // EPERM would break pthread_create instead of redirecting it.
+    return kBlocked;
+}
+
+inline int mmap_wx() {
+    // a single writable+executable mapping is what most code-injection payloads
+    // want: write the shellcode, jump to it, no mprotect in between. ordinary
+    // programs never ask for one.
+    void* p = ::mmap(nullptr, 4096, PROT_READ | PROT_WRITE | PROT_EXEC,
+                     MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (p == MAP_FAILED) return kBlocked;
+    ::munmap(p, 4096);
+    return kEscaped;
+}
+
+inline int mprotect_wx() {
+    // the two-step version of the same thing. W^X by itself cannot stop this --
+    // the attacker maps writable, writes, then flips to executable -- so the
+    // rule covers mprotect as well, and this checks that it does.
+    void* p = ::mmap(nullptr, 4096, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (p == MAP_FAILED) return kNotApplicable;  // no anonymous memory at all
+    int r = ::mprotect(p, 4096, PROT_READ | PROT_WRITE | PROT_EXEC);
+    ::munmap(p, 4096);
+    return r == 0 ? kEscaped : kBlocked;
+}
+
 
 inline int regain_caps() {
     // try to put a capability back into the bounding set. the kernel offers no
@@ -416,6 +504,13 @@ inline const Attack* table(std::size_t& count) {
         {"info.staging_paths", read_host_mounts, false},
         {"net.raw_socket", net_raw_socket, false},
         {"net.abstract_unix", abstract_unix_socket, false},
+        // the flag-argument attacks. each of these is allowed by a filter that
+        // checks syscall NUMBERS only, which is why argument filtering exists.
+        {"ns.clone_newuser", clone_userns, false},
+        {"ns.clone_newns", clone_newns, false},
+        {"ns.clone3_newuser", clone3_userns, false},
+        {"mem.mmap_wx", mmap_wx, false},
+        {"mem.mprotect_wx", mprotect_wx, false},
     };
     count = sizeof t / sizeof t[0];
     return t;

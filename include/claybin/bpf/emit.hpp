@@ -46,8 +46,14 @@ inline constexpr std::uint16_t kJa = 0x00;
 inline constexpr std::uint16_t kJeq = 0x10;
 inline constexpr std::uint16_t kJgt = 0x20;
 inline constexpr std::uint16_t kJge = 0x30;
+// JSET is the bit test: `A & k`, jump if nonzero. it is what makes masked
+// argument rules cheap -- one instruction instead of load/and/compare.
+inline constexpr std::uint16_t kJset = 0x40;
 inline constexpr std::uint16_t kK = 0x00;
 inline constexpr std::uint16_t kRet = 0x06;
+// ALU class, used to mask an argument half before comparing it.
+inline constexpr std::uint16_t kAlu = 0x04;
+inline constexpr std::uint16_t kAnd = 0x50;
 
 // offsets into struct seccomp_data. stable kernel ABI.
 inline constexpr std::uint32_t kOffNr = 0;

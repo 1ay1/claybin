@@ -78,9 +78,24 @@ inline SyscallPolicy base() {
         302,  // prlimit64
         318,  // getrandom
         334,  // rseq
-        435,  // clone3 -> ENOSYS is fine, but glibc probes it
     };
     p.allow(std::span<const SysNr>{kAllowed});
+
+    // clone3 is deliberately NOT allowed, and the errno is ENOSYS rather than
+    // EPERM on purpose.
+    //
+    // clone3 takes a POINTER to struct clone_args, so its flags live in memory
+    // and seccomp cannot see them -- and filtering them by dereferencing the
+    // pointer is unsound, because the guest can rewrite it between the check and
+    // the syscall. that makes clone3 a hole straight through the clone flag
+    // rules below: deny unshare and mask off CLONE_NEWUSER on clone, and
+    // clone3(CLONE_NEWUSER) still gets you a namespace.
+    //
+    // ENOSYS is what makes this safe rather than merely strict: glibc probes
+    // clone3 and falls back to clone when the kernel says "no such syscall",
+    // which is exactly the path we can filter. EPERM here would make
+    // pthread_create fail instead of fall back.
+    p.deny(435 /* clone3 */, 38 /* ENOSYS */);
 
     // process-group and session calls. these are NOT privileges -- they only
     // touch the caller's own group -- but every shell calls them during startup
@@ -163,6 +178,67 @@ inline SyscallPolicy base() {
     for (std::uint64_t req : {kTiocsti, kTioclinux, kTioccons, kTiocsctty})
         p.deny_arg(16 /* ioctl */, 1 /* request */, req, SysAction::errno_, 1 /* EPERM */);
 
+    // W^X: no mapping may be writable and executable at the same time.
+    //
+    // this does not stop a determined attacker -- they can mmap writable, write
+    // their code, then mprotect it executable -- but it does break the whole
+    // class of exploits that rely on a single RWX mapping, and it costs nothing
+    // for ordinary programs, which never ask for one. JITs do, which is why this
+    // lives here and not in a profile a JIT would use.
+    //
+    // not_all is the right comparison: PROT_WRITE|PROT_EXEC is forbidden as a
+    // COMBINATION, while either alone is fine. an equality test on the pair
+    // would miss PROT_READ|PROT_WRITE|PROT_EXEC, which is what a real exploit
+    // actually asks for.
+    static constexpr std::uint64_t kProtWriteExec = 0x2 | 0x4;
+    p.deny_arg_all(9 /* mmap */, 2 /* prot */, kProtWriteExec, SysAction::errno_, 1);
+    p.deny_arg_all(10 /* mprotect */, 2 /* prot */, kProtWriteExec, SysAction::errno_, 1);
+
+    return p;
+}
+
+// every CLONE_NEW* flag. a new namespace of any kind is the first move in most
+// container escapes: a user namespace hands back capabilities, a mount namespace
+// is a step towards remounting something writable, and a pid namespace hides
+// processes from a supervisor watching from outside.
+//
+// masking these off clone is what makes threads work while namespaces do not --
+// pthread_create sets CLONE_VM|CLONE_FS|CLONE_FILES|CLONE_SIGHAND|CLONE_THREAD,
+// none of which are here.
+//
+// these values are from linux/sched.h and are NOT guessable. CLONE_VM is
+// 0x00000100 and CLONE_NEWNS is 0x00020000; getting that pair backwards puts
+// CLONE_VM in this mask and denies every pthread_create in the sandbox.
+inline constexpr std::uint64_t kCloneNewNamespaces =
+    0x00020000ull |  // CLONE_NEWNS      -- mount
+    0x02000000ull |  // CLONE_NEWCGROUP
+    0x04000000ull |  // CLONE_NEWUTS     -- hostname
+    0x08000000ull |  // CLONE_NEWIPC
+    0x10000000ull |  // CLONE_NEWUSER    -- the dangerous one
+    0x20000000ull |  // CLONE_NEWPID
+    0x40000000ull;   // CLONE_NEWNET
+                     // 0x80000000 is CLONE_IO, not a namespace. leave it alone.
+
+// grant subprocesses and threads on top of an existing profile, WITH the clone
+// flag mask that makes it safe.
+//
+// this is a mutating helper rather than a composition because composition of
+// sealed authority is meet -- intersection -- and intersecting two profiles
+// would deny everything either one denies, which is the opposite of "add exec
+// to a filesystem profile". granting is only ever explicit, so it looks like a
+// function call that takes a policy apart and puts more in.
+inline SyscallPolicy& add_processes(SyscallPolicy& p) {
+    for (SysNr nr : {56u /* clone */, 57u /* fork */, 58u /* vfork */, 59u /* execve */,
+                     61u /* wait4 */, 62u /* kill */, 322u /* execveat */})
+        p.allow(nr);
+
+    // clone is allowed, but not for making namespaces. base() already denies
+    // unshare and clone3 outright; this closes the third door.
+    //
+    // any_set, not equality: the guest picks the other flags, so the only sound
+    // question is "is any namespace bit present".
+    p.deny_arg_any(56 /* clone */, 0 /* flags */, kCloneNewNamespaces, SysAction::errno_,
+                   1 /* EPERM */);
     return p;
 }
 
@@ -170,9 +246,7 @@ inline SyscallPolicy base() {
 // with spawn(), because it is the first one that allows execve.
 inline SyscallPolicy with_processes() {
     SyscallPolicy p = base();
-    for (SysNr nr : {56u /* clone */, 57u /* fork */, 58u /* vfork */, 59u /* execve */,
-                     61u /* wait4 */, 62u /* kill */, 322u /* execveat */})
-        p.allow(nr);
+    add_processes(p);
     return p;
 }
 
@@ -198,7 +272,7 @@ inline SyscallPolicy with_filesystem() {
 // a build/compile sandbox: files plus subprocesses, no network.
 inline SyscallPolicy compiler() {
     SyscallPolicy p = with_filesystem();
-    for (SysNr nr : {56u, 57u, 58u, 59u, 61u, 62u, 322u}) p.allow(nr);
+    add_processes(p);
     return p;
 }
 
@@ -227,7 +301,7 @@ inline SyscallPolicy with_network() {
 // the shape an agent-run build wants: files, subprocesses, and brokered network.
 inline SyscallPolicy compiler_with_network() {
     SyscallPolicy p = with_network();
-    for (SysNr nr : {56u, 57u, 58u, 59u, 61u, 62u, 322u}) p.allow(nr);
+    add_processes(p);
     return p;
 }
 
