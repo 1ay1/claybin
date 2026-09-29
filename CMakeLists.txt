@@ -10,6 +10,8 @@ option(CLAYBIN_TESTS "build tests" ON)
 
 add_library(claybin STATIC
   src/bpf/emit.cpp
+  src/plan/compile.cpp
+  src/plan/probe.cpp
 )
 target_include_directories(claybin PUBLIC include)
 target_compile_options(claybin PRIVATE
@@ -18,6 +20,9 @@ target_compile_options(claybin PRIVATE
 )
 # the whole point: no libseccomp, no libcap, no libmount. raw syscalls only.
 target_link_libraries(claybin PUBLIC)
+
+add_executable(claybin-audit tools/claybin_audit.cpp)
+target_link_libraries(claybin-audit PRIVATE claybin)
 
 if(CLAYBIN_TESTS)
   enable_testing()
@@ -36,4 +41,5 @@ if(CLAYBIN_TESTS)
   claybin_test(bpf_emit_test)
   claybin_test(policy_typestate_test)
   claybin_test(readme_example_test)
+  claybin_test(plan_test)
 endif()

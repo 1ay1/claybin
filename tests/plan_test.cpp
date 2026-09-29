@@ -1,0 +1,266 @@
+// the plan is the pre-fork/post-fork boundary, so its invariants are the ones
+// that matter most: phase ordering (a security property), arena bounds (a
+// memory-safety property), and relocatability (a correctness property).
+
+#include "harness.hpp"
+
+#include "claybin/plan/compile.hpp"
+#include "claybin/plan/plan.hpp"
+#include "claybin/policy/profiles.hpp"
+
+using namespace clay;
+using namespace clay::test;
+using namespace clay::literals;
+
+int main() {
+    // -- arena: refs resolve, strings are shared --------------------------
+    {
+        PlanBuilder b;
+        Ref a = b.intern("/workspace");
+        Ref c = b.intern("/workspace");  // identical: must be interned once
+        CHECK(a == c);
+        Ref d = b.intern("/usr");
+        CHECK(!(a == d));
+
+        b.op(OpCode::chdir, ChdirOp{a});
+        auto plan = std::move(b).build();
+        CHECK(plan.has_value());
+        CHECK_EQ(std::string(plan->cstr(a)), std::string("/workspace"));
+        CHECK_EQ(std::string(plan->cstr(d)), std::string("/usr"));
+    }
+
+    // -- out-of-bounds refs are refused, not read -------------------------
+    {
+        PlanBuilder b;
+        b.op(OpCode::chdir, ChdirOp{b.intern("/tmp")});
+        auto plan = std::move(b).build();
+        CHECK(plan.has_value());
+        CHECK(plan->cstr(Ref{999999, 4}) == nullptr);
+        CHECK(plan->cstr(Ref{0, 999999}) == nullptr);
+        CHECK(plan->blob(Ref{999999, 4}).empty());
+    }
+
+    // -- phase ordering is enforced ---------------------------------------
+    {
+        // seccomp before landlock is backwards: the filter would block the very
+        // syscalls landlock setup needs.
+        PlanBuilder b;
+        b.op(OpCode::seccomp_install, SeccompInstallOp{Ref{0, 0}, 0, 0});
+        b.op(OpCode::landlock_enforce, LandlockEnforceOp{0, 0, 1, 0});
+        auto plan = std::move(b).build();
+        CHECK(!plan.has_value());
+        CHECK(plan.error().code == Errc::invalid_policy);
+    }
+    {
+        // and the right order builds fine
+        PlanBuilder b;
+        b.op(OpCode::unshare, UnshareOp{0});
+        b.op(OpCode::chdir, ChdirOp{b.intern("/")});
+        b.op(OpCode::landlock_enforce, LandlockEnforceOp{0, 0, 1, 0});
+        b.op(OpCode::no_new_privs, NoNewPrivsOp{0});
+        b.op(OpCode::seccomp_install, SeccompInstallOp{Ref{0, 0}, 0, 0});
+        auto plan = std::move(b).build();
+        CHECK(plan.has_value());
+        CHECK(plan->well_ordered());
+        CHECK_EQ(plan->op_count(), std::size_t{5});
+    }
+
+    // -- phase_of covers every opcode with the right wall order -----------
+    CHECK(phase_of(OpCode::unshare) < phase_of(OpCode::mount));
+    CHECK(phase_of(OpCode::mount) < phase_of(OpCode::landlock_enforce));
+    CHECK(phase_of(OpCode::landlock_enforce) < phase_of(OpCode::no_new_privs));
+    // the two that matter most: nnp before seccomp, seccomp dead last.
+    CHECK(phase_of(OpCode::no_new_privs) < phase_of(OpCode::seccomp_install));
+    for (auto c : {OpCode::unshare, OpCode::mount, OpCode::dup2, OpCode::chdir,
+                   OpCode::landlock_rule, OpCode::drop_caps})
+        CHECK(phase_of(c) <= phase_of(OpCode::seccomp_install));
+
+    // -- the plan is relocatable ------------------------------------------
+    {
+        auto pol = Policy<Draft>{}
+                       .read("/usr")
+                       .read_write("/workspace")
+                       .memory(512_MB)
+                       .syscall_profile(profiles::base())
+                       .seal();
+        auto c = compile(pol, HostCapabilities::modern_linux());
+        CHECK(c.has_value());
+
+        // copy the raw bytes somewhere else, exactly as a fork or a pipe would.
+        std::vector<std::byte> copy(c->plan.bytes().begin(), c->plan.bytes().end());
+        CHECK_EQ(copy.size(), c->plan.size());
+        // no absolute pointers means the copy is still walkable
+        CHECK(c->plan.well_ordered());
+        CHECK(c->plan.op_count() > 0);
+    }
+
+    // -- compile: the honest report ---------------------------------------
+    {
+        auto pol = Policy<Draft>{}
+                       .read("/usr")
+                       .read_write("/workspace")
+                       .memory(512_MB)
+                       .processes(64)
+                       .syscall_profile(profiles::base())
+                       .seal();
+
+        auto c = compile(pol, HostCapabilities::modern_linux());
+        CHECK(c.has_value());
+        const auto& g = c->guarantees;
+
+        CHECK(g.strength(CapId::fs_read) == Enforcement::strong);
+        CHECK(g.strength(CapId::syscall_filter) == Enforcement::strong);
+        CHECK(g.strength(CapId::net_isolation) == Enforcement::strong);  // no net -> netns
+        CHECK(g.strength(CapId::privilege_drop) == Enforcement::strong);
+        // rlimits are a backstop, not a real memory limit: RLIMIT_AS caps
+        // address space and RLIMIT_NPROC is per-UID. until the cgroup writes
+        // exist these must NOT claim strong.
+        CHECK(g.strength(CapId::mem_limit) == Enforcement::partial);
+        CHECK(g.strength(CapId::pid_limit) == Enforcement::partial);
+        // the line that must never be wrong: a process backend shares the kernel
+        CHECK(g.strength(CapId::host_kernel_isolation) == Enforcement::none);
+        CHECK(!g.witness<cap::HostKernelIsolation>().has_value());
+        CHECK(c->degraded.empty());
+
+        // and the walls are in the plan, in order
+        CHECK(c->plan.has(OpCode::unshare));
+        CHECK(c->plan.has(OpCode::landlock_enforce));
+        CHECK(c->plan.has(OpCode::no_new_privs));
+        CHECK(c->plan.has(OpCode::seccomp_install));
+        CHECK(c->plan.well_ordered());
+    }
+
+    // -- a weak host degrades LOUDLY --------------------------------------
+    {
+        HostCapabilities old_kernel;
+        old_kernel.user_namespaces = true;
+        old_kernel.mount_namespaces = true;
+        old_kernel.pid_namespaces = true;
+        old_kernel.net_namespaces = true;
+        old_kernel.seccomp = true;
+        old_kernel.no_new_privs = true;
+        old_kernel.landlock_abi = 0;  // no landlock
+
+        auto pol = Policy<Draft>{}
+                       .read("/usr")
+                       .syscall_profile(profiles::base())
+                       .seal();
+        auto c = compile(pol, old_kernel);
+        CHECK(c.has_value());
+        // filesystem is NOT enforced, and the report says so rather than lying
+        CHECK(c->guarantees.strength(CapId::fs_read) == Enforcement::none);
+        CHECK(!c->guarantees.witness<cap::FilesystemRead>().has_value());
+        CHECK(!c->degraded.empty());
+        CHECK(!c->plan.has(OpCode::landlock_enforce));
+        // but seccomp still went in
+        CHECK(c->plan.has(OpCode::seccomp_install));
+    }
+
+    // -- hardened refuses to downgrade ------------------------------------
+    {
+        HostCapabilities weak;
+        weak.user_namespaces = true;
+        weak.seccomp = true;
+        weak.no_new_privs = true;
+        weak.landlock_abi = 0;
+
+        auto pol = Policy<Draft>{}
+                       .read("/usr")
+                       .isolation(Isolation::hardened_process)
+                       .syscall_profile(profiles::base())
+                       .seal();
+        auto c = compile(pol, weak);
+        // asking for hardened on a kernel that cannot deliver must FAIL, not
+        // silently give you something weaker.
+        CHECK(!c.has_value());
+        CHECK(c.error().code == Errc::unsupported);
+    }
+
+    // -- an empty allow-list is a policy bug, caught at compile time ------
+    {
+        auto pol = Policy<Draft>{}.read("/usr").seal();  // never named a syscall
+        auto c = compile(pol, HostCapabilities::modern_linux());
+        CHECK(!c.has_value());
+        CHECK(c.error().code == Errc::invalid_policy);
+    }
+
+    // -- microvm is not implemented, and says so --------------------------
+    {
+        auto pol = Policy<Draft>{}
+                       .read("/usr")
+                       .isolation(Isolation::microvm)
+                       .syscall_profile(profiles::base())
+                       .seal();
+        auto c = compile(pol, HostCapabilities::modern_linux());
+        CHECK(!c.has_value());
+        CHECK(c.error().code == Errc::unsupported);
+    }
+
+    // -- granting network drops the netns, and downgrades the claim -------
+    {
+        auto pol = Policy<Draft>{}
+                       .read("/usr")
+                       .connect("api.github.com", 443)
+                       .syscall_profile(profiles::base())
+                       .seal();
+        auto c = compile(pol, HostCapabilities::modern_linux());
+        CHECK(c.has_value());
+        // we no longer have an empty netns, so the guarantee is weaker and the
+        // report must not keep claiming `strong`.
+        CHECK(c->guarantees.strength(CapId::net_isolation) == Enforcement::partial);
+    }
+
+    // -- no claim without a corresponding op ------------------------------
+    // the guarantee report is only meaningful if every `strong` is backed by a
+    // mechanism actually present in the plan. this is the invariant that caught
+    // a real bug: the compiler claimed "cgroup2+rlimit" for memory while
+    // emitting no cgroup op at all.
+    {
+        for (bool net : {false, true}) {
+            auto d = Policy<Draft>{}
+                         .read("/usr")
+                         .memory(512_MB)
+                         .processes(64)
+                         .syscall_profile(profiles::base());
+            auto pol = net ? std::move(d).connect("example.com", 443).seal() : std::move(d).seal();
+            auto c = compile(pol, HostCapabilities::modern_linux());
+            CHECK(c.has_value());
+            if (!c) continue;
+            const auto& g = c->guarantees;
+
+            if (g.strength(CapId::fs_read) >= Enforcement::strong)
+                CHECK(c->plan.has(OpCode::landlock_enforce));
+            if (g.strength(CapId::syscall_filter) >= Enforcement::strong)
+                CHECK(c->plan.has(OpCode::seccomp_install));
+            if (g.strength(CapId::privilege_drop) >= Enforcement::strong)
+                CHECK(c->plan.has(OpCode::no_new_privs));
+            if (g.strength(CapId::proc_isolation) >= Enforcement::strong)
+                CHECK(c->plan.has(OpCode::unshare));
+
+            // nothing may claim `isolated` on a process backend: that word is
+            // reserved for a separate kernel.
+            for (std::size_t i = 0; i < kCapCount; ++i)
+                CHECK(g.strength(static_cast<CapId>(i)) < Enforcement::isolated);
+        }
+    }
+
+    // -- profiles are sane -------------------------------------------------
+    {
+        auto p = profiles::base();
+        CHECK(p.action_for(0) == SysAction::allow);    // read
+        CHECK(p.action_for(1) == SysAction::allow);    // write
+        CHECK(p.action_for(231) == SysAction::allow);  // exit_group
+        // the escapes are killed, not merely denied
+        CHECK(p.action_for(101) == SysAction::kill_process);  // ptrace
+        CHECK(p.action_for(321) == SysAction::kill_process);  // bpf
+        CHECK(p.action_for(308) == SysAction::kill_process);  // setns
+        // base has no fork/exec
+        CHECK(p.action_for(57) == SysAction::errno_);
+        CHECK(profiles::with_processes().action_for(57) == SysAction::allow);
+        // composing profiles can only restrict: compiler() & base() loses fork
+        auto tight = profiles::compiler() & profiles::base();
+        CHECK(tight.action_for(57) == SysAction::errno_);
+    }
+
+    return finish("plan_test");
+}

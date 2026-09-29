@@ -159,9 +159,10 @@ class GuaranteeReport {
     }
 
   private:
+    static constexpr const char* kUnset = "none";
     struct Slot {
         Enforcement strength{Enforcement::none};
-        const char* mechanism{"none"};
+        const char* mechanism{kUnset};
     };
     std::array<Slot, kCapCount> slots_{};
 };
@@ -177,6 +178,10 @@ class GuaranteeReport::Builder {
         // that reached that strength for auditability.
         if (e > slot.strength) {
             slot.strength = e;
+            slot.mechanism = mechanism;
+        } else if (e == slot.strength && slot.mechanism == kUnset) {
+            // an explicit `none` still carries a reason worth printing, e.g.
+            // "process-backend" for host kernel isolation.
             slot.mechanism = mechanism;
         }
         return *this;
