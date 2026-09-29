@@ -152,9 +152,16 @@ constexpr const char* kGuestRoot = "/tmp/.clay/newroot";
 // `path` is not under the root, which is the caller's signal that confinement
 // does not apply and the path is one of OUR OWN (the staging scratch files).
 const char* relative_to_guest_root(const char* path) {
+    // compare against the root, stopping at the end of EITHER string. the first
+    // version only checked kGuestRoot's terminator, so a shorter path -- e.g.
+    // "/tmp/.clay", which really is passed here -- was read past its end. that
+    // is undefined behaviour, and in practice it matched whatever followed in
+    // memory and misclassified staging paths as guest paths.
     std::size_t i = 0;
-    for (; kGuestRoot[i] != '\0'; ++i)
+    for (; kGuestRoot[i] != '\0'; ++i) {
+        if (path[i] == '\0') return nullptr;  // path is a prefix of the root
         if (path[i] != kGuestRoot[i]) return nullptr;
+    }
     if (path[i] == '\0') return path + i;  // the root itself
     if (path[i] != '/') return nullptr;     // a sibling like /tmp/.clay/newrootX
     while (path[i] == '/') ++i;            // BENEATH rejects a leading slash
@@ -240,6 +247,110 @@ bool mkdir_p_beneath(int root_fd, const char* rel, std::uint32_t mode, char* scr
     }
     sys(SYS_close, dir);
     return ok;
+}
+
+// is this path the guest root itself? the root has no parent inside the tree, so
+// it cannot be confined -- and it does not need to be, being a fixed string in
+// our own staging tmpfs with no caller-supplied component.
+//
+// this is a separate predicate rather than an errno from the resolver on purpose.
+// the first attempt signalled it as ENOENT, but openat2 returns ENOENT for real
+// reasons too, so "is this the root" and "did confinement fail" became
+// indistinguishable -- and the fallback for the former is to proceed unconfined.
+// an ambiguous sentinel on that branch is how a protection quietly turns off.
+bool is_guest_root(const char* path) {
+    const char* rel = relative_to_guest_root(path);
+    return rel != nullptr && rel[0] == '\0';
+}
+
+// resolve the PARENT of a guest path safely, creating directories along the way,
+// and hand back a dirfd plus the final component.
+//
+// this is the primitive every op that writes into the guest tree should use. the
+// first version of this fix confined only --file, which was too narrow: the same
+// hole existed in --symlink and in a --bind destination, both verified to plant
+// things on the host through a caller-controlled symlink. the fix for "one op
+// resolves unsafely" is not three patches, it is one safe primitive that all of
+// them go through.
+//
+// on success *dirfd is owned by the caller and must be closed, and *leaf points
+// into `scratch`. on failure *err carries the reason -- via out-param, not errno,
+// because the close() calls here overwrite it and a clobbered errno reads as
+// ENOSYS, which is exactly the value that silently disables confinement.
+bool resolve_parent_beneath(const char* path, char* scratch, std::size_t cap, int* dirfd,
+                            const char** leaf, int* err) {
+    *err = 0;
+    *dirfd = -1;
+    *leaf = nullptr;
+
+    const char* rel = relative_to_guest_root(path);
+    if (!rel) {
+        *err = EXDEV;  // not under the guest root: caller should not be here
+        return false;
+    }
+    std::size_t n = cstr_len(rel);
+    if (n == 0) {
+        // the root itself. callers are expected to have checked is_guest_root()
+        // first; reaching here means they did not, so refuse rather than guess.
+        *err = EINVAL;
+        return false;
+    }
+    if (n >= cap) {
+        *err = ENAMETOOLONG;
+        return false;
+    }
+    for (std::size_t i = 0; i <= n; ++i) scratch[i] = rel[i];
+
+    long root = open_guest_root();
+    if (root < 0) {
+        *err = errno;
+        return false;
+    }
+    int dir = static_cast<int>(root);
+
+    std::size_t start = 0;
+    while (start < n) {
+        std::size_t end = start;
+        while (end < n && scratch[end] != '/') ++end;
+        if (end == n) break;  // the remainder is the leaf, not a directory
+        char saved = scratch[end];
+        scratch[end] = '\0';
+        if (end > start) {
+            long rc = sys(SYS_mkdirat, dir, reinterpret_cast<long>(scratch + start),
+                          static_cast<long>(0755));
+            if (rc < 0 && errno != EEXIST) {
+                *err = errno;
+                sys(SYS_close, dir);
+                return false;
+            }
+            // the descent is what enforces confinement: each component is opened
+            // BENEATH the previous one, so a symlink partway along fails the open
+            // instead of being followed. resolving the whole path in one call
+            // would be equivalent, but mkdirat has no open_how, so the directory
+            // creation has to be interleaved anyway.
+            long next = open_beneath(dir, scratch + start, O_PATH | O_DIRECTORY | O_CLOEXEC, 0);
+            if (next < 0) {
+                *err = errno;
+                sys(SYS_close, dir);
+                return false;
+            }
+            sys(SYS_close, dir);
+            dir = static_cast<int>(next);
+        }
+        scratch[end] = saved;
+        start = end + 1;
+    }
+
+    if (start >= n) {
+        // the path was the root itself, or ended in a slash: no leaf to act on.
+        *err = EINVAL;
+        sys(SYS_close, dir);
+        return false;
+    }
+
+    *dirfd = dir;
+    *leaf = scratch + start;
+    return true;
 }
 
 // mkdir -p, without allocating. walks the path in place using a scratch buffer
@@ -621,6 +732,47 @@ Status Plan::apply_range(Phase first, Phase last) const {
                 const char* p = cstr(op.path);
                 if (!p) return die(Errc::invalid_policy, "mkdir", 0);
                 char scratch[4096];
+
+                // a mount's target directory comes through here, and it is a
+                // guest path. verified escape before this: with a caller-bound
+                // directory containing `out -> /tmp/victim`, a --bind whose
+                // destination was /work/out/mnt created the mountpoint at
+                // /tmp/victim/mnt, on the host.
+                //
+                // the staging paths (/tmp/.clay and its newroot) also come
+                // through here and are NOT under the guest root, so they take the
+                // plain path -- correctly, since we create them ourselves before
+                // any caller-supplied mount exists.
+                //
+                // note this op must create the LEAF directory too, not just the
+                // parents: it is mkdir -p, and its whole job is making a
+                // mountpoint exist. an earlier version of this only resolved the
+                // parent and left the leaf uncreated, which broke every mount
+                // with ENOENT -- including in the tests, which is how it was
+                // caught.
+                // the guest root itself is excluded: compile() emits a mkdir for
+                // it, and that mkdir is what CREATES the directory everything
+                // else is confined to. it has no parent inside the tree, and it
+                // needs no confinement -- a fixed string of ours.
+                if (relative_to_guest_root(p) && !is_guest_root(p)) {
+                    int dir = -1;
+                    const char* leaf = nullptr;
+                    int err = 0;
+                    if (resolve_parent_beneath(p, scratch, sizeof scratch, &dir, &leaf, &err)) {
+                        long rc = sys(SYS_mkdirat, dir, reinterpret_cast<long>(leaf),
+                                      static_cast<long>(op.mode ? op.mode : 0755));
+                        int merr = errno;
+                        sys(SYS_close, dir);
+                        if (rc < 0 && merr != EEXIST) return die(Errc::io_error, "mkdir", merr);
+                        return true;
+                    }
+                    // ONLY a kernel without openat2 falls back. every other
+                    // failure is confinement refusing, and must stay fatal --
+                    // treating a refusal as "retry without protection" would
+                    // defeat the entire change.
+                    if (err != ENOSYS) return die(Errc::io_error, "mkdir (confined)", err);
+                }
+
                 if (!mkdir_p(p, op.mode, scratch, sizeof scratch))
                     return die(Errc::io_error, "mkdir", errno);
                 return true;
@@ -663,9 +815,31 @@ Status Plan::apply_range(Phase first, Phase last) const {
                 }
                 constexpr unsigned int kIfmt = 0170000, kIfdir = 0040000;
                 if ((st.st_mode & kIfmt) == kIfdir) {
+                    // a bind's mount POINT is a guest path, so it gets confined
+                    // resolution -- this is the op that made `--bind src
+                    // /work/out/mnt` create a directory at /tmp/victim/mnt on the
+                    // host, through a symlink in a caller-bound directory.
+                    if (relative_to_guest_root(dst) && !is_guest_root(dst)) {
+                        int dir = -1;
+                        const char* leaf = nullptr;
+                        int err = 0;
+                        if (resolve_parent_beneath(dst, scratch, sizeof scratch, &dir, &leaf,
+                                                   &err)) {
+                            long rc = sys(SYS_mkdirat, dir, reinterpret_cast<long>(leaf),
+                                          static_cast<long>(0755));
+                            int merr = errno;
+                            sys(SYS_close, dir);
+                            if (rc < 0 && merr != EEXIST)
+                                return die(Errc::io_error, "bind_target: mkdir", merr);
+                            return true;
+                        }
+                        if (err != ENOSYS)
+                            return die(Errc::io_error, "bind_target: mkdir (confined)", err);
+                    }
                     if (!mkdir_p(dst, 0755, scratch, sizeof scratch))
                         return die(Errc::io_error, "bind_target: mkdir", errno);
                 } else {
+                    // touch_file already confines guest paths internally.
                     if (!touch_file(dst, 0600, scratch, sizeof scratch))
                         return die(Errc::io_error, "bind_target: touch", errno);
                 }
@@ -677,6 +851,33 @@ Status Plan::apply_range(Phase first, Phase last) const {
                 const char* tgt = cstr(op.target);
                 const char* lnk = cstr(op.linkpath);
                 if (!tgt || !lnk) return die(Errc::invalid_policy, "symlink", 0);
+
+                // the link's LOCATION is a guest path, so it gets confined
+                // resolution. verified escape before this: with a caller-bound
+                // directory containing `out -> /tmp/victim`, --symlink x
+                // /work/out/planted created the symlink at /tmp/victim/planted,
+                // on the host. the link's TARGET is just a string the kernel
+                // stores and needs no checking -- it is interpreted later, inside
+                // the sandbox, where landlock and the mount tree apply.
+                if (relative_to_guest_root(lnk)) {
+                    char scratch[4096];
+                    int dir = -1;
+                    const char* leaf = nullptr;
+                    int err = 0;
+                    if (resolve_parent_beneath(lnk, scratch, sizeof scratch, &dir, &leaf, &err)) {
+                        long rc = sys(SYS_symlinkat, reinterpret_cast<long>(tgt), dir,
+                                      reinterpret_cast<long>(leaf));
+                        int serr = errno;
+                        sys(SYS_close, dir);
+                        if (rc < 0 && serr != EEXIST)
+                            return die(Errc::io_error, "symlink", serr);
+                        return true;
+                    }
+                    // only a kernel without openat2 falls back to the unconfined
+                    // path. a refusal is confinement working.
+                    if (err != ENOSYS) return die(Errc::io_error, "symlink (confined)", err);
+                }
+
                 if (sys(SYS_symlinkat, reinterpret_cast<long>(tgt), AT_FDCWD,
                         reinterpret_cast<long>(lnk)) < 0 &&
                     errno != EEXIST)

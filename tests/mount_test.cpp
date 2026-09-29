@@ -321,6 +321,78 @@ int main(int argc, char** argv) {
                 std::fprintf(stderr, "  *** ESCAPED: host file now reads '%s'\n", buf);
             CHECK_EQ(std::strcmp(buf, kCanary), 0);
 
+            // ---- the same hole, two more ways in --------------------------
+            //
+            // fixing --file alone was not enough, which is the real lesson here.
+            // every op that writes into the guest tree resolves a path, and each
+            // one that did so unconfined was its own escape. both of these were
+            // verified to plant things on the host before the fix:
+            //
+            //   --symlink x /work/out/planted  -> symlink at /tmp/victim/planted
+            //   --bind src /work/out/mnt       -> directory at /tmp/victim/mnt
+            //
+            // bubblewrap refuses both. so the check is per-OP, not per-symptom:
+            // a future op that forgets to confine is a new escape, and only a
+            // test shaped like this will say so.
+            struct Case {
+                const char* name;
+                bool symlink;  // else: a bind destination
+            };
+            static constexpr Case kCases[] = {
+                {"--symlink", true},
+                {"--bind destination", false},
+            };
+
+            for (const auto& cs : kCases) {
+                // a fresh marker each time, so one case cannot mask another
+                char probe[256];
+                std::snprintf(probe, sizeof probe, "%s/victim/planted", dir);
+                ::unlink(probe);
+                ::rmdir(probe);
+
+                auto draft = Policy<Draft>{}
+                                 .ro_bind("/usr", "/usr")
+                                 .bind_try("/lib", "/lib")
+                                 .bind_try("/lib64", "/lib64")
+                                 .bind_try("/bin", "/bin")
+                                 .bind(evil, "/work")
+                                 .proc_fs("/proc")
+                                 .dev_fs("/dev")
+                                 .workdir("/");
+                auto pol = cs.symlink
+                               ? std::move(draft).symlink("/etc/passwd", "/work/out/planted")
+                                     .syscall_profile(profiles::compiler())
+                                     .seal()
+                               : std::move(draft).bind(victim, "/work/out/planted")
+                                     .syscall_profile(profiles::compiler())
+                                     .seal();
+
+                auto cc = compile(pol, probe_host());
+                CHECK(cc.has_value());
+                if (!cc) continue;
+                const char* av2[] = {"/bin/true", nullptr};
+                Command cmd2{"/bin/true", av2, nullptr};
+                auto s2 = spawn(cc->plan, cmd2);
+                if (s2) {
+                    int st2 = 0;
+                    ::waitpid(s2->pid, &st2, 0);
+                    if (s2->pidfd >= 0) ::close(s2->pidfd);
+                    int code2 = WIFEXITED(st2) ? WEXITSTATUS(st2) : -1;
+                    if (code2 != kExitPlanFailed)
+                        std::fprintf(stderr, "  %s escape: setup did not refuse (exit %d)\n",
+                                     cs.name, code2);
+                    CHECK_EQ(code2, kExitPlanFailed);
+                }
+
+                // and nothing appeared on the host through the symlink
+                struct stat sb {};
+                bool appeared = ::lstat(probe, &sb) == 0;
+                if (appeared)
+                    std::fprintf(stderr, "  *** ESCAPED via %s: %s exists on the host\n",
+                                 cs.name, probe);
+                CHECK(!appeared);
+            }
+
             // tidy up
             ::unlink(link);
             ::unlink(canary);
