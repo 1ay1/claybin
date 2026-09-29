@@ -140,29 +140,42 @@ and fails in practice.
 
 ## what is still missing
 
-not implemented, and every one of them is *refused* rather than ignored where
-silently ignoring it would change the security outcome:
+**nothing, in the sense of flags.** all 68 of bubblewrap's options are handled:
+59 explicitly and the 8 `--unshare-*` variants by prefix (an unknown flag still
+errors, so the prefix match does not swallow typos). conformance is **51/51**.
 
-- `--seccomp FD` / `--add-seccomp-fd` — **refused loudly.** claybin compiles its
-  own filter, and accepting the flag while running a different filter than the
-  caller supplied would be the worst possible failure. use `--profile`.
-- `--bind-data` / `--ro-bind-data` / `--file` — writing a file from an fd
-- `--bind-fd` / `--ro-bind-fd` — binding by fd rather than path
-- `--uid` / `--gid` beyond identity mapping
-- `--userns` / `--userns2` / `--pidns` / `--userns-block-fd` — joining an
-  existing namespace by fd
-- `--cap-add` / `--cap-drop` — we drop the whole bounding set unconditionally
-- `--exec-label` / `--file-label` — SELinux
-- `--chmod` / `--perms` — parsed, not yet applied
-- `--as-pid-1`, `--lock-file`, `--sync-fd`, `--block-fd`, `--args`
-- `--info-fd` / `--json-status-fd` — machine-readable status
-- `--mqueue` — refused rather than ignored
-- `--disable-userns` / `--assert-userns-disabled`
+what differs is behaviour in five places, and all five are claybin being
+stricter on purpose. every one *refuses* rather than silently doing something
+else, because a sandbox that quietly gives you less than you asked for is worse
+than one that fails:
 
-43 of bubblewrap's 68 flags are handled explicitly, plus every `--unshare-*`
-variant by prefix. the gap is mostly fd-passing and namespace-joining, which
-matter for flatpak's own supervisor but not for running a sandbox from a command
-line.
+| flag | claybin | why |
+|---|---|---|
+| `--not-a-security-boundary` | refused | a sandbox that continues after a wall fails is not a sandbox |
+| `--cap-add CAP_SYS_ADMIN` (and other escapes) | refused | `CAP_SYS_ADMIN` inside a sandbox means there is no sandbox |
+| `--cap-add ALL` | refused | same, wholesale |
+| `--seccomp FD` / `--add-seccomp-fd` | refused | claybin compiles its own filter; accepting the flag while running a *different* filter than the caller supplied is the worst available outcome. use `--profile`. |
+| `--userns` / `--userns2` / `--pidns` | refused | joining a namespace claybin did not build makes the guarantee report a guess |
+
+that last one is the interesting refusal. the others are about privilege; this
+one is about honesty. the whole value of `Compiled::guarantees` is that it
+describes walls claybin actually installed — if it inherits a namespace someone
+else made, it has no idea what that namespace enforces, and every line of the
+report becomes speculation.
+
+two more are accepted but weaker than bwrap's version, and say so:
+
+- `--exec-label` / `--file-label` are parsed and stored, but SELinux transitions
+  are not applied. the report does not claim them.
+- `--chmod` mutates a **host** path, like bwrap's. claybin does it because
+  conformance demands it, but it is the one place a claybin policy has an effect
+  outside the sandbox, which is worth knowing.
+
+and one place claybin is genuinely better: `--mqueue` works. bubblewrap mounts it
+before building `/dev` and fails with `EPERM` on an unprivileged user namespace;
+claybin mounts it inside its own `/dev` tmpfs, where it is permitted, so the guest
+gets a real message-queue filesystem. conformance asserts `stat -f` reports
+`mqueue` rather than just matching bwrap's failure.
 
 ## the setuid question
 

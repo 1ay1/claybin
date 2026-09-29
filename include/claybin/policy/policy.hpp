@@ -16,6 +16,7 @@
 
 #include "claybin/core/error.hpp"
 #include "claybin/core/lattice.hpp"
+#include "claybin/policy/caps.hpp"
 #include "claybin/policy/filesystem.hpp"
 #include "claybin/policy/mounts.hpp"
 #include "claybin/policy/resources.hpp"
@@ -58,6 +59,10 @@ struct EnvVar {
     friend bool operator==(const EnvVar&, const EnvVar&) = default;
 };
 
+// sentinel for "the caller did not ask for a specific id", which is different
+// from asking for 0.
+inline constexpr std::uint32_t kUnsetId = 0xffffffffu;
+
 // the phase-independent payload. the Policy<Phase> wrapper adds the typestate.
 struct PolicyData {
     FsAuthority fs{};
@@ -88,6 +93,25 @@ struct PolicyData {
     // PR_SET_PDEATHSIG, so an orphaned sandbox dies with its supervisor rather
     // than surviving as a stray process nobody is watching.
     bool die_with_parent{false};
+
+    // capabilities to KEEP in the bounding set. bottom (drop everything) is the
+    // default and the right answer for almost every sandbox; --cap-add exists
+    // because flatpak occasionally needs CAP_NET_BIND_SERVICE and similar.
+    Caps keep_caps{Caps::nothing()};
+
+    // the uid/gid the guest runs as inside its user namespace. unset means
+    // "map our own id to itself", which is what a sandbox almost always wants.
+    std::uint32_t uid{kUnsetId};
+    std::uint32_t gid{kUnsetId};
+
+    // become pid 1 of the new pid namespace rather than having a shepherd hold
+    // that slot. changes signal semantics for the guest, so it is opt-in.
+    bool as_pid_1{false};
+
+    // an SELinux label for the exec'd process / for created files. not applied
+    // unless the host has SELinux, and the report says so.
+    std::string exec_label{};
+    std::string file_label{};
 
     PolicyData meet(const PolicyData& o) const {
         PolicyData r;
@@ -121,12 +145,21 @@ struct PolicyData {
         // composing policies must not be able to turn a protection off.
         r.new_session = new_session || o.new_session;
         r.die_with_parent = die_with_parent || o.die_with_parent;
+        // capabilities are authority, so this is a real meet: a capability
+        // survives only if BOTH sides kept it.
+        r.keep_caps = keep_caps.meet(o.keep_caps);
+        r.uid = uid;
+        r.gid = gid;
+        r.as_pid_1 = as_pid_1 && o.as_pid_1;
+        r.exec_label = exec_label;
+        r.file_label = file_label;
         return r;
     }
 
     bool subsumes(const PolicyData& o) const {
         return fs.subsumes(o.fs) && net.subsumes(o.net) && resources.subsumes(o.resources) &&
-               syscalls.subsumes(o.syscalls) && proc.subsumes(o.proc) && isolation <= o.isolation;
+               syscalls.subsumes(o.syscalls) && proc.subsumes(o.proc) &&
+               keep_caps.subsumes(o.keep_caps) && isolation <= o.isolation;
     }
 
     friend bool operator==(const PolicyData&, const PolicyData&) = default;
@@ -221,6 +254,10 @@ class Policy<Draft> {
     }
     Policy&& dev_fs(std::string dst = "/dev") && {
         data_.mounts.dev(std::move(dst));
+        return std::move(*this);
+    }
+    Policy&& mqueue(std::string dst = "/dev/mqueue") && {
+        data_.mounts.mqueue(std::move(dst));
         return std::move(*this);
     }
     Policy&& symlink(std::string target, std::string dst) && {
@@ -358,6 +395,54 @@ class Policy<Draft> {
     // thing that was supposed to be watching it.
     Policy&& die_with_parent() && {
         data_.die_with_parent = true;
+        return std::move(*this);
+    }
+
+    // ---- capabilities ----------------------------------------------------
+    //
+    // the default is to drop everything, which is right for almost every
+    // sandbox. keeping one is a real grant, so it lives here on the Draft --
+    // and `forbidden_caps()` is refused outright, because CAP_SYS_ADMIN inside
+    // a sandbox means there is no sandbox.
+    Policy&& keep_cap(int cap) && {
+        Caps want = Caps::of(cap);
+        if (!want.meet(forbidden_caps()).is_nothing()) return std::move(*this);
+        data_.keep_caps = Caps{data_.keep_caps.unsafe_join(want)};
+        return std::move(*this);
+    }
+    Policy&& drop_cap(int cap) && {
+        data_.keep_caps = Caps{data_.keep_caps.without(Caps::of(cap))};
+        return std::move(*this);
+    }
+    Policy&& drop_all_caps() && {
+        data_.keep_caps = Caps::nothing();
+        return std::move(*this);
+    }
+
+    // ---- identity --------------------------------------------------------
+    Policy&& uid(std::uint32_t id) && {
+        data_.uid = id;
+        return std::move(*this);
+    }
+    Policy&& gid(std::uint32_t id) && {
+        data_.gid = id;
+        return std::move(*this);
+    }
+
+    // run the guest AS pid 1 of its namespace, rather than behind a shepherd.
+    // changes signal semantics (pid 1 ignores signals it has no handler for), so
+    // it is opt-in.
+    Policy&& as_pid_1() && {
+        data_.as_pid_1 = true;
+        return std::move(*this);
+    }
+
+    Policy&& exec_label(std::string label) && {
+        data_.exec_label = std::move(label);
+        return std::move(*this);
+    }
+    Policy&& file_label(std::string label) && {
+        data_.file_label = std::move(label);
         return std::move(*this);
     }
     Policy&& isolation(Isolation lvl) && {

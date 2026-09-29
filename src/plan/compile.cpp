@@ -1,5 +1,8 @@
 #include "claybin/plan/compile.hpp"
 
+#include <cstdio>
+#include <unistd.h>
+
 #include "claybin/bpf/emit.hpp"
 
 namespace clay {
@@ -160,8 +163,33 @@ Result<Compiled> compile(const Policy<Sealed>& policy, const HostCapabilities& h
         // bypass a negative group permission.
         b.op(OpCode::write_file,
              WriteFileOp{b.intern("/proc/self/setgroups"), b.intern("deny")});
-        b.op(OpCode::write_file, WriteFileOp{b.intern("/proc/self/uid_map"), b.intern("")});
-        b.op(OpCode::write_file, WriteFileOp{b.intern("/proc/self/gid_map"), b.intern("")});
+
+        // an empty content ref means "map my own id to itself", computed at
+        // apply time because the plan may be built by another process. an
+        // explicit --uid/--gid writes the mapping here instead.
+        //
+        // note an unprivileged user namespace can only map ONE id, and only one
+        // it already owns, so `--uid 0` maps our real uid to 0 inside. that is
+        // what bwrap does too, and it is not a privilege gain: uid 0 in a user
+        // namespace owns nothing outside it.
+        if (d.uid != kUnsetId) {
+            char buf[64];
+            std::snprintf(buf, sizeof buf, "%u %u 1\n", d.uid,
+                          static_cast<unsigned>(::getuid()));
+            b.op(OpCode::write_file,
+                 WriteFileOp{b.intern("/proc/self/uid_map"), b.intern(buf)});
+        } else {
+            b.op(OpCode::write_file, WriteFileOp{b.intern("/proc/self/uid_map"), b.intern("")});
+        }
+        if (d.gid != kUnsetId) {
+            char buf[64];
+            std::snprintf(buf, sizeof buf, "%u %u 1\n", d.gid,
+                          static_cast<unsigned>(::getgid()));
+            b.op(OpCode::write_file,
+                 WriteFileOp{b.intern("/proc/self/gid_map"), b.intern(buf)});
+        } else {
+            b.op(OpCode::write_file, WriteFileOp{b.intern("/proc/self/gid_map"), b.intern("")});
+        }
         report.record(CapId::proc_isolation, Enforcement::strong, "userns+pidns");
     } else {
         degrade(CapId::proc_isolation);
@@ -374,8 +402,22 @@ Result<Compiled> compile(const Policy<Sealed>& policy, const HostCapabilities& h
                     b.op(OpCode::mkdir_p, MkdirOp{b.intern(dst), m.perms ? m.perms : 0755u, 0});
                     break;
                 }
-                case MountKind::mqueue:
+                case MountKind::mqueue: {
+                    // a posix message queue filesystem, its own instance, so the
+                    // guest cannot see or write host queues.
+                    //
+                    // NOT optional: mounting mqueue needs privilege an
+                    // unprivileged user namespace does not have, so this usually
+                    // fails -- and bubblewrap fails too. making it optional would
+                    // mean claybin "succeeds" with no /dev/mqueue while the caller
+                    // believes they got one, which is exactly the kind of quiet
+                    // divergence this library exists to avoid.
+                    b.op(OpCode::mkdir_p, MkdirOp{b.intern(dst), 0755, 0});
+                    b.op(OpCode::mount,
+                         MountOp{b.intern("mqueue"), b.intern(dst), b.intern("mqueue"), Ref{},
+                                 kMsNosuid | kMsNodev | kMsNoexec});
                     break;
+                }
 
                 case MountKind::file:
                 case MountKind::bind_data:
@@ -484,6 +526,15 @@ Result<Compiled> compile(const Policy<Sealed>& policy, const HostCapabilities& h
     // and this makes an orphaned sandbox die rather than linger unsupervised.
     if (d.die_with_parent) b.op(OpCode::die_with_parent, NoNewPrivsOp{0});
 
+    // an explicit --uid/--gid means the guest should RUN as that id, not merely
+    // have it mapped. the mapping was written in the namespace phase; this is
+    // the setresuid/setresgid that actually adopts it.
+    if (d.uid != kUnsetId || d.gid != kUnsetId) {
+        b.op(OpCode::set_ids,
+             SetIdsOp{d.uid == kUnsetId ? static_cast<std::uint32_t>(::getuid()) : d.uid,
+                      d.gid == kUnsetId ? static_cast<std::uint32_t>(::getgid()) : d.gid});
+    }
+
     b.op(OpCode::chdir, ChdirOp{b.intern(d.workdir)});
 
     // rlimits are a coarse backstop and nothing more. RLIMIT_AS caps address
@@ -552,8 +603,21 @@ Result<Compiled> compile(const Policy<Sealed>& policy, const HostCapabilities& h
     // otherwise, which is almost impossible to diagnose from the symptom.
     if (host.no_new_privs) {
         b.op(OpCode::no_new_privs, NoNewPrivsOp{0});
-        b.op(OpCode::drop_caps, DropCapsOp{0});
-        report.record(CapId::privilege_drop, Enforcement::strong, "no_new_privs+bounding-set");
+        // the bounding set: everything NOT in keep_caps is dropped, so a caller
+        // who says nothing gets the empty set. forbidden_caps() is masked out
+        // even if a caller managed to ask, because a sandbox holding
+        // CAP_SYS_ADMIN is not a sandbox.
+        Caps keep = d.keep_caps.without(forbidden_caps());
+        b.op(OpCode::drop_caps, DropCapsOp{keep.bits()});
+        if (keep.is_nothing()) {
+            report.record(CapId::privilege_drop, Enforcement::strong,
+                          "no_new_privs+empty bounding set");
+        } else {
+            // keeping any capability is a real weakening, and the report must
+            // not describe it the same way as dropping everything.
+            report.record(CapId::privilege_drop, Enforcement::partial,
+                          "no_new_privs, some capabilities retained");
+        }
     } else {
         degrade(CapId::privilege_drop);
         // without nnp we cannot install landlock or seccomp at all, so nothing

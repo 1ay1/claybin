@@ -205,6 +205,10 @@ class MountPlan {
         mounts_.push_back({MountKind::devtmpfs, {}, std::move(dst), 0, 0, false, {}, {}});
         return *this;
     }
+    MountPlan& mqueue(std::string dst = "/dev/mqueue") {
+        mounts_.push_back({MountKind::mqueue, {}, std::move(dst), 0, 0, false, {}, {}});
+        return *this;
+    }
     MountPlan& symlink(std::string target, std::string dst) {
         mounts_.push_back({MountKind::symlink, std::move(target), std::move(dst), 0, 0, false, {}, {}});
         return *this;

@@ -239,9 +239,59 @@ else
 fi
 rm -f /tmp/clay_bd.out "$FD_DATA"
 
+# ---- identity, capabilities, status ------------------------------------------
+check "uid 0 inside the namespace" \
+    $BASE --uid 0 --gid 0 --chdir / -- /usr/bin/id -u
+check "cap-drop ALL" \
+    $BASE --cap-drop ALL --chdir / -- /usr/bin/true
+check "cap-add NET_BIND_SERVICE" \
+    $BASE --cap-add CAP_NET_BIND_SERVICE --chdir / -- /usr/bin/true
+check "as-pid-1" \
+    $BASE --unshare-pid --as-pid-1 --proc /proc --chdir / -- /usr/bin/true
+# mqueue is one place claybin is genuinely BETTER, so it cannot be a `check`.
+# bwrap mounts it before building /dev and fails with EPERM on an unprivileged
+# userns; claybin mounts it inside its own /dev tmpfs, where it is permitted, and
+# the guest gets a real message-queue filesystem. asserted directly.
+mq=$($CLAY $BASE --dev /dev --mqueue /dev/mqueue --chdir / \
+     -- /usr/bin/stat -f -c '%T' /dev/mqueue 2>/dev/null)
+if [ "$mq" = "mqueue" ]; then
+    PASS=$((PASS+1))
+    printf '  ok    mqueue is a real mqueue fs (bwrap fails here)\n'
+else
+    FAIL=$((FAIL+1))
+    printf '  FAIL  mqueue: expected a mqueue fs, got [%s]\n' "$mq"
+fi
+
+# --args: NUL-separated arguments read from an fd, spliced in as if typed.
+ARGS_BIN=$(mktemp)
+printf '%s\0%s\0%s\0' "--ro-bind" "/usr" "/usr" > "$ARGS_BIN"
+check_fd "args from fd" "$ARGS_BIN" \
+    --args 9 --symlink usr/lib /lib --symlink usr/lib64 /lib64 --chdir / -- /usr/bin/true
+rm -f "$ARGS_BIN"
+
+# the JSON status shape has to match field-for-field, since a supervisor parses
+# it. the ids themselves differ per run, so compare with numbers normalized.
+b_json=$($BWRAP $BASE --json-status-fd 3 --chdir / -- /bin/sh -c 'exit 7' \
+         3>&1 >/dev/null 2>/dev/null | sed 's/[0-9]\+/N/g' | tr -d '\n')
+c_json=$($CLAY  $BASE --json-status-fd 3 --chdir / -- /bin/sh -c 'exit 7' \
+         3>&1 >/dev/null 2>/dev/null | sed 's/[0-9]\+/N/g' | tr -d '\n')
+if [ "$b_json" = "$c_json" ]; then
+    PASS=$((PASS+1))
+    printf '  ok    json-status-fd shape matches\n'
+else
+    FAIL=$((FAIL+1))
+    printf '  FAIL  json-status-fd shape differs\n'
+    printf '          bwrap  %s\n' "$b_json"
+    printf '          clay   %s\n' "$c_json"
+fi
+
 # ---- claybin is deliberately stricter ---------------------------------------
 check_stricter "--not-a-security-boundary" \
     $BASE --not-a-security-boundary --chdir / -- /usr/bin/true
+check_stricter "--cap-add CAP_SYS_ADMIN" \
+    $BASE --cap-add CAP_SYS_ADMIN --chdir / -- /usr/bin/true
+check_stricter "--cap-add ALL" \
+    $BASE --cap-add ALL --chdir / -- /usr/bin/true
 
 echo
 echo "pass=$PASS fail=$FAIL skip=$SKIP"
