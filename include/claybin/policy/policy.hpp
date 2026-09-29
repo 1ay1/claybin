@@ -252,6 +252,26 @@ class Policy<Draft> {
         return std::move(*this);
     }
 
+    // ---- descriptors as sources ------------------------------------------
+    //
+    // an fd names an object, not a path, so these are immune to the symlink and
+    // TOCTOU races that path-based binds have to defend against.
+    Policy&& bind_fd(BorrowedFd fd, std::string dst, bool ro = false) && {
+        data_.mounts.bind_fd(fd, std::move(dst), ro);
+        return std::move(*this);
+    }
+    Policy&& file_from_fd(BorrowedFd fd, std::string dst, std::uint32_t perms = 0644) && {
+        data_.mounts.file(fd, std::move(dst), perms);
+        return std::move(*this);
+    }
+    // stronger than file_from_fd: the backing file is unlinked after the bind,
+    // so the content has no name anywhere on the filesystem.
+    Policy&& bind_data(BorrowedFd fd, std::string dst, bool ro = false,
+                       std::uint32_t perms = 0644) && {
+        data_.mounts.bind_data(fd, std::move(dst), ro, perms);
+        return std::move(*this);
+    }
+
     // -- network ------------------------------------------------------------
     Policy&& connect(std::string host, std::uint16_t port) && {
         data_.net.allow(std::move(host), port, kNetConnect);

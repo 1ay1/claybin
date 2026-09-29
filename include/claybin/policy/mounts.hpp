@@ -19,6 +19,7 @@
 #include <string>
 #include <vector>
 
+#include "claybin/core/fd.hpp"
 #include "claybin/core/lattice.hpp"
 #include "claybin/policy/filesystem.hpp"
 
@@ -45,6 +46,15 @@ enum class MountKind : std::uint8_t {
     overlay,
     tmp_overlay,
     ro_overlay,
+
+    // content read from a descriptor the caller holds.
+    //
+    //   file       write the bytes to a plain file inside the tree
+    //   bind_data  write them to a temp file, bind it in, then UNLINK it, so
+    //              the backing file has no name the guest could ever open
+    file,
+    bind_data,
+    bind_data_ro,
 };
 
 constexpr const char* to_string(MountKind k) {
@@ -61,6 +71,9 @@ constexpr const char* to_string(MountKind k) {
         case MountKind::overlay: return "overlay";
         case MountKind::tmp_overlay: return "tmp-overlay";
         case MountKind::ro_overlay: return "ro-overlay";
+        case MountKind::file: return "file";
+        case MountKind::bind_data: return "bind-data";
+        case MountKind::bind_data_ro: return "ro-bind-data";
     }
     return "?";
 }
@@ -142,6 +155,10 @@ struct Mount {
     // needs on the same filesystem as the upper layer.
     std::vector<std::string> lowers{};
     std::string workdir{};
+
+    // for file/bind_data: the descriptor whose CONTENTS go at `dest`. borrowed,
+    // never closed by us -- the caller owns it. -1 when unused.
+    int content_fd{-1};
 
     friend bool operator==(const Mount&, const Mount&) = default;
 };
@@ -236,6 +253,64 @@ class MountPlan {
         return *this;
     }
 
+    // ---- descriptors as sources ------------------------------------------
+    //
+    // an fd names an OBJECT, not a path, so binding one is immune to every
+    // symlink and TOCTOU race that path resolution suffers from. that is why
+    // bubblewrap offers these and why they are worth having.
+
+    // bind whatever `fd` refers to.
+    //
+    // the fd is resolved to its real path via readlink(/proc/self/fd/N) HERE,
+    // pre-fork, and the path is what gets bound. that is not as strong as
+    // binding the descriptor itself would be -- the kernel refuses to bind
+    // through a magic symlink, so nobody can do that -- but resolving it in the
+    // parent, before any namespace work, is the closest available thing: the
+    // caller's own view of the filesystem is what we capture.
+    //
+    // the residual risk is a TOCTOU window between resolution and mount, which
+    // bubblewrap has too and documents. it is narrower here because resolution
+    // happens before we fork rather than inside the sandboxed child.
+    MountPlan& bind_fd(BorrowedFd fd, std::string dst, bool ro = false) {
+        Mount m{};
+        m.kind = ro ? MountKind::bind_ro : MountKind::bind;
+        m.source = resolve_fd(fd);
+        m.dest = std::move(dst);
+        m.content_fd = fd.get();
+        // a descriptor we could not resolve names nothing we can bind. mark it
+        // optional so the sandbox still starts, with the path simply absent,
+        // rather than failing in a way that looks like a policy error.
+        m.optional = m.source.empty();
+        mounts_.push_back(std::move(m));
+        return *this;
+    }
+
+    // write the fd's contents to a plain file inside the tree.
+    MountPlan& file(BorrowedFd fd, std::string dst, std::uint32_t perms = 0644) {
+        Mount m{};
+        m.kind = MountKind::file;
+        m.dest = std::move(dst);
+        m.perms = perms;
+        m.content_fd = fd.get();
+        mounts_.push_back(std::move(m));
+        return *this;
+    }
+
+    // write the fd's contents to a temp file, bind it in, then UNLINK the temp.
+    // strictly stronger than `file`: the bytes are present at `dest` and the
+    // backing file has no name anywhere, so there is no second path to it even
+    // for a guest that escapes the tree.
+    MountPlan& bind_data(BorrowedFd fd, std::string dst, bool ro = false,
+                         std::uint32_t perms = 0644) {
+        Mount m{};
+        m.kind = ro ? MountKind::bind_data_ro : MountKind::bind_data;
+        m.dest = std::move(dst);
+        m.perms = perms;
+        m.content_fd = fd.get();
+        mounts_.push_back(std::move(m));
+        return *this;
+    }
+
     bool empty() const { return mounts_.empty(); }
     const std::vector<Mount>& mounts() const { return mounts_; }
 
@@ -295,6 +370,16 @@ class MountPlan {
                     f = Fidelity::impossible;
                     why = "overlayfs merges layers into a new view; access control "
                           "cannot synthesize one";
+                    break;
+
+                case MountKind::file:
+                case MountKind::bind_data:
+                case MountKind::bind_data_ro:
+                    // materializing content at a path is creation, not
+                    // restriction. there is nothing on the host at `dest` for
+                    // access control to point at.
+                    f = Fidelity::impossible;
+                    why = "writing content into the tree requires a real filesystem";
                     break;
             }
 
@@ -360,6 +445,14 @@ class MountPlan {
                 case MountKind::ro_overlay:
                     // no upper layer, so the merge cannot be written at all.
                     fs.grant(m.dest, FileRights::exec());  // read + execute
+                    break;
+
+                case MountKind::file:
+                case MountKind::bind_data:
+                    fs.grant(m.dest, FileRights::write());
+                    break;
+                case MountKind::bind_data_ro:
+                    fs.grant(m.dest, FileRights::read());
                     break;
             }
         }

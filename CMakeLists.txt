@@ -11,6 +11,7 @@ option(CLAYBIN_TESTS "build tests" ON)
 add_library(claybin STATIC
   src/bpf/emit.cpp
   src/plan/compile.cpp
+  src/core/fd.cpp
   src/plan/probe.cpp
   src/windows/compile.cpp
 )

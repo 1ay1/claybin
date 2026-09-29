@@ -377,6 +377,23 @@ Result<Compiled> compile(const Policy<Sealed>& policy, const HostCapabilities& h
                 case MountKind::mqueue:
                     break;
 
+                case MountKind::file:
+                case MountKind::bind_data:
+                case MountKind::bind_data_ro: {
+                    // copy the caller's fd into the tree. the fd number travels
+                    // in the op, and the copy happens post-fork where we are
+                    // already inside the namespace -- so the bytes land on OUR
+                    // tmpfs and never touch a host path.
+                    std::uint32_t flags = 0;
+                    if (m.kind != MountKind::file) flags |= 1;  // bind it in
+                    if (m.kind == MountKind::bind_data_ro) flags |= 2;  // read-only
+                    b.op(OpCode::write_fd_content,
+                         WriteFdContentOp{b.intern(dst),
+                                          static_cast<std::int32_t>(m.content_fd),
+                                          m.perms ? m.perms : 0644u, flags});
+                    break;
+                }
+
                 case MountKind::overlay:
                 case MountKind::tmp_overlay:
                 case MountKind::ro_overlay: {

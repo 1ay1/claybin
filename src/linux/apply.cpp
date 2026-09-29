@@ -529,6 +529,95 @@ Status Plan::apply_range(Phase first, Phase last) const {
                 }
                 return true;
             }
+            case OpCode::write_fd_content: {
+                WriteFdContentOp op{};
+                if (!decode(payload, op)) return die(Errc::invalid_policy, "write_fd", 0);
+                const char* dst = cstr(op.dest);
+                if (!dst || op.fd < 0) return die(Errc::invalid_policy, "write_fd", 0);
+
+                const bool as_bind = (op.flags & 1u) != 0;
+                const bool ro = (op.flags & 2u) != 0;
+
+                char scratch[4096];
+
+                // for a plain file the destination IS the target. for a bind we
+                // write to a scratch path first, then mount it over dest and
+                // unlink the scratch -- so the bytes exist at dest and nowhere
+                // else, which is the whole point of --bind-data over --file.
+                const char* write_to = dst;
+                char tmp_path[256];
+                if (as_bind) {
+                    // a fixed name inside our own staging tmpfs. it is unlinked
+                    // moments later and the tmpfs is gone after the pivot, so a
+                    // predictable name costs nothing here.
+                    const char* base = "/tmp/.clay/bindfile";
+                    std::size_t n = 0;
+                    for (; base[n]; ++n) tmp_path[n] = base[n];
+                    // distinguish multiple bind-datas by fd number
+                    int v = op.fd;
+                    tmp_path[n++] = '.';
+                    if (v == 0) tmp_path[n++] = '0';
+                    char digits[12];
+                    std::size_t dn = 0;
+                    while (v > 0) { digits[dn++] = static_cast<char>('0' + v % 10); v /= 10; }
+                    while (dn > 0) tmp_path[n++] = digits[--dn];
+                    tmp_path[n] = '\0';
+                    write_to = tmp_path;
+                } else {
+                    if (!touch_file(dst, op.perms, scratch, sizeof scratch))
+                        return die(Errc::io_error, "write_fd: touch", errno);
+                }
+
+                long out = sys(SYS_openat, AT_FDCWD, reinterpret_cast<long>(write_to),
+                               O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC,
+                               static_cast<long>(op.perms));
+                if (out < 0) return die(Errc::io_error, "write_fd: open dest", errno);
+
+                // copy. a fixed stack buffer, no allocation: this runs post-fork.
+                char buf[65536];
+                for (;;) {
+                    long n = sys(SYS_read, op.fd, reinterpret_cast<long>(buf),
+                                 static_cast<long>(sizeof buf));
+                    if (n == 0) break;
+                    if (n < 0) {
+                        sys(SYS_close, out);
+                        return die(Errc::io_error, "write_fd: read", errno);
+                    }
+                    long off = 0;
+                    while (off < n) {
+                        long w = sys(SYS_write, out, reinterpret_cast<long>(buf + off),
+                                     n - off);
+                        if (w <= 0) {
+                            sys(SYS_close, out);
+                            return die(Errc::io_error, "write_fd: write", errno);
+                        }
+                        off += w;
+                    }
+                }
+                sys(SYS_close, out);
+
+                if (as_bind) {
+                    if (!touch_file(dst, op.perms, scratch, sizeof scratch))
+                        return die(Errc::io_error, "write_fd: bind target", errno);
+                    std::uint64_t flags = 4096 /*MS_BIND*/ | 2 /*MS_NOSUID*/;
+                    if (sys(SYS_mount, reinterpret_cast<long>(write_to),
+                            reinterpret_cast<long>(dst), 0, static_cast<long>(flags), 0) < 0)
+                        return die(Errc::permission_denied, "write_fd: bind", errno);
+                    if (ro) {
+                        std::uint64_t rf = flags | 32 /*MS_REMOUNT*/ | 1 /*MS_RDONLY*/;
+                        if (sys(SYS_mount, reinterpret_cast<long>("none"),
+                                reinterpret_cast<long>(dst), 0, static_cast<long>(rf), 0) < 0)
+                            return die(Errc::permission_denied, "write_fd: remount ro", errno);
+                    }
+                    // unlink the backing file. the mount keeps it alive, but it
+                    // now has NO NAME, so even a guest that escapes the tree has
+                    // no path by which to reopen it. bubblewrap does the same and
+                    // the reasoning is worth copying: belt and braces on top of
+                    // it already being outside the new root.
+                    sys(SYS_unlinkat, AT_FDCWD, reinterpret_cast<long>(write_to), 0);
+                }
+                return true;
+            }
             case OpCode::pivot_root: {
                 PivotRootOp op{};
                 if (!decode(payload, op)) return die(Errc::invalid_policy, "pivot_root", 0);

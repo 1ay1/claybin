@@ -88,6 +88,10 @@ enum class OpCode : std::uint16_t {
     touch,          // create an empty file as a bind target for a device node
     bind_target,    // create a mount point matching the SOURCE's kind (dir or file)
     symlink_at,     // /lib -> usr/lib, the usr-merge layout every distro needs
+    // copy a caller-held fd's contents into the tree. with the bind flag set,
+    // the bytes go to a temp file which is bound at `dest` and then UNLINKED, so
+    // the backing file has no name the guest could open.
+    write_fd_content,
     pivot_root,
     // the second half of bubblewrap's pivot dance: chdir into newroot, then
     // pivot_root(".", ".") so the old root stacks on top of itself and can be
@@ -119,6 +123,7 @@ constexpr Phase phase_of(OpCode c) {
         case OpCode::touch:
         case OpCode::bind_target:
         case OpCode::symlink_at:
+        case OpCode::write_fd_content:
         case OpCode::pivot_root:
         case OpCode::pivot_into_newroot:
         case OpCode::umount: return Phase::mounts;
@@ -149,6 +154,7 @@ constexpr const char* to_string(OpCode c) {
         case OpCode::touch: return "touch";
         case OpCode::bind_target: return "bind_target";
         case OpCode::symlink_at: return "symlink";
+        case OpCode::write_fd_content: return "write_fd";
         case OpCode::pivot_root: return "pivot_root";
         case OpCode::pivot_into_newroot: return "pivot_newroot";
         case OpCode::umount: return "umount";
@@ -224,6 +230,15 @@ struct SymlinkOp {
 struct BindTargetOp {
     Ref source;
     Ref dest;
+};
+// copy `fd`'s contents to `dest`. flags bit 0 = bind it in and unlink the
+// backing file, bit 1 = make that bind read-only.
+struct WriteFdContentOp {
+    Ref dest;
+    std::int32_t fd;
+    std::uint32_t perms;
+    std::uint32_t flags;
+    std::uint32_t _pad;
 };
 struct UmountOp {
     Ref target;

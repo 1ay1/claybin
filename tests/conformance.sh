@@ -32,10 +32,33 @@ BASE="--ro-bind /usr /usr --symlink usr/lib /lib --symlink usr/lib64 /lib64 --sy
 #
 # stderr is deliberately NOT compared: the two tools word their diagnostics
 # differently and always will. what has to match is what the GUEST observes.
+#
+# note each tool gets its OWN invocation of the redirect, which matters for the
+# fd-passing cases: a shared fd would be left at EOF by whichever tool ran
+# first, and the second would faithfully copy zero bytes. that bit me.
 check() {
     desc="$1"; shift
     b_out=$($BWRAP "$@" 2>/dev/null); b_rc=$?
     c_out=$($CLAY  "$@" 2>/dev/null); c_rc=$?
+
+    if [ "$b_out" = "$c_out" ] && [ "$b_rc" = "$c_rc" ]; then
+        PASS=$((PASS+1))
+        printf '  ok    %s\n' "$desc"
+    else
+        FAIL=$((FAIL+1))
+        printf '  FAIL  %s\n' "$desc"
+        printf '          bwrap  rc=%s out=[%s]\n' "$b_rc" "$(echo "$b_out" | tr '\n' '|')"
+        printf '          clay   rc=%s out=[%s]\n' "$c_rc" "$(echo "$c_out" | tr '\n' '|')"
+    fi
+}
+
+# same, but each tool gets a freshly-opened fd 9 on $2. needed because reading
+# an fd CONSUMES it: sharing one between the two runs left the second tool at
+# EOF, and it faithfully copied zero bytes.
+check_fd() {
+    desc="$1"; fdfile="$2"; shift 2
+    b_out=$($BWRAP "$@" 9<"$fdfile" 2>/dev/null); b_rc=$?
+    c_out=$($CLAY  "$@" 9<"$fdfile" 2>/dev/null); c_rc=$?
 
     if [ "$b_out" = "$c_out" ] && [ "$b_rc" = "$c_rc" ]; then
         PASS=$((PASS+1))
@@ -183,6 +206,38 @@ check "hostname is accepted" \
 check "unsetenv" \
     $BASE --setenv KEEP yes --setenv DROP no --unsetenv DROP --chdir / \
     -- /bin/sh -c 'echo "$KEEP-$DROP"'
+
+# ---- fd passing --------------------------------------------------------------
+# an fd names an object rather than a path. these are the flags flatpak's own
+# supervisor uses, because it already holds descriptors it does not want to
+# re-resolve by name.
+FD_DATA=$(mktemp)
+echo "content-from-fd" > "$FD_DATA"
+
+check_fd "file from fd" "$FD_DATA" \
+    $BASE --file 9 /data.txt --chdir / -- /usr/bin/cat /data.txt
+check_fd "bind-data from fd" "$FD_DATA" \
+    $BASE --bind-data 9 /d.txt --chdir / -- /usr/bin/cat /d.txt
+check_fd "ro-bind-data rejects writes" "$FD_DATA" \
+    $BASE --ro-bind-data 9 /d.txt --chdir / \
+    -- /bin/sh -c 'cat /d.txt; echo x > /d.txt'
+check_fd "ro-bind-fd binds a directory" /usr/share \
+    $BASE --ro-bind-fd 9 /shared --chdir / -- /usr/bin/test -d /shared
+check_fd "bind-fd contents are real" /usr/share \
+    $BASE --ro-bind-fd 9 /shared --chdir / -- /bin/sh -c 'ls /shared | head -1'
+
+# --bind-data must leave NO other path to the content. the backing file is
+# unlinked after the bind, so /tmp inside the sandbox must not contain it.
+$CLAY $BASE --bind-data 9 /d.txt --tmpfs /scratch --chdir / \
+    -- /bin/sh -c 'ls /tmp 2>/dev/null | grep -c bindfile' 9<"$FD_DATA" >/tmp/clay_bd.out 2>&1
+if grep -q '^0$' /tmp/clay_bd.out 2>/dev/null || [ ! -s /tmp/clay_bd.out ]; then
+    PASS=$((PASS+1))
+    printf '  ok    bind-data backing file is unlinked\n'
+else
+    FAIL=$((FAIL+1))
+    printf '  FAIL  bind-data left its backing file reachable\n'
+fi
+rm -f /tmp/clay_bd.out "$FD_DATA"
 
 # ---- claybin is deliberately stricter ---------------------------------------
 check_stricter "--not-a-security-boundary" \

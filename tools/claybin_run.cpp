@@ -45,6 +45,11 @@ void usage() {
                  "  --overlay UP WORK DST  writable overlay at DST\n"
                  "  --tmp-overlay DST      overlay whose writes are discarded\n"
                  "  --ro-overlay DST       read-only overlay (needs 2+ srcs)\n"
+                 "  --ro-bind-fd FD DST    bind what FD refers to, read-only\n"
+                 "  --bind-fd FD DST       bind what FD refers to\n"
+                 "  --file FD DST          write FD's contents to a file at DST\n"
+                 "  --bind-data FD DST     bind FD's contents (backing file unlinked)\n"
+                 "  --ro-bind-data FD DST  same, read-only\n"
                  "  --dir DST              create a directory\n"
                  "  --symlink TGT DST      create a symlink\n"
                  "  --chdir DIR            working directory inside the sandbox\n"
@@ -220,6 +225,45 @@ int main(int argc, char** argv) {
                          "claybin-run: %s not supported. claybin compiles its own "
                          "seccomp filter; use --profile to choose one.\n", a);
             return 1;
+        } else if (std::strcmp(a, "--bind-fd") == 0 ||
+                   std::strcmp(a, "--ro-bind-fd") == 0) {
+            if (!need(2, a)) return 1;
+            char* end = nullptr;
+            long fd = std::strtol(argv[i + 1], &end, 10);
+            if (end == argv[i + 1] || fd < 0) {
+                std::fprintf(stderr, "claybin-run: %s: invalid fd '%s'\n", a, argv[i + 1]);
+                return 1;
+            }
+            policy = std::move(policy).bind_fd(BorrowedFd{static_cast<int>(fd)}, argv[i + 2],
+                                               std::strcmp(a, "--ro-bind-fd") == 0);
+            i += 2;
+        } else if (std::strcmp(a, "--file") == 0) {
+            if (!need(2, a)) return 1;
+            char* end = nullptr;
+            long fd = std::strtol(argv[i + 1], &end, 10);
+            if (end == argv[i + 1] || fd < 0) {
+                std::fprintf(stderr, "claybin-run: --file: invalid fd '%s'\n", argv[i + 1]);
+                return 1;
+            }
+            policy = std::move(policy).file_from_fd(BorrowedFd{static_cast<int>(fd)},
+                                                    argv[i + 2],
+                                                    next_perms ? next_perms : 0666u);
+            next_perms = 0;
+            i += 2;
+        } else if (std::strcmp(a, "--bind-data") == 0 ||
+                   std::strcmp(a, "--ro-bind-data") == 0) {
+            if (!need(2, a)) return 1;
+            char* end = nullptr;
+            long fd = std::strtol(argv[i + 1], &end, 10);
+            if (end == argv[i + 1] || fd < 0) {
+                std::fprintf(stderr, "claybin-run: %s: invalid fd '%s'\n", a, argv[i + 1]);
+                return 1;
+            }
+            policy = std::move(policy).bind_data(BorrowedFd{static_cast<int>(fd)}, argv[i + 2],
+                                                 std::strcmp(a, "--ro-bind-data") == 0,
+                                                 next_perms ? next_perms : 0666u);
+            next_perms = 0;
+            i += 2;
         } else if (std::strcmp(a, "--setenv") == 0) {
             if (!need(2, a)) return 1;
             policy = std::move(policy).env(argv[i + 1], argv[i + 2]);
