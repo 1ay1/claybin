@@ -7,6 +7,7 @@
 #include <cstring>
 #include <fcntl.h>
 #include <sched.h>
+#include <sys/prctl.h>
 #include <sys/socket.h>
 #include <sys/syscall.h>
 #ifndef SYS_pidfd_open
@@ -110,6 +111,7 @@ Result<Spawned> spawn_in(const Plan& plan, const Command& cmd, const cgroup::Gro
         // and the broker relay, which the guest writes its listener fd number to
         // AFTER the privdrop phase that does the closing.
         if (brokering) Plan::set_relay_fd(relay[1]);
+        if (brokering) Plan::set_relay_fd2(relay[0]);
 
         struct Failure {
             int stage;  // 0 = plan, 1 = exec
@@ -150,43 +152,8 @@ Result<Spawned> spawn_in(const Plan& plan, const Command& cmd, const cgroup::Gro
             }
             if (inner > 0) {
                 // the outer child is the shepherd: it holds pid 1 of the new pid
-                // namespace and mirrors the guest's exit status.
-                //
-                // it is ALSO the only process that can hand the seccomp listener
-                // to the supervisor. the guest cannot: SCM_RIGHTS refuses a
-                // notify fd once no_new_privs is set, and the guest's own pid is
-                // 1 in its namespace, so the supervisor cannot name it for
-                // pidfd_getfd either.
-                //
-                // the shepherd can, because it is the guest's PARENT and is
-                // OUTSIDE the seccomp filter: pidfd_open on its own child, then
-                // pidfd_getfd, then SCM_RIGHTS to the supervisor -- which works
-                // because the shepherd never set no_new_privs on itself.
-                // the shepherd's job for brokering: tell the SUPERVISOR which
-                // pid holds the listener and which fd number it is. it cannot
-                // pass the descriptor itself -- the kernel refuses SCM_RIGHTS on
-                // a seccomp notify fd whose owner has no_new_privs set, whoever
-                // is doing the sending -- but pidfd_getfd from the supervisor is
-                // allowed, because that is gated on PTRACE_MODE_ATTACH rather
-                // than on moving a filter-bypass capability across a boundary.
-                //
-                // the shepherd is the one that knows the guest's HOST pid: inside
-                // the new pid namespace the guest sees itself as 1, which is
-                // useless to anyone outside.
-                if (brokering) {
-                    struct Handshake {
-                        int stage, code, sys_errno;
-                        char mech[32];
-                    } hs{};
-                    if (::read(relay[0], &hs, sizeof hs) == static_cast<ssize_t>(sizeof hs) &&
-                        hs.stage == 2) {
-                        // rewrite the pid to the one the SUPERVISOR can name, and
-                        // forward it on the report socket.
-                        hs.sys_errno = static_cast<int>(inner);
-                        ssize_t w2 = ::write(report[1], &hs, sizeof hs);
-                        (void)w2;
-                    }
-                }
+                // namespace and mirrors the guest's exit status, so the caller's
+                // waitpid() still means what they expect.
                 ::close(report[1]);
                 int wst = 0;
                 ::waitpid(inner, &wst, 0);
@@ -210,7 +177,80 @@ Result<Spawned> spawn_in(const Plan& plan, const Command& cmd, const cgroup::Gro
             // i.e. the supervisor's existing authority over its own child, rather
             // than a new capability crossing a boundary. spawn() therefore
             // reports the fd NUMBER, and the parent pulls the descriptor across.
-            st = plan.apply_from(Phase::mounts);
+            st = plan.apply_range(Phase::mounts, Phase::seccomp);
+
+            // BROKER HANDOFF, following the approach crun landed after hitting
+            // this exact deadlock (scrivano.org/posts/2022-09-05-seccomp-listener).
+            //
+            // the problem: the listener fd only exists AFTER the filter is
+            // installed, but by then sendmsg may itself be filtered -- and the
+            // kernel refuses SCM_RIGHTS on a notify fd once no_new_privs is set.
+            // so the process that installs the filter cannot be the one that
+            // hands the descriptor over.
+            //
+            // the fix: fork a helper with CLONE_FILES *before* installing the
+            // filter. it SHARES our descriptor table, so when we install the
+            // filter and get fd N, the helper already has fd N -- no transfer is
+            // needed at all. and the helper is outside the filter, so its
+            // sendmsg is not intercepted.
+            //
+            // the helper learns N through a pipe write, which is the one syscall
+            // we must keep allowed (compile() ensures that).
+            pid_t helper = -1;
+            if (st && brokering) {
+                struct clone_args {
+                    std::uint64_t flags, pidfd, child_tid, parent_tid, exit_signal, stack,
+                        stack_size, tls, set_tid, set_tid_size, cgroup;
+                } ca{};
+                ca.flags = 0x00000400ull;  // CLONE_FILES
+                ca.exit_signal = SIGCHLD;
+                long hp = ::syscall(SYS_clone3, &ca, sizeof ca);
+                if (hp == 0) {
+                    // helper: share the fd table, wait for the number, send it.
+                    ::prctl(PR_SET_PDEATHSIG, SIGKILL, 0, 0, 0);
+                    int nfd = -1;
+                    while (::read(relay[0], &nfd, sizeof nfd) < 0 && errno == EINTR) {
+                    }
+                    if (nfd >= 0) {
+                        struct iovec iov{};
+                        char tag = 'L';
+                        iov.iov_base = &tag;
+                        iov.iov_len = 1;
+                        union {
+                            char buf[CMSG_SPACE(sizeof(int))];
+                            struct cmsghdr align;
+                        } u{};
+                        struct msghdr msg{};
+                        msg.msg_iov = &iov;
+                        msg.msg_iovlen = 1;
+                        msg.msg_control = u.buf;
+                        msg.msg_controllen = sizeof u.buf;
+                        struct cmsghdr* cm = CMSG_FIRSTHDR(&msg);
+                        cm->cmsg_level = SOL_SOCKET;
+                        cm->cmsg_type = SCM_RIGHTS;
+                        cm->cmsg_len = CMSG_LEN(sizeof(int));
+                        std::memcpy(CMSG_DATA(cm), &nfd, sizeof nfd);
+                        ssize_t sent = ::sendmsg(report[1], &msg, 0);
+                        (void)sent;
+                    }
+                    ::_exit(0);
+                }
+                helper = static_cast<pid_t>(hp);
+            }
+
+            // NOW install the filter. the helper is already running and shares
+            // our fd table, so whatever number we get is a number it can use.
+            if (st) st = plan.apply_from(Phase::seccomp);
+
+            if (brokering && helper > 0) {
+                int nfd = Plan::take_notify_fd();
+                ssize_t w = ::write(relay[1], &nfd, sizeof nfd);
+                (void)w;
+                // wait for the helper to finish sending, so the descriptor is in
+                // the supervisor's hands before we exec (exec would close it).
+                int hst = 0;
+                ::waitpid(helper, &hst, 0);
+            }
 
             // report the listener fd NUMBER so the parent can fetch it with
             // pidfd_getfd. the descriptor itself cannot cross the boundary (see
@@ -321,28 +361,10 @@ Result<Spawned> spawn_in(const Plan& plan, const Command& cmd, const cgroup::Gro
     }
     ::close(report[0]);
 
-    // a stage-2 message is the broker handshake: the shepherd told us which host
-    // pid holds the listener and at which fd number. we fetch the descriptor
-    // ourselves with pidfd_getfd, which the kernel permits because it is gated on
-    // the authority we already have over our own descendants.
-    if (n == static_cast<ssize_t>(sizeof f) && f.stage == 2) {
-        int listener = -1;
-        long gp = ::syscall(SYS_pidfd_open, f.sys_errno, 0);
-        if (gp >= 0) {
-            long got = ::syscall(SYS_pidfd_getfd, static_cast<int>(gp), f.code, 0);
-            if (got >= 0) listener = static_cast<int>(got);
-            ::close(static_cast<int>(gp));
-        }
-        if (listener < 0) {
-            int err = errno;
-            ::kill(static_cast<pid_t>(pid), SIGKILL);
-            int st2 = 0;
-            ::waitpid(static_cast<pid_t>(pid), &st2, 0);
-            if (pidfd >= 0) ::close(pidfd);
-            return std::unexpected(Error{Errc::io_error, "broker: pidfd_getfd", err});
-        }
-        return Spawned{static_cast<int>(pid), pidfd, listener};
-    }
+    // the CLONE_FILES helper sent the listener as ancillary data, so a one-byte
+    // message with a descriptor attached IS the handoff -- not a failure report.
+    // the helper shares the guest's fd table, which is why no pidfd_getfd dance
+    // is needed: the number the guest got is already valid in the helper.
 
     if (received_fd >= 0 && n == 1) return Spawned{static_cast<int>(pid), pidfd, received_fd};
 

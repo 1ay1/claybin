@@ -17,6 +17,7 @@
 #include <cstring>
 
 #if defined(__linux__)
+#include <poll.h>
 #include <sys/socket.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -61,33 +62,6 @@ int main(int argc, char** argv) {
         return 0;
     }
 
-    // KNOWN INCOMPLETE, and skipped rather than failed so the tree stays honest.
-    //
-    // the policy layer, the BPF emission of SECCOMP_RET_USER_NOTIF, and the
-    // Listener/Decision API are all done and unit-tested. what is not working is
-    // getting the listener DESCRIPTOR from the guest to the supervisor, and the
-    // reason is a genuine kernel constraint rather than a loose end:
-    //
-    //   - SCM_RIGHTS refuses a seccomp notify fd once its owner has set
-    //     no_new_privs, whoever does the sending. and no_new_privs MUST be set
-    //     before seccomp, so there is no window where the fd exists and can be
-    //     passed.
-    //   - pidfd_getfd from the supervisor is the kernel's intended answer, but
-    //     the supervisor cannot name the guest: it is pid 1 inside its own pid
-    //     namespace, and the shepherd that knows its host pid is itself inside
-    //     the namespace by then.
-    //
-    // the fix is to hand the fd over BEFORE the pid namespace is entered, which
-    // means restructuring spawn's phase split rather than patching the handoff.
-    // that is a real change and it deserves its own pass instead of being rushed
-    // in behind a passing test that does not actually exercise it.
-    std::fprintf(stderr, "skip broker_test: listener fd handoff not implemented yet\n");
-    std::fprintf(stderr, "  (policy + BPF + Listener API are done; see the comment here)\n");
-    return 0;
-
-    // the rest of this test is written and correct; it will run as-is once the
-    // handoff lands.
-#if 0
     if (host.landlock_abi == 0 || !host.user_namespaces) {
         std::fprintf(stderr, "skip broker_test: host lacks landlock/userns\n");
         return 0;
@@ -150,19 +124,23 @@ int main(int argc, char** argv) {
 
         // service notifications until the guest exits. a real supervisor would
         // poll this alongside the pidfd; here we just interleave.
+        // poll the listener alongside the child. a bare blocking recv deadlocks
+        // once the guest exits without another brokered call; a bare waitpid
+        // never runs the handler. a real supervisor uses its event loop.
         int status = 0;
-        for (int guard = 0; guard < 64; ++guard) {
-            pid_t done = ::waitpid(sp->pid, &status, WNOHANG);
-            if (done == sp->pid) break;
-            // one notification, if there is one. this blocks, which is fine
-            // because the guest is blocked too -- that is the whole mechanism.
-            auto st = listener.poll_once(h);
-            if (!st) break;
+        for (;;) {
+            if (::waitpid(sp->pid, &status, WNOHANG) == sp->pid) break;
+            struct pollfd pfd{};
+            pfd.fd = listener.fd().get();
+            pfd.events = POLLIN;
+            int pr = ::poll(&pfd, 1, 50);
+            if (pr > 0 && (pfd.revents & POLLIN)) {
+                if (!listener.poll_once(h)) break;
+            } else if (pr < 0) {
+                break;
+            }
         }
-        if (::waitpid(sp->pid, &status, WNOHANG) == 0) {
-            // the guest may have exited between our checks
-            ::waitpid(sp->pid, &status, 0);
-        }
+        if (::waitpid(sp->pid, &status, WNOHANG) == 0) ::waitpid(sp->pid, &status, 0);
         if (sp->pidfd >= 0) ::close(sp->pidfd);
         return WIFEXITED(status) ? WEXITSTATUS(status) : -2;
     };
@@ -249,7 +227,6 @@ int main(int argc, char** argv) {
         }
     }
 
-#endif  // 0 -- re-enable with the handoff
 
 #else
     (void)argc;

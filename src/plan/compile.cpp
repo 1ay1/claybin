@@ -700,6 +700,8 @@ Result<Compiled> compile(const Policy<Sealed>& policy, const HostCapabilities& h
             // this op runs, so closing it here would silently break the handoff.
             if (cr.keep_count < sizeof cr.keep / sizeof cr.keep[0])
                 cr.keep[cr.keep_count++] = kRelayFdSentinel;
+            if (cr.keep_count < sizeof cr.keep / sizeof cr.keep[0])
+                cr.keep[cr.keep_count++] = kRelayFd2Sentinel;
             b.op(OpCode::close_range, cr);
         }
 

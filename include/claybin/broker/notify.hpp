@@ -31,6 +31,41 @@
 // deliberately NOT supported: "read a string out of the guest, validate it, then
 // allow the syscall". that is the unsound pattern, and offering it would be worse
 // than having no broker at all.
+//
+// ---------------------------------------------------------------------------
+// HOW THE LISTENER FD REACHES THE SUPERVISOR, and why the obvious way fails.
+// ---------------------------------------------------------------------------
+//
+// the kernel hands the listener to whichever process installs the filter -- the
+// sandboxed one -- but the supervisor needs it, and every direct route is shut:
+//
+//   SCM_RIGHTS from the guest    the kernel refuses to pass a seccomp notify fd
+//                                once its owner has no_new_privs set, and nnp
+//                                MUST precede seccomp. so there is never a
+//                                moment when the fd exists and is passable.
+//                                (EPERM, confirmed by strace.)
+//
+//   pidfd_getfd                  works in principle, but the supervisor cannot
+//                                NAME the guest: it is pid 1 inside its own pid
+//                                namespace.
+//
+// the answer is the one crun arrived at after hitting this same deadlock
+// (scrivano.org/posts/2022-09-05-seccomp-listener): fork a helper with
+// CLONE_FILES *before* installing the filter.
+//
+// the helper SHARES the guest's descriptor table, so when the guest installs the
+// filter and the kernel returns fd N, the helper already has fd N -- there is
+// nothing to transfer. and the helper is outside the filter, so its sendmsg is
+// not intercepted and its nnp state is its own. the guest tells it which number
+// through a pipe, it sends the descriptor with SCM_RIGHTS, and the guest waits
+// for it to exit before exec'ing (exec would close the CLOEXEC listener).
+//
+// two things had to be right for this to work, and both were silently wrong at
+// first: the ADDFD and ID_VALID ioctls are _IOW rather than _IOWR (the wrong
+// direction bit yields a different ioctl number and ENOTTY, which reads like an
+// unsupported kernel), and BOTH ends of the relay pipe have to be spared from the
+// close_range in the privdrop phase -- the guest writes on one, the helper reads
+// the other, and they share the same table.
 #pragma once
 
 #include <cstdint>

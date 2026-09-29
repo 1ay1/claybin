@@ -52,11 +52,17 @@ constexpr unsigned long iowr(unsigned n) {
 
 constexpr unsigned long kNotifRecv = iowr<Notif>(0);
 constexpr unsigned long kNotifSend = iowr<NotifResp>(1);
-// ID_VALID is _IOW('!', 2, __u64)
+// ID_VALID and ADDFD are _IOW, not _IOWR: the kernel only reads them. using the
+// wrong direction bit produces a completely different ioctl number and the call
+// fails with ENOTTY, which reads like an unsupported kernel rather than a typo.
+// verified against <linux/seccomp.h>: RECV 0xc0502100, SEND 0xc0182101,
+// ID_VALID 0x40082102, ADDFD 0x40182103.
 constexpr unsigned long kNotifIdValid =
     (1ul << 30) | (static_cast<unsigned long>('!') << 8) | 2u |
     (static_cast<unsigned long>(sizeof(std::uint64_t)) << 16);
-constexpr unsigned long kNotifAddfd = iowr<NotifAddfd>(3);
+constexpr unsigned long kNotifAddfd =
+    (1ul << 30) | (static_cast<unsigned long>('!') << 8) | 3u |
+    (static_cast<unsigned long>(sizeof(NotifAddfd)) << 16);
 
 // SECCOMP_ADDFD_FLAG_SEND: install the fd AND use it as the syscall's return
 // value, in one atomic step. without this the supervisor would have to install

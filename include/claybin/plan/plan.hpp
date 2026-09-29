@@ -284,6 +284,10 @@ inline constexpr std::uint32_t kReportFdSentinel = 0xfffffffeu;
 // likewise for the broker relay pipe, which the guest writes its listener fd
 // number to after the phase that closes inherited descriptors.
 inline constexpr std::uint32_t kRelayFdSentinel = 0xfffffffdu;
+// the relay pipe has TWO ends that must survive: the guest writes the listener
+// number on one, and the CLONE_FILES helper -- which shares the same descriptor
+// table -- reads it on the other. closing either breaks the handoff silently.
+inline constexpr std::uint32_t kRelayFd2Sentinel = 0xfffffffcu;
 struct SetHostnameOp {
     Ref name;
 };
@@ -442,6 +446,7 @@ class Plan {
     // the plan is compiled.
     static void set_report_fd(int fd);
     static void set_relay_fd(int fd);
+    static void set_relay_fd2(int fd);
 
     // take the seccomp listener fd, if the policy asked for one. valid only in
     // the child, immediately after apply(); spawn() passes it to the supervisor.

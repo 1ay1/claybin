@@ -44,6 +44,8 @@ void Plan::set_report_fd(int fd) { g_report_fd = static_cast<std::uint32_t>(fd);
 // the broker relay pipe, spared by the same mechanism as the report socket.
 static std::uint32_t g_relay_fd = 0xffffffffu;
 void Plan::set_relay_fd(int fd) { g_relay_fd = static_cast<std::uint32_t>(fd); }
+static std::uint32_t g_relay_fd2 = 0xffffffffu;
+void Plan::set_relay_fd2(int fd) { g_relay_fd2 = static_cast<std::uint32_t>(fd); }
 
 // the seccomp listener fd, when the policy asked for one. set by apply() in the
 // child and read by spawn(), which sends it to the supervisor over the report
@@ -752,6 +754,7 @@ Status Plan::apply_range(Phase first, Phase last) const {
                     std::uint32_t want = op.keep[k];
                     if (want == kReportFdSentinel) want = g_report_fd;
                     else if (want == kRelayFdSentinel) want = g_relay_fd;
+                    else if (want == kRelayFd2Sentinel) want = g_relay_fd2;
                     if (want != 0xffffffffu) keep[nkeep++] = want;
                 }
                 // insertion sort; nkeep is tiny and this needs no allocation.
