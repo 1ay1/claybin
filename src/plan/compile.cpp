@@ -800,8 +800,44 @@ Result<Compiled> compile(const Policy<Sealed>& policy, const HostCapabilities& h
             }
         }
 
+        // landlock scoping (abi 6+). this is the third kind of thing landlock
+        // mediates, and it is different in shape from the other two: there is no
+        // rule to add, only a handled set, because there is no object to name.
+        //
+        // it closes two channels that ignore the filesystem entirely, so no
+        // amount of path or mount work touches them:
+        //
+        //   abstract unix sockets. these live in the NETWORK namespace, not the
+        //   mount namespace, so a sandbox that only unshares mounts leaves the
+        //   guest able to reach host services listening on abstract names -- and
+        //   an abstract socket has no path, so landlock's fs rules cannot see it
+        //   either. before scoping the only thing stopping this was an empty
+        //   netns, which is all-or-nothing and gone the moment the guest needs
+        //   real network. the escape corpus proves the gap was live: with network
+        //   granted and scoping removed, net.abstract_unix_live escapes.
+        //
+        //   signals. without this the guest can signal any process sharing its
+        //   uid, which includes the supervisor watching it.
+        //
+        // scoping is strictly better than a netns here because it COMPOSES: a
+        // guest can have network and still be unable to reach the host's abstract
+        // sockets, which the namespace approach cannot express.
+        std::uint64_t scoped = 0;
+        if (host.landlock_abi >= 6) {
+            constexpr std::uint64_t kLlScopeAbstractUnix = 1ull << 0;
+            constexpr std::uint64_t kLlScopeSignal = 1ull << 1;
+
+            // both are unconditional, because scoping is about crossing the
+            // sandbox BOUNDARY and no policy grants that. talking to a port is
+            // not permission to talk to arbitrary host daemons, and the guest can
+            // still signal its own children either way -- kProcSignalSelfTree is
+            // about the guest's own tree, which scoping never touches.
+            scoped |= kLlScopeAbstractUnix;
+            scoped |= kLlScopeSignal;
+        }
+
         b.op(OpCode::landlock_enforce,
-             LandlockEnforceOp{handled, net_fully_enforced ? handled_net : 0,
+             LandlockEnforceOp{handled, net_fully_enforced ? handled_net : 0, scoped,
                                host.landlock_abi, 0});
 
         report.record(CapId::fs_read, Enforcement::strong, "landlock");

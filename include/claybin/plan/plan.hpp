@@ -317,6 +317,12 @@ struct LandlockNetRuleOp {
 struct LandlockEnforceOp {
     std::uint64_t handled_fs;   // access rights the ruleset governs
     std::uint64_t handled_net;
+    // landlock scoping (abi 6+). unlike the fs and net sets these are not about
+    // objects a rule can name -- they close two IPC channels that ignore the
+    // filesystem entirely: abstract unix sockets, which live in the network
+    // namespace rather than the mount namespace, and signals. there is no
+    // add_rule for them, so they are handled-only with no grants.
+    std::uint64_t scoped;
     std::uint32_t abi;          // the abi we compiled for
     std::uint32_t _pad;
 };

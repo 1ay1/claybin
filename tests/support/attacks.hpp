@@ -438,6 +438,42 @@ inline int abstract_unix_socket() {
     return (r == 0 || errno == ECONNREFUSED) ? kEscaped : kBlocked;
 }
 
+inline int abstract_unix_live() {
+    // the sharper version of the attack above, and the only one that can see
+    // landlock scoping.
+    //
+    // scoping is checked against the PEER: the kernel compares the listening
+    // socket's landlock domain with ours and refuses if they differ. a name that
+    // nobody is listening on has no peer to compare against, so connecting to it
+    // fails with ECONNREFUSED whether scoping is on or not -- which means the
+    // heuristic above cannot distinguish "scoped" from "reachable but empty".
+    //
+    // so the supervisor binds a real abstract name outside the sandbox and passes
+    // it in. reaching it is a genuine escape: a guest talking to a host service.
+    const char* name = ::getenv("CLAY_ABSTRACT_PROBE");
+    if (!name || !*name) return kNotApplicable;
+
+    int s = ::socket(AF_UNIX, SOCK_STREAM, 0);
+    if (s < 0) return kBlocked;
+
+    struct sockaddr_un {
+        unsigned short family;
+        char path[108];
+    } a{};
+    a.family = AF_UNIX;
+    a.path[0] = '\0';  // leading NUL is what makes it abstract
+    std::size_t n = std::strlen(name);
+    if (n > sizeof a.path - 2) n = sizeof a.path - 2;
+    std::memcpy(a.path + 1, name, n);
+
+    int r = ::connect(s, reinterpret_cast<struct sockaddr*>(&a),
+                      static_cast<unsigned>(2 + 1 + n));
+    ::close(s);
+    // here a refusal is NOT an escape: the listener exists, so ECONNREFUSED
+    // would mean we are looking at a different abstract namespace entirely.
+    return r == 0 ? kEscaped : kBlocked;
+}
+
 // ---------------------------------------------------------------------------
 // the table
 // ---------------------------------------------------------------------------
@@ -504,6 +540,7 @@ inline const Attack* table(std::size_t& count) {
         {"info.staging_paths", read_host_mounts, false},
         {"net.raw_socket", net_raw_socket, false},
         {"net.abstract_unix", abstract_unix_socket, false},
+        {"net.abstract_unix_live", abstract_unix_live, false},
         // the flag-argument attacks. each of these is allowed by a filter that
         // checks syscall NUMBERS only, which is why argument filtering exists.
         {"ns.clone_newuser", clone_userns, false},

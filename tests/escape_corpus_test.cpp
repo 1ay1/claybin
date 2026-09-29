@@ -9,7 +9,10 @@
 #include <cstring>
 
 #if defined(__linux__)
+#include <cstddef>
 #include <fcntl.h>
+#include <sys/socket.h>
+#include <sys/un.h>
 #include <sys/wait.h>
 #include <unistd.h>
 #endif
@@ -36,7 +39,7 @@ struct Outcome {
 };
 
 Outcome run_attack(const Policy<Sealed>& pol, const char* self, const char* name,
-                   bool leak_fd) {
+                   bool leak_fd, const char* env_entry = nullptr) {
     Outcome o;
     auto c = compile(pol, probe_host());
     if (!c) {
@@ -45,7 +48,11 @@ Outcome run_attack(const Policy<Sealed>& pol, const char* self, const char* name
     }
 
     const char* argv[] = {self, "attack", name, nullptr};
-    Command cmd{self, argv, nullptr};
+    // the policy's env list is caller data, not part of the plan -- claybin
+    // compiles authority, and it is spawn's caller that decides what execve
+    // sees. so an env var the guest should read has to be handed over here.
+    const char* envp[] = {env_entry, nullptr};
+    Command cmd{self, argv, env_entry ? envp : nullptr};
 
     // for the inherited-fd case the harness deliberately leaks one, so the
     // attack has something to find. the whole point is that claybin closes it
@@ -185,6 +192,94 @@ int main(int argc, char** argv) {
 
     std::fprintf(stderr, "\n  %d blocked, %d escaped, %d n/a, %d failed to start\n\n", blocked,
                  escaped, skipped, nostart);
+
+    // ---- scoping, which is the case a namespace cannot express ------------
+    //
+    // net.abstract_unix passes above, but that proves less than it looks: the
+    // build policy has no network, so the guest is in an empty netns and the
+    // abstract socket namespace is empty for that reason alone. a netns is
+    // all-or-nothing, so it stops being available the moment the guest needs
+    // real network -- which is exactly when a sandbox is most interesting.
+    //
+    // landlock scoping (abi 6+) is what covers that gap: it closes abstract
+    // sockets and cross-boundary signals INDEPENDENTLY of the network namespace.
+    // so the real test is the same attack under a policy that grants network.
+    //
+    // it needs a REAL listener, because scoping is checked against the peer: the
+    // kernel compares the listening socket's landlock domain with the caller's
+    // and refuses if they differ. an unbound name has no peer to compare, so it
+    // fails identically with and without scoping and proves nothing. so bind one
+    // here, outside the sandbox, and hand the guest its name.
+    if (host.landlock_abi >= 6) {
+        static constexpr char kProbeName[] = "claybin-scope-probe";
+
+        int lfd = ::socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+        CHECK(lfd >= 0);
+
+        struct sockaddr_un addr{};
+        addr.sun_family = AF_UNIX;
+        addr.sun_path[0] = '\0';
+        std::memcpy(addr.sun_path + 1, kProbeName, sizeof kProbeName - 1);
+        socklen_t alen = static_cast<socklen_t>(offsetof(struct sockaddr_un, sun_path) + 1 +
+                                               sizeof kProbeName - 1);
+
+        bool listening = ::bind(lfd, reinterpret_cast<struct sockaddr*>(&addr), alen) == 0 &&
+                         ::listen(lfd, 4) == 0;
+
+        std::fprintf(stderr, "  scoping, network allowed (landlock abi %u):\n",
+                     host.landlock_abi);
+
+        if (!listening) {
+            // another copy of the test is already running, most likely. without a
+            // listener there is nothing to prove, so say so rather than pass.
+            std::fprintf(stderr, "    could not bind the probe listener, skipped\n\n");
+            ::close(lfd);
+        } else {
+            // the control: unsandboxed, this connect must succeed. an attack that
+            // cannot succeed outside the sandbox proves nothing inside it.
+            {
+                int s = ::socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+                int r = ::connect(s, reinterpret_cast<struct sockaddr*>(&addr), alen);
+                ::close(s);
+                std::fprintf(stderr, "    control (no sandbox)   %s\n",
+                             r == 0 ? "reachable, as expected" : "UNREACHABLE -- test is broken");
+                CHECK_EQ(r, 0);
+            }
+
+            auto with_net = [&] {
+                return Policy<Draft>{}
+                    .ro_bind("/usr", "/usr")
+                    .bind_try("/lib", "/lib")
+                    .bind_try("/lib64", "/lib64")
+                    .bind_try("/bin", "/bin")
+                    .ro_bind(dir, "/app")
+                    .tmpfs("/tmp", 64_MB)
+                    .proc_fs("/proc")
+                    .dev_fs("/dev")
+                    .workdir("/")
+                    .connect("example.invalid", 443)
+                    .env("CLAY_ABSTRACT_PROBE", kProbeName)
+                    .syscall_profile(profiles::compiler_with_network())
+                    .memory(256_MB)
+                    .processes(64)
+                    .seal();
+            };
+
+            Outcome o = run_attack(with_net(), inner, "net.abstract_unix_live", false,
+                                   "CLAY_ABSTRACT_PROBE=" "claybin-scope-probe");
+            std::fprintf(stderr, "    net.abstract_unix_live %s\n",
+                         !o.started                     ? "DID NOT START"
+                         : o.code == attacks::kEscaped   ? "*** ESCAPED ***"
+                         : o.code == attacks::kNotApplicable ? "n/a (no probe name)"
+                                                         : "blocked");
+            CHECK(o.started);
+            CHECK(o.code == attacks::kBlocked);
+            ::close(lfd);
+            std::fprintf(stderr, "\n");
+        }
+    } else {
+        std::fprintf(stderr, "  scoping: skipped, landlock abi %u < 6\n\n", host.landlock_abi);
+    }
 
 #else
     (void)argc;

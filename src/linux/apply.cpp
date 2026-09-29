@@ -392,7 +392,7 @@ Status Plan::apply_range(Phase first, Phase last) const {
             LandlockRulesetAttr attr{};
             attr.handled_access_fs = enf.handled_fs;
             attr.handled_access_net = enf.handled_net;
-            attr.scoped = 0;
+            attr.scoped = enf.scoped;
             // pass exactly the prefix this abi knows. a newer kernel expects a
             // bigger struct and an older one rejects extra fields, so the size
             // has to track the detected abi rather than sizeof(attr).
