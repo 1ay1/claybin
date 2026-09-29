@@ -82,6 +82,53 @@ inline SyscallPolicy base() {
     };
     p.allow(std::span<const SysNr>{kAllowed});
 
+    // process-group and session calls. these are NOT privileges -- they only
+    // touch the caller's own group -- but every shell calls them during startup
+    // and a missing one produces the baffling
+    // "initialize_job_control: getpgrp failed: Success", which cost an
+    // afternoon the first time. a sandbox that cannot run /bin/sh is not much
+    // of a sandbox.
+    static constexpr SysNr kJobControl[] = {
+        39,   // getpid (already above, harmless to repeat)
+        109,  // setpgid
+        110,  // getppid
+        111,  // getpgrp
+        112,  // setsid
+        121,  // getpgid
+        122,  // getsid
+        124,  // getsid variant on some ABIs
+        14,   // rt_sigprocmask (already above)
+        13,   // rt_sigaction (already above)
+    };
+    p.allow(std::span<const SysNr>{kJobControl});
+
+    // the modern variants glibc actually calls. the older numbers are not
+    // enough on their own: libc prefers pipe2/dup3/openat and only falls back
+    // to pipe/dup2/open on ancient kernels, so a list with just the classic
+    // numbers produces "pipe error: Operation not permitted" from any shell
+    // running a pipeline.
+    static constexpr SysNr kModern[] = {
+        22,   // pipe
+        32,   // dup
+        33,   // dup2
+        292,  // dup3
+        293,  // pipe2
+        213,  // epoll_create
+        291,  // epoll_create1
+        232,  // epoll_wait
+        281,  // epoll_pwait
+        233,  // epoll_ctl
+        23,   // select
+        7,    // poll
+        271,  // ppoll
+        270,  // pselect6
+        302,  // prlimit64
+        99,   // sysinfo
+        137,  // statfs
+        138,  // fstatfs
+    };
+    p.allow(std::span<const SysNr>{kModern});
+
     // explicitly kill rather than errno for the classic escape attempts. a
     // denied-with-EPERM ptrace looks like a permissions hiccup; a killed one is
     // an unmistakable signal in an audit log.

@@ -278,6 +278,14 @@ class Policy<Draft> {
         data_.env.push_back({std::move(key), std::move(value)});
         return std::move(*this);
     }
+    // inherit the parent's environment. OFF by default, because the environment
+    // is authority -- PATH decides what gets executed, LD_PRELOAD decides what
+    // code runs -- and inheriting it silently is how a sandbox ends up handing
+    // the guest a channel nobody audited. named loudly so it is greppable.
+    Policy&& inherit_env() && {
+        data_.env_cleared = false;
+        return std::move(*this);
+    }
     Policy&& workdir(std::string p) && {
         data_.workdir = path::normalize(p);
         return std::move(*this);

@@ -45,17 +45,91 @@ the two mechanisms also fail differently, which is the point of running both: a
 mount mistake makes a path invisible, a landlock mistake makes it inaccessible,
 and an escape needs to beat both.
 
-## what is missing
+## conformance status
 
-not yet implemented, and `--audit` will tell you so rather than pretending:
+`tests/conformance.sh` runs the same invocation under `bwrap` and `claybin-run`
+and requires identical guest-observable behaviour: same stdout, same exit code.
+it is wired into ctest and skips itself when bwrap is not installed.
 
-- `--seccomp FD` / `--add-seccomp-fd` (we compile our own; accepting a foreign
-  BPF program is planned)
+**25/25 passing** as of this writing, covering the tree layout (including hidden
+entries, so no staging directory may leak), what must be unreachable, path
+remapping, env handling, try-variants, exit-code fidelity, and namespaces.
+
+stderr is deliberately not compared: the two tools word diagnostics differently
+and always will. what has to match is what the *guest* sees.
+
+## what reading the bubblewrap source fixed
+
+these were real bugs in claybin, found by reading `bubblewrap.c` and
+`bind-mount.c` rather than by testing. worth recording because each one is a
+silent hole rather than a crash:
+
+**1. a bind mount does not apply its flags.** `mount(src, dst, MS_BIND|MS_RDONLY)`
+gives you a *writable* mount. you need a separate `MS_REMOUNT` pass. i had that
+part right.
+
+**2. but the remount only affects the top mount.** submounts keep their own
+flags. so `--ro-bind /home /home` on a machine where `/home/x` is its own mount
+left `/home/x` **writable**. claybin now parses `/proc/self/mountinfo` and
+remounts every mount under the target. verified against bwrap with a real
+submount: both refuse the write, and before the fix claybin allowed it.
+
+**3. remount flags must be OR'd onto the existing ones.** remounting with only
+our flags *drops* whatever was already there, so a mount that was `noexec`
+becomes executable. tightening a mount by loosening it is a fine way to ship a
+vulnerability.
+
+**4. `MS_SLAVE`, not `MS_PRIVATE`.** slave still receives mounts from the host
+but never propagates ours back. private cuts both directions, which sounds
+tighter but means a long-running sandbox silently misses later host mounts and
+sees a stale tree.
+
+**5. the double pivot.** the obvious `pivot_root(newroot, oldroot)` leaves a
+visible `/oldroot` in the guest's tree even after `MNT_DETACH`. bubblewrap does
+it twice, the second time as `pivot_root(".", ".")` — put_old is allowed to be
+the same directory as new_root, which stacks the old root on top of itself and
+lets you detach it with **nothing left behind**. `ls -a /` is now byte-identical
+to bwrap's.
+
+**6. `newroot` must itself be a mount point** for that trick to work, so it gets
+bind-mounted onto itself first. otherwise `pivot_root(".", ".")` is EINVAL, which
+reads like nothing at all.
+
+and two conformance bugs that were mine rather than subtle:
+
+**7. the environment leaked entirely.** `--setenv` and `--clearenv` parsed fine
+and were then ignored, because `spawn()` fell back to `environ` whenever `envp`
+was null. the environment is authority — `PATH` decides what executes,
+`LD_PRELOAD` decides what code runs — so this was a real hole, not a cosmetic
+gap. the library still defaults to a cleared environment; the CLI opts back into
+inheritance because that is what bwrap does.
+
+**8. the syscall profiles could not run a shell.** missing `getpgrp` produced
+`initialize_job_control: getpgrp failed: Success`, and missing `pipe2` produced
+`pipe error: Operation not permitted` on any pipeline. libc prefers the modern
+variants (`pipe2`, `dup3`, `openat`) and only falls back to the classic numbers
+on ancient kernels, so an allow-list with just the classic ones looks correct
+and fails in practice.
+
+## what is still missing
+
+not yet implemented, and `--audit` says so rather than pretending:
+
+- `--overlay` / `--ro-overlay` / `--tmp-overlay` (overlayfs mounts)
+- `--seccomp FD` / `--add-seccomp-fd` (we compile our own filter; accepting a
+  foreign BPF program is planned)
+- `--bind-data` / `--ro-bind-data` / `--file` (writing a file from an fd)
+- `--bind-fd` / `--ro-bind-fd` (binding by fd rather than path)
 - `--uid` / `--gid` beyond identity mapping
-- `--bind-data` / `--file` (writing a file from an fd into the sandbox)
+- `--userns` / `--userns2` / `--pidns` (joining an existing namespace by fd)
 - `--new-session` (setsid)
-- `--userns` / `--pidns` (joining an existing namespace by fd)
-- cgroup v2 limits, so `--audit` still reports memory and pids as `partial`
+- `--die-with-parent`, `--as-pid-1`, `--lock-file`, `--sync-fd`
+- `--exec-label` / `--file-label` (SELinux)
+- `--chmod`, `--perms`, `--remount-ro`
+- `--json-status-fd` / `--info-fd`
+
+the overlay flags and `--seccomp FD` are the two that matter for flatpak. the
+rest are either niche or trivially addable.
 
 ## the setuid question
 

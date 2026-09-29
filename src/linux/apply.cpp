@@ -52,6 +52,11 @@ bool write_all(const char* path, const char* data, std::size_t len) {
     return n == static_cast<long>(len);
 }
 
+bool streq(const char* a, const char* b) {
+    while (*a && *a == *b) { ++a; ++b; }
+    return *a == '\0' && *b == '\0';
+}
+
 std::size_t cstr_len(const char* s) {
     std::size_t n = 0;
     while (s[n] != '\0') ++n;
@@ -168,6 +173,156 @@ struct LandlockPathBeneathAttr {
 } __attribute__((packed));
 
 constexpr int kLandlockRuleTypePathBeneath = 1;
+
+// ---------------------------------------------------------------------------
+// mountinfo, for the recursive remount below.
+//
+// this exists because of a kernel behaviour that is very easy to get wrong: a
+// bind mount DOES NOT APPLY ITS FLAGS. `mount(src, dst, MS_BIND|MS_RDONLY)`
+// gives you a writable mount. you have to follow it with an explicit
+// MS_REMOUNT, and -- the part that actually bites -- the remount only affects
+// the top mount, not the submounts underneath it.
+//
+// so `--ro-bind /home /home` on a machine where /home/x is its own mount leaves
+// /home/x WRITABLE. that is a silent hole, and it is why this parser is here.
+// ---------------------------------------------------------------------------
+
+// the flags we care about preserving. dropping one during a remount would
+// LOOSEN the mount, so the new flags are always OR'd onto the current ones.
+struct MountFlags {
+    bool ro{false};
+    bool nosuid{false};
+    bool nodev{false};
+    bool noexec{false};
+    bool noatime{false};
+    bool nodiratime{false};
+    bool relatime{false};
+
+    std::uint64_t to_ms() const {
+        std::uint64_t f = 0;
+        if (ro) f |= 1;            // MS_RDONLY
+        if (nosuid) f |= 2;        // MS_NOSUID
+        if (nodev) f |= 4;         // MS_NODEV
+        if (noexec) f |= 8;        // MS_NOEXEC
+        if (noatime) f |= 1024;    // MS_NOATIME
+        if (nodiratime) f |= 2048; // MS_NODIRATIME
+        if (relatime) f |= 1ull << 21;  // MS_RELATIME
+        return f;
+    }
+};
+
+// does `prefix` cover `path`, component-aware? same rule as the policy layer.
+bool path_covers(const char* prefix, const char* path) {
+    std::size_t pl = cstr_len(prefix);
+    if (pl == 1 && prefix[0] == '/') return true;
+    for (std::size_t i = 0; i < pl; ++i)
+        if (prefix[i] != path[i]) return false;
+    return path[pl] == '\0' || path[pl] == '/';
+}
+
+// unescape a mountinfo field in place: the kernel octal-escapes space, tab,
+// newline and backslash. a path with a space in it would otherwise be truncated,
+// and a mount we fail to see is a mount we fail to lock down.
+void unescape_inplace(char* s) {
+    char* w = s;
+    for (char* r = s; *r; ) {
+        if (r[0] == '\\' && r[1] >= '0' && r[1] <= '7' && r[2] && r[3]) {
+            *w++ = static_cast<char>(((r[1] - '0') << 6) | ((r[2] - '0') << 3) | (r[3] - '0'));
+            r += 4;
+        } else {
+            *w++ = *r++;
+        }
+    }
+    *w = '\0';
+}
+
+// remount every mount at or under `target` with `add` OR'd into its existing
+// flags. allocation-free: reads mountinfo into a caller buffer and works in
+// place.
+//
+// returns false only on a failure that matters. a submount we cannot read is
+// one the guest cannot reach either, so EACCES is ignored -- that is
+// bubblewrap's reasoning and it is sound.
+bool remount_tree(const char* target, std::uint64_t add, char* buf, std::size_t cap) {
+    int fd = static_cast<int>(sys(SYS_openat, AT_FDCWD,
+                                 reinterpret_cast<long>("/proc/self/mountinfo"),
+                                 O_RDONLY | O_CLOEXEC, 0));
+    if (fd < 0) return false;
+    long total = 0;
+    for (;;) {
+        long n = sys(SYS_read, fd, reinterpret_cast<long>(buf + total),
+                     static_cast<long>(cap - 1 - static_cast<std::size_t>(total)));
+        if (n <= 0) break;
+        total += n;
+        if (static_cast<std::size_t>(total) >= cap - 1) break;
+    }
+    sys(SYS_close, fd);
+    if (total <= 0) return false;
+    buf[total] = '\0';
+
+    bool all_ok = true;
+    char* line = buf;
+    while (line && *line) {
+        char* eol = nullptr;
+        for (char* p = line; *p; ++p)
+            if (*p == '\n') { eol = p; break; }
+        if (eol) *eol = '\0';
+
+        // mountinfo: id parent major:minor root MOUNTPOINT OPTIONS ...
+        // walk to field 5 (the mount point) and field 6 (the options).
+        char* f[7] = {};
+        int nf = 0;
+        char* p = line;
+        while (nf < 7 && *p) {
+            f[nf++] = p;
+            while (*p && *p != ' ') ++p;
+            if (*p == ' ') *p++ = '\0';
+        }
+        if (nf >= 6) {
+            char* mp = f[4];
+            char* opts = f[5];
+            unescape_inplace(mp);
+
+            if (path_covers(target, mp)) {
+                // parse the existing flags. these MUST be preserved: remounting
+                // with only our own flags would drop e.g. an existing noexec,
+                // which loosens the mount rather than tightening it.
+                MountFlags cur;
+                char* o = opts;
+                while (o && *o) {
+                    char* comma = nullptr;
+                    for (char* q = o; *q; ++q)
+                        if (*q == ',') { comma = q; break; }
+                    if (comma) *comma = '\0';
+                    if (streq(o, "ro")) cur.ro = true;
+                    else if (streq(o, "nosuid")) cur.nosuid = true;
+                    else if (streq(o, "nodev")) cur.nodev = true;
+                    else if (streq(o, "noexec")) cur.noexec = true;
+                    else if (streq(o, "noatime")) cur.noatime = true;
+                    else if (streq(o, "nodiratime")) cur.nodiratime = true;
+                    else if (streq(o, "relatime")) cur.relatime = true;
+                    o = comma ? comma + 1 : nullptr;
+                }
+
+                std::uint64_t current = cur.to_ms();
+                std::uint64_t want = current | add;
+                if (want != current) {
+                    constexpr std::uint64_t kBindRemount = 4096 | 32 | 32768;  // BIND|REMOUNT|SILENT
+                    if (sys(SYS_mount, reinterpret_cast<long>("none"),
+                            reinterpret_cast<long>(mp), 0,
+                            static_cast<long>(kBindRemount | want), 0) < 0) {
+                        // a mount we cannot read is a mount the guest cannot
+                        // reach, so EACCES is safe to skip. anything else means
+                        // we failed to lock down something reachable.
+                        if (errno != EACCES) all_ok = false;
+                    }
+                }
+            }
+        }
+        line = eol ? eol + 1 : nullptr;
+    }
+    return all_ok;
+}
 
 }  // namespace
 
@@ -302,9 +457,10 @@ Status Plan::apply_range(Phase first, Phase last) const {
                 char scratch[4096];
                 if (sys(SYS_newfstatat, AT_FDCWD, reinterpret_cast<long>(src),
                         reinterpret_cast<long>(&st), 0) < 0) {
-                    // the source does not exist. make a directory and let the
-                    // mount itself fail (or be skipped, if optional).
-                    mkdir_p(dst, 0755, scratch, sizeof scratch);
+                    // the source does not exist. create NOTHING: for a
+                    // --bind-try the whole point is that the path is absent,
+                    // and leaving an empty directory behind would be a visible
+                    // difference from bubblewrap and a lie about what is there.
                     return true;
                 }
                 constexpr unsigned int kIfmt = 0170000, kIfdir = 0040000;
@@ -353,6 +509,25 @@ Status Plan::apply_range(Phase first, Phase last) const {
                 }
                 return true;
             }
+            case OpCode::remount_recursive: {
+                RemountRecursiveOp op{};
+                if (!decode(payload, op)) return die(Errc::invalid_policy, "remount_rec", 0);
+                const char* tgt = cstr(op.target);
+                if (!tgt) return die(Errc::invalid_policy, "remount_rec", 0);
+
+                constexpr std::uint64_t kOptional = 1ull << 56;
+                const bool optional = (op.add_flags & kOptional) != 0;
+                const std::uint64_t add = op.add_flags & ~kOptional;
+
+                // a generous buffer: mountinfo on a desktop is a few KB, and we
+                // cannot allocate here. if it does not fit we are better off
+                // failing than silently locking down only the mounts we saw.
+                static char mi[64 * 1024];
+                if (!remount_tree(tgt, add, mi, sizeof mi)) {
+                    if (!optional) return die(Errc::permission_denied, "remount_rec", errno);
+                }
+                return true;
+            }
             case OpCode::pivot_root: {
                 PivotRootOp op{};
                 if (!decode(payload, op)) return die(Errc::invalid_policy, "pivot_root", 0);
@@ -366,10 +541,53 @@ Status Plan::apply_range(Phase first, Phase last) const {
                     return die(Errc::io_error, "pivot_root: chdir", errno);
                 if (sys(SYS_pivot_root, reinterpret_cast<long>(nr), reinterpret_cast<long>(po)) < 0)
                     return die(Errc::permission_denied, "pivot_root", errno);
-                // land somewhere valid inside the new tree before the old root
-                // is detached.
                 if (sys(SYS_chdir, reinterpret_cast<long>("/")) < 0)
                     return die(Errc::io_error, "pivot_root: chdir /", errno);
+                return true;
+            }
+            case OpCode::pivot_into_newroot: {
+                PivotRootOp op{};
+                if (!decode(payload, op)) return die(Errc::invalid_policy, "pivot2", 0);
+                const char* nr = cstr(op.new_root);
+                if (!nr) return die(Errc::invalid_policy, "pivot2", 0);
+
+                // bubblewrap's trick. keep an fd on the CURRENT root, chdir into
+                // the new one, then pivot_root(".", ".").
+                //
+                // the kernel documents put_old as needing to be underneath
+                // new_root, but passing the same directory is explicitly fine
+                // and is what runc and lxc do: it stacks the old root on top of
+                // itself. we then fchdir back to the old root through the fd we
+                // kept and detach it -- which leaves NO oldroot directory in the
+                // guest's tree at all. doing it the documented way leaves a
+                // visible mount point the guest can see even after the detach.
+                long oldfd = sys(SYS_openat, AT_FDCWD, reinterpret_cast<long>("/"),
+                                 O_DIRECTORY | O_RDONLY | O_CLOEXEC, 0);
+                if (oldfd < 0) return die(Errc::io_error, "pivot2: open /", errno);
+
+                if (sys(SYS_chdir, reinterpret_cast<long>(nr)) < 0) {
+                    sys(SYS_close, oldfd);
+                    return die(Errc::io_error, "pivot2: chdir newroot", errno);
+                }
+                if (sys(SYS_pivot_root, reinterpret_cast<long>("."),
+                        reinterpret_cast<long>(".")) < 0) {
+                    sys(SYS_close, oldfd);
+                    return die(Errc::permission_denied, "pivot2: pivot_root", errno);
+                }
+                // step back into the old root via the fd, and detach it.
+                if (sys(SYS_fchdir, oldfd) < 0) {
+                    sys(SYS_close, oldfd);
+                    return die(Errc::io_error, "pivot2: fchdir", errno);
+                }
+                sys(SYS_close, oldfd);
+
+                // MNT_DETACH the old root. while it is mounted the entire host
+                // filesystem is reachable, so a failure here is fatal.
+                if (sys(SYS_umount2, reinterpret_cast<long>("."), 2 /* MNT_DETACH */) < 0)
+                    return die(Errc::permission_denied, "pivot2: umount oldroot", errno);
+
+                if (sys(SYS_chdir, reinterpret_cast<long>("/")) < 0)
+                    return die(Errc::io_error, "pivot2: chdir /", errno);
                 return true;
             }
             case OpCode::umount: {

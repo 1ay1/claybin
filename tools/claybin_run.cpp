@@ -80,6 +80,9 @@ int main(int argc, char** argv) {
     std::uint64_t next_size = 0;
     const char* profile_name = "compiler";
     std::vector<std::string> denies;
+    std::vector<std::string> unset_keys;
+    bool clear_env = false;
+    bool inherit_env = true;  // bwrap inherits unless --clearenv
 
     int i = 1;
     auto need = [&](int n, const char* what) -> bool {
@@ -170,6 +173,14 @@ int main(int argc, char** argv) {
             if (!need(2, a)) return 1;
             policy = std::move(policy).env(argv[i + 1], argv[i + 2]);
             i += 2;
+        } else if (std::strcmp(a, "--unsetenv") == 0) {
+            if (!need(1, a)) return 1;
+            unset_keys.push_back(argv[i + 1]);
+            i += 1;
+        } else if (std::strcmp(a, "--clearenv") == 0) {
+            // a fresh Draft is already env_cleared, so this is the default.
+            // accepted for bwrap compatibility.
+            clear_env = true;
         } else if (std::strcmp(a, "--share-net") == 0) {
             share_net = true;
         } else if (std::strcmp(a, "--unshare-all") == 0 ||
@@ -217,6 +228,13 @@ int main(int argc, char** argv) {
     for (const auto& d : denies) policy = std::move(policy).deny(d);
     if (share_net) policy = std::move(policy).connect("", 0);
 
+    // bwrap INHERITS the environment unless --clearenv; the library defaults to
+    // cleared, which is the safer default for a policy but the wrong one for a
+    // drop-in replacement. so the CLI opts back in explicitly, and --clearenv
+    // restores the library default.
+    if (!clear_env) policy = std::move(policy).inherit_env();
+    (void)inherit_env;
+
     auto sealed = std::move(policy).seal();
     auto compiled = compile(sealed, probe_host());
     if (!compiled) {
@@ -260,7 +278,37 @@ int main(int argc, char** argv) {
     for (int k = i; k < argc; ++k) child_argv.push_back(argv[k]);
     child_argv.push_back(nullptr);
 
-    Command cmd{child_argv[0], child_argv.data(), nullptr};
+    // the environment is authority: PATH decides what gets executed and
+    // LD_PRELOAD decides what code runs inside the guest. so the policy's env
+    // is what the child gets, full stop -- a sealed policy that says
+    // env_cleared must not have the parent's environment leak past it.
+    //
+    // this was a real bug: --setenv and --clearenv parsed fine and were then
+    // ignored, because spawn() passed `environ` whenever envp was null.
+    std::vector<std::string> env_storage;
+    std::vector<const char*> child_env;
+    for (const auto& e : sealed.data().env) {
+        env_storage.push_back(e.key + "=" + e.value);
+    }
+    if (!sealed.data().env_cleared) {
+        // not cleared: inherit, but let explicit --setenv win over the parent,
+        // and honour --unsetenv.
+        for (char** p = environ; p && *p; ++p) {
+            std::string entry = *p;
+            auto eq = entry.find('=');
+            std::string key = eq == std::string::npos ? entry : entry.substr(0, eq);
+            bool drop = false;
+            for (const auto& e : sealed.data().env)
+                if (e.key == key) { drop = true; break; }
+            for (const auto& u : unset_keys)
+                if (u == key) { drop = true; break; }
+            if (!drop) env_storage.push_back(std::move(entry));
+        }
+    }
+    for (const auto& s : env_storage) child_env.push_back(s.c_str());
+    child_env.push_back(nullptr);
+
+    Command cmd{child_argv[0], child_argv.data(), child_env.data()};
     // spawn_in rather than spawn: the child is placed in its cgroup before it
     // execs, so the limits cover the target program's very first instruction.
     auto sp = spawn_in(compiled->plan, cmd, compiled->cgroup);

@@ -79,11 +79,20 @@ enum class OpCode : std::uint16_t {
     unshare = 1,
     write_file,     // uid_map, gid_map, setgroups: small writes with no libc
     mount,
+    // remount a bind AND every submount under it, OR-ing flags onto whatever
+    // each already has. a plain bind does not apply its flags, and a plain
+    // remount only touches the top mount -- so without this a --ro-bind of a
+    // tree containing its own submounts leaves those submounts WRITABLE.
+    remount_recursive,
     mkdir_p,        // create a mount point (and its parents) inside the new tree
     touch,          // create an empty file as a bind target for a device node
     bind_target,    // create a mount point matching the SOURCE's kind (dir or file)
     symlink_at,     // /lib -> usr/lib, the usr-merge layout every distro needs
     pivot_root,
+    // the second half of bubblewrap's pivot dance: chdir into newroot, then
+    // pivot_root(".", ".") so the old root stacks on top of itself and can be
+    // detached leaving NO directory behind in the guest's tree.
+    pivot_into_newroot,
     umount,
     dup2,
     close_range,
@@ -103,11 +112,13 @@ constexpr Phase phase_of(OpCode c) {
         case OpCode::unshare:
         case OpCode::write_file: return Phase::namespaces;
         case OpCode::mount:
+        case OpCode::remount_recursive:
         case OpCode::mkdir_p:
         case OpCode::touch:
         case OpCode::bind_target:
         case OpCode::symlink_at:
         case OpCode::pivot_root:
+        case OpCode::pivot_into_newroot:
         case OpCode::umount: return Phase::mounts;
         case OpCode::dup2:
         case OpCode::close_range: return Phase::fds;
@@ -129,11 +140,13 @@ constexpr const char* to_string(OpCode c) {
         case OpCode::unshare: return "unshare";
         case OpCode::write_file: return "write_file";
         case OpCode::mount: return "mount";
+        case OpCode::remount_recursive: return "remount_rec";
         case OpCode::mkdir_p: return "mkdir_p";
         case OpCode::touch: return "touch";
         case OpCode::bind_target: return "bind_target";
         case OpCode::symlink_at: return "symlink";
         case OpCode::pivot_root: return "pivot_root";
+        case OpCode::pivot_into_newroot: return "pivot_newroot";
         case OpCode::umount: return "umount";
         case OpCode::dup2: return "dup2";
         case OpCode::close_range: return "close_range";
@@ -209,6 +222,12 @@ struct BindTargetOp {
 struct UmountOp {
     Ref target;
     std::uint64_t flags;
+};
+// remount `target` and everything under it, adding `add_flags` to each mount's
+// existing flags. `optional` mirrors the mount op's bit.
+struct RemountRecursiveOp {
+    Ref target;
+    std::uint64_t add_flags;
 };
 struct Dup2Op {
     std::int32_t from;

@@ -58,5 +58,12 @@ if(CLAYBIN_TESTS)
     claybin_test(escape_test)
     claybin_test(mount_test)
     claybin_test(cgroup_test)
+
+    # differential conformance against the real bwrap. skips itself when bwrap
+    # is not installed, because the whole point is comparing against it rather
+    # than against our own idea of what it does.
+    add_test(NAME conformance
+             COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/conformance.sh
+                     $<TARGET_FILE:claybin-run>)
   endif()
 endif()

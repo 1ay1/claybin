@@ -96,6 +96,8 @@ constexpr std::uint64_t kMsRemount = 32;
 constexpr std::uint64_t kMsBind = 4096;
 constexpr std::uint64_t kMsRec = 16384;
 constexpr std::uint64_t kMsPrivate = 1ull << 18;
+constexpr std::uint64_t kMsSlave = 1ull << 19;
+constexpr std::uint64_t kMsSilent = 1ull << 15;
 
 // our own flag, well above the kernel's range. marks a mount that may fail
 // without failing the sandbox: a device node that does not exist on this host,
@@ -104,17 +106,13 @@ constexpr std::uint64_t kClayMountOptional = 1ull << 56;
 
 // where the new root is assembled before we pivot into it.
 //
-// this needs a directory that (a) exists everywhere, (b) we can mount a tmpfs
-// over without privilege, and (c) does not SHADOW anything the caller might
-// bind from. (c) is the subtle one: staging under /tmp meant that binding a
-// source under /tmp -- a perfectly ordinary thing to do -- found the source
-// already hidden by our own staging tmpfs, and failed with ENOENT.
-//
-// /proc/self/fdinfo is the trick bwrap-alikes use: it always exists, it is
-// per-process, it is already a virtual filesystem so nothing real is hidden,
-// and mounting over it inside our private namespace affects nobody.
-constexpr const char* kStageRoot = "/proc/self/fdinfo";
-constexpr const char* kOldRoot = "/proc/self/fdinfo/.clay-old";
+// bubblewrap's layout, and for its reasons: a base tmpfs with a "newroot"
+// subdirectory inside it. pivoting to the SUBDIRECTORY rather than the base
+// means a caller who binds something over / (or over the base path itself)
+// cannot break our access to the old root mid-setup.
+constexpr const char* kStageBase = "/tmp/.clay";
+constexpr const char* kNewRoot = "/tmp/.clay/newroot";
+constexpr const char* kOldRoot = "/tmp/.clay/oldroot";
 
 }  // namespace
 
@@ -210,25 +208,38 @@ Result<Compiled> compile(const Policy<Sealed>& policy, const HostCapabilities& h
     }
 
     if (building_tree) {
-        // 1. make our whole tree private, or every mount we do would propagate
-        //    back to the host. bwrap does this first too, and skipping it is a
-        //    classic container-escape-by-accident.
+        // 1. mark everything SLAVE, not private.
+        //
+        //    slave means we still RECEIVE mounts from the host but never
+        //    propagate ours back to it. private would cut both directions,
+        //    which sounds tighter but is actually worse: a long-running sandbox
+        //    would silently miss a later host mount under a path it has bound,
+        //    and see a stale tree. this is what bubblewrap does and the reason
+        //    is worth copying along with the flag.
         b.op(OpCode::mount, MountOp{b.intern("none"), b.intern("/"), b.intern("none"),
-                                    Ref{}, kMsRec | kMsPrivate});
+                                    Ref{}, kMsRec | kMsSlave | kMsSilent});
 
-        // 2. a tmpfs to assemble the new root in. mounted directly over the
-        //    staging directory, which is a virtual path so nothing real is
-        //    hidden and no caller source can be shadowed by it.
-        b.op(OpCode::mount, MountOp{b.intern("tmpfs"), b.intern(kStageRoot),
+        // 2. a tmpfs for the staging area, then newroot/ and oldroot/ inside it.
+        //    pivoting to the SUBDIRECTORY (not the tmpfs root) is deliberate: a
+        //    caller who binds something over / or over the staging path cannot
+        //    then break our own access to the old root.
+        b.op(OpCode::mkdir_p, MkdirOp{b.intern(kStageBase), 0755, 0});
+        b.op(OpCode::mount, MountOp{b.intern("tmpfs"), b.intern(kStageBase),
                                     b.intern("tmpfs"), Ref{}, kMsNosuid | kMsNodev});
-        // the pivot target has to exist inside the new root
+        b.op(OpCode::mkdir_p, MkdirOp{b.intern(kNewRoot), 0755, 0});
+        // newroot must itself be a MOUNT POINT for the second pivot_root to
+        // work -- pivot_root(".", ".") returns EINVAL on a plain directory. a
+        // recursive bind of the directory onto itself is how bubblewrap does
+        // it, and it costs nothing.
+        b.op(OpCode::mount, MountOp{b.intern(kNewRoot), b.intern(kNewRoot), b.intern("none"),
+                                    Ref{}, kMsBind | kMsRec | kMsSilent});
         b.op(OpCode::mkdir_p, MkdirOp{b.intern(kOldRoot), 0755, 0});
 
-        // 3. every requested mount, rebased under the staging root. the source
+        // 3. every requested mount, rebased under the NEW ROOT. the source
         //    is interned too, because apply() needs to stat it to decide
         //    whether the mount point should be a file or a directory.
         for (const auto& m : d.mounts.mounts()) {
-            std::string dst = std::string(kStageRoot) + path::normalize(m.dest);
+            std::string dst = std::string(kNewRoot) + path::normalize(m.dest);
             switch (m.kind) {
                 case MountKind::bind:
                 case MountKind::bind_ro:
@@ -252,16 +263,22 @@ Result<Compiled> compile(const Policy<Sealed>& policy, const HostCapabilities& h
                          BindTargetOp{b.intern(m.source), b.intern(dst)});
                     b.op(OpCode::mount, MountOp{b.intern(m.source), b.intern(dst),
                                                 b.intern("none"), Ref{}, flags});
-                    // a read-only bind needs a second remount: the kernel
-                    // ignores MS_RDONLY on the initial bind, which is a
-                    // notorious way to end up with a writable "read-only" mount.
-                    // the optional bit has to ride along, or a skipped bind is
-                    // followed by a remount of nothing and that fails hard.
-                    if (m.kind == MountKind::bind_ro)
-                        b.op(OpCode::mount,
-                             MountOp{b.intern("none"), b.intern(dst), b.intern("none"), Ref{},
-                                     kMsBind | kMsRec | kMsRemount | kMsRdonly | kMsNosuid |
-                                         (m.optional ? kClayMountOptional : 0)});
+                    // a bind mount DOES NOT APPLY ITS FLAGS -- the kernel
+                    // ignores MS_RDONLY and friends on the initial bind -- and a
+                    // plain remount only affects the top mount. so every bind
+                    // gets a recursive remount that walks mountinfo and ORs the
+                    // flags onto each submount's existing ones.
+                    //
+                    // without this, `--ro-bind /home /home` on a machine where
+                    // /home/x is its own mount leaves /home/x writable. that is
+                    // a silent hole, and it is why this op exists rather than
+                    // the single remount that was here before.
+                    std::uint64_t add = kMsNosuid;
+                    if (m.kind != MountKind::bind_dev) add |= kMsNodev;
+                    if (m.kind == MountKind::bind_ro) add |= kMsRdonly;
+                    b.op(OpCode::remount_recursive,
+                         RemountRecursiveOp{b.intern(dst),
+                                            add | (m.optional ? kClayMountOptional : 0)});
                     break;
                 }
                 case MountKind::tmpfs: {
@@ -291,25 +308,56 @@ Result<Compiled> compile(const Policy<Sealed>& policy, const HostCapabilities& h
                     // actually needs. binding individual nodes rather than
                     // mounting devtmpfs means /dev/mem and friends are simply
                     // absent rather than present-but-denied.
+                    //
+                    // the node list and the layout follow bubblewrap exactly,
+                    // because guests depend on the details: six real devices
+                    // bound in, then stdin/stdout/stderr as SYMLINKS into
+                    // /proc/self/fd (they are not devices and cannot be bound),
+                    // then a devpts instance with a ptmx symlink so a guest can
+                    // actually allocate a pty.
                     b.op(OpCode::mkdir_p, MkdirOp{b.intern(dst), 0755, 0});
                     b.op(OpCode::mount, MountOp{b.intern("tmpfs"), b.intern(dst),
                                                 b.intern("tmpfs"), Ref{},
                                                 kMsNosuid | kMsNoexec});
-                    for (const char* node : {"null", "zero", "full", "random", "urandom", "tty"}) {
+                    for (const char* node : {"null", "zero", "full", "random", "urandom",
+                                             "tty"}) {
                         std::string host_node = std::string("/dev/") + node;
                         std::string sand_node = dst + "/" + node;
                         // a bind mount needs the target to EXIST and to be the
                         // same kind of thing, so a device node needs an empty
                         // regular file to land on, not a directory.
-                        b.op(OpCode::touch, MkdirOp{b.intern(sand_node), 0600, 0});
+                        b.op(OpCode::touch, MkdirOp{b.intern(sand_node), 0444, 0});
                         // optional: /dev/tty does not exist when there is no
                         // controlling terminal, and a missing device node is not
-                        // a security failure -- it just is not there. the flag
-                        // tells apply() to skip rather than abort.
+                        // a security failure -- it just is not there.
                         b.op(OpCode::mount,
                              MountOp{b.intern(host_node), b.intern(sand_node), b.intern("none"),
-                                     Ref{}, kMsBind | kMsNosuid | kClayMountOptional});
+                                     Ref{}, kMsBind | kClayMountOptional});
                     }
+                    // stdio are symlinks into procfs, not devices.
+                    for (int fdno = 0; fdno < 3; ++fdno) {
+                        static const char* names[] = {"stdin", "stdout", "stderr"};
+                        std::string target = "/proc/self/fd/" + std::to_string(fdno);
+                        b.op(OpCode::symlink_at,
+                             SymlinkOp{b.intern(target), b.intern(dst + "/" + names[fdno])});
+                    }
+                    // and so are these two: /dev/fd is the classic alias for a
+                    // process's own descriptor table, /dev/core for its memory.
+                    b.op(OpCode::symlink_at,
+                         SymlinkOp{b.intern("/proc/self/fd"), b.intern(dst + "/fd")});
+                    b.op(OpCode::symlink_at,
+                         SymlinkOp{b.intern("/proc/kcore"), b.intern(dst + "/core")});
+                    // a private devpts, so a guest can open a pty without
+                    // reaching the host's. newinstance is what keeps it private.
+                    b.op(OpCode::mkdir_p, MkdirOp{b.intern(dst + "/pts"), 0755, 0});
+                    b.op(OpCode::mount,
+                         MountOp{b.intern("devpts"), b.intern(dst + "/pts"), b.intern("devpts"),
+                                 b.intern("newinstance,ptmxmode=0666,mode=620"),
+                                 kMsNosuid | kMsNoexec | kClayMountOptional});
+                    b.op(OpCode::symlink_at,
+                         SymlinkOp{b.intern("pts/ptmx"), b.intern(dst + "/ptmx")});
+                    b.op(OpCode::mkdir_p, MkdirOp{b.intern(dst + "/shm"), 0755, 0});
+
                     report.record(CapId::device_isolation, Enforcement::strong, "dev allowlist");
                     break;
                 }
@@ -327,11 +375,17 @@ Result<Compiled> compile(const Policy<Sealed>& policy, const HostCapabilities& h
             }
         }
 
-        // 4. pivot into the new tree and detach the old one. after this the
-        //    host filesystem is not reachable by any path.
-        b.op(OpCode::pivot_root,
-             PivotRootOp{b.intern(kStageRoot), b.intern(kOldRoot)});
-        b.op(OpCode::umount, UmountOp{b.intern("/.clay-old"), 2 /* MNT_DETACH */});
+        // 4. pivot into the new tree and detach the old one.
+        //
+        //    two pivots, following bubblewrap. the first moves us into the
+        //    staging tmpfs with the real root parked at oldroot/. the second
+        //    uses the pivot_root(".", ".") trick: put_old is allowed to be the
+        //    same directory as new_root, which stacks the old root ON TOP of
+        //    itself and lets us umount it with no leftover directory in the
+        //    guest's tree. doing it the obvious way leaves a visible /oldroot
+        //    that the guest can see even after the detach.
+        b.op(OpCode::pivot_root, PivotRootOp{b.intern(kStageBase), b.intern("oldroot")});
+        b.op(OpCode::pivot_into_newroot, PivotRootOp{b.intern("/newroot"), Ref{}});
 
         report.record(CapId::fs_read, Enforcement::strong, "mount-ns");
         report.record(CapId::fs_write, Enforcement::strong, "mount-ns");

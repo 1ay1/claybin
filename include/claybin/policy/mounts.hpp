@@ -268,8 +268,17 @@ class MountPlan {
                     fs.grant(m.dest, FileRights::write());
                     break;
                 case MountKind::symlink:
+                    // a symlink IS content from the guest's point of view: it has
+                    // to be readable or `ls -l` on it fails with EPERM, which
+                    // looks like a broken sandbox rather than a missing grant.
+                    fs.grant(m.dest, FileRights::read());
+                    break;
                 case MountKind::dir:
-                    break;  // not access grants on their own
+                    // a directory we created for the guest should be usable.
+                    // read-only: a caller who wants to write there binds or
+                    // tmpfs-mounts it instead.
+                    fs.grant(m.dest, FileRights::read());
+                    break;
             }
         }
         fs.normalize();

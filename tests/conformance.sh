@@ -1,0 +1,140 @@
+#!/bin/sh
+# differential conformance: run the same invocation under bwrap and claybin-run
+# and require identical observable behaviour.
+#
+# this is the only honest way to claim "drop-in replacement". a flag-by-flag
+# checklist proves nothing about semantics; running both and diffing does.
+#
+# usage: tests/conformance.sh [path-to-claybin-run]
+
+set -u
+CLAY="${1:-./build/claybin-run}"
+BWRAP="$(command -v bwrap || true)"
+
+if [ -z "$BWRAP" ]; then
+    echo "skip: bwrap not installed, nothing to compare against"
+    exit 0
+fi
+if [ ! -x "$CLAY" ]; then
+    echo "FAIL: $CLAY not found or not executable"
+    exit 1
+fi
+
+PASS=0
+FAIL=0
+SKIP=0
+
+# the loader bits every dynamically linked guest needs. kept in one place so a
+# case only states what it is actually testing.
+BASE="--ro-bind /usr /usr --symlink usr/lib /lib --symlink usr/lib64 /lib64 --symlink usr/bin /bin"
+
+# run one case under both tools and compare stdout+exit code.
+#
+# stderr is deliberately NOT compared: the two tools word their diagnostics
+# differently and always will. what has to match is what the GUEST observes.
+check() {
+    desc="$1"; shift
+    b_out=$($BWRAP "$@" 2>/dev/null); b_rc=$?
+    c_out=$($CLAY  "$@" 2>/dev/null); c_rc=$?
+
+    if [ "$b_out" = "$c_out" ] && [ "$b_rc" = "$c_rc" ]; then
+        PASS=$((PASS+1))
+        printf '  ok    %s\n' "$desc"
+    else
+        FAIL=$((FAIL+1))
+        printf '  FAIL  %s\n' "$desc"
+        printf '          bwrap  rc=%s out=[%s]\n' "$b_rc" "$(echo "$b_out" | tr '\n' '|')"
+        printf '          clay   rc=%s out=[%s]\n' "$c_rc" "$(echo "$c_out" | tr '\n' '|')"
+    fi
+}
+
+# a case claybin is expected to REFUSE where bwrap allows it. claybin is
+# deliberately stricter in a few places, and pretending otherwise would be the
+# same dishonesty the library exists to avoid -- so those are asserted, not
+# smoothed over.
+check_stricter() {
+    desc="$1"; shift
+    $BWRAP "$@" >/dev/null 2>&1; b_rc=$?
+    $CLAY  "$@" >/dev/null 2>&1; c_rc=$?
+    if [ "$b_rc" -eq 0 ] && [ "$c_rc" -ne 0 ]; then
+        PASS=$((PASS+1))
+        printf '  ok    %s (claybin refuses, by design)\n' "$desc"
+    else
+        FAIL=$((FAIL+1))
+        printf '  FAIL  %s: expected bwrap=0 clay!=0, got bwrap=%s clay=%s\n' \
+               "$desc" "$b_rc" "$c_rc"
+    fi
+}
+
+echo "conformance: $CLAY vs $BWRAP"
+echo
+
+# ---- the tree ----------------------------------------------------------------
+check "ro-bind /usr, ls /" \
+    $BASE --chdir / -- /usr/bin/ls /
+check "ls -a / (no oldroot leak)" \
+    $BASE --chdir / -- /usr/bin/ls -a /
+check "proc mounted" \
+    $BASE --proc /proc --chdir / -- /usr/bin/ls /proc/self
+check "dev mounted" \
+    $BASE --dev /dev --chdir / -- /usr/bin/ls /dev
+check "tmpfs is writable" \
+    $BASE --tmpfs /tmp --chdir / -- /bin/sh -c 'echo hi > /tmp/x && cat /tmp/x'
+check "full flatpak shape" \
+    --unshare-all $BASE --proc /proc --dev /dev --tmpfs /tmp --chdir / -- /usr/bin/ls /
+
+# ---- what must NOT be reachable ---------------------------------------------
+check "host /etc is absent" \
+    $BASE --chdir / -- /usr/bin/test -e /etc
+check "host /home is absent" \
+    $BASE --chdir / -- /usr/bin/test -e /home
+check "ro-bind rejects writes" \
+    $BASE --chdir / -- /usr/bin/touch /usr/probe
+check "/dev/mem absent from --dev" \
+    $BASE --dev /dev --chdir / -- /usr/bin/test -e /dev/mem
+
+# ---- remapping, the mount model's whole point -------------------------------
+check "bind remaps a path" \
+    $BASE --ro-bind /usr/share /data --chdir / -- /usr/bin/test -d /data
+check "symlink is created" \
+    $BASE --symlink usr/share /shared --chdir / -- /usr/bin/test -L /shared
+check "dir is created" \
+    $BASE --dir /workspace --chdir / -- /usr/bin/test -d /workspace
+check "chdir takes effect" \
+    $BASE --chdir /usr -- /usr/bin/pwd
+
+# ---- env --------------------------------------------------------------------
+check "setenv" \
+    $BASE --setenv CLAY_TEST value1 --chdir / -- /bin/sh -c 'echo $CLAY_TEST'
+check "clearenv drops the environment" \
+    $BASE --clearenv --chdir / -- /bin/sh -c 'echo "[$HOME]"'
+
+# ---- try-variants -----------------------------------------------------------
+check "ro-bind-try on a missing source" \
+    $BASE --ro-bind-try /nonexistent-xyz /target --chdir / -- /usr/bin/ls /
+check "bind-try on a missing source" \
+    $BASE --bind-try /nonexistent-xyz /target --chdir / -- /usr/bin/ls /
+
+# ---- exit-code fidelity -----------------------------------------------------
+check "guest exit code 0" \
+    $BASE --chdir / -- /usr/bin/true
+check "guest exit code 1" \
+    $BASE --chdir / -- /usr/bin/false
+check "guest exit code 42" \
+    $BASE --chdir / -- /bin/sh -c 'exit 42'
+check "exec failure is reported" \
+    $BASE --chdir / -- /usr/bin/definitely-not-a-real-binary
+
+# ---- namespaces -------------------------------------------------------------
+check "unshare-net kills connectivity" \
+    $BASE --unshare-net --chdir / -- /bin/sh -c 'ls /sys/class/net 2>/dev/null | wc -l'
+check "unshare-pid gives us a fresh pid space" \
+    $BASE --unshare-pid --proc /proc --chdir / -- /bin/sh -c 'ls /proc | grep -c "^1$"'
+
+# ---- claybin is deliberately stricter ---------------------------------------
+check_stricter "--not-a-security-boundary" \
+    $BASE --not-a-security-boundary --chdir / -- /usr/bin/true
+
+echo
+echo "pass=$PASS fail=$FAIL skip=$SKIP"
+[ "$FAIL" -eq 0 ]
