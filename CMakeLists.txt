@@ -57,6 +57,7 @@ if(CLAYBIN_TESTS)
   claybin_test(windows_backend_test)
   if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
     claybin_test(escape_test)
+    claybin_test(escape_corpus_test)
     claybin_test(mount_test)
     claybin_test(cgroup_test)
 

@@ -139,6 +139,30 @@ inline SyscallPolicy base() {
                      246u /* kexec_load */, 169u /* reboot */})
         p.kill(nr);
 
+    // ---- dangerous ioctls, denied by ARGUMENT ----------------------------
+    //
+    // ioctl has to stay allowed: isatty() calls it, and so does every program
+    // that checks whether stdout is a terminal. but a handful of requests are
+    // outright escapes, and without argument filtering the only choices were
+    // "allow the escape" or "break isatty for everyone".
+    //
+    // TIOCSTI is the important one. it pushes a byte into a terminal's input
+    // queue -- so a guest sharing a controlling terminal with an interactive
+    // shell can TYPE INTO THAT SHELL, and whatever it types runs outside the
+    // sandbox. modern kernels gate it behind dev.tty.legacy_tiocsti, but a
+    // sandbox that relies on a host sysctl is not a sandbox, so we deny it
+    // ourselves. new_session() also fixes this; defence in depth means doing
+    // both, since a caller may reasonably want to keep the tty.
+    //
+    // TIOCLINUX can do the same thing via its subcommand 2 (TIOCL_SETSEL),
+    // and TIOCCONS redirects console output.
+    static constexpr std::uint64_t kTiocsti = 0x5412;
+    static constexpr std::uint64_t kTioclinux = 0x541C;
+    static constexpr std::uint64_t kTioccons = 0x541D;
+    static constexpr std::uint64_t kTiocsctty = 0x540E;
+    for (std::uint64_t req : {kTiocsti, kTioclinux, kTioccons, kTiocsctty})
+        p.deny_arg(16 /* ioctl */, 1 /* request */, req, SysAction::errno_, 1 /* EPERM */);
+
     return p;
 }
 

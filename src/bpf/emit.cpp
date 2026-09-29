@@ -135,6 +135,35 @@ Result<Program> compile(const SyscallPolicy& policy, std::uint32_t arch) {
         out.push_back(ret(kRetKillProcess));
     }
 
+    // ---- argument rules, before the interval tree ------------------------
+    //
+    // these are exceptions carved out of an otherwise-allowed syscall, so they
+    // have to be checked FIRST -- the tree would say `allow` and return.
+    //
+    // each rule is: is this the right syscall number, is the arg's low half
+    // equal, is its high half equal. checking only the low half is a real
+    // bypass: an attacker sets the high bits, the comparison misses, and the
+    // syscall still does what they wanted.
+    //
+    // the accumulator holds the syscall number on entry here and must hold it
+    // again on exit, because the tree that follows depends on that.
+    for (const auto& r : policy.arg_rules()) {
+        std::uint32_t act = action_to_ret(r.action, r.errno_value);
+        auto lo = static_cast<std::uint32_t>(r.value & 0xffffffffu);
+        auto hi = static_cast<std::uint32_t>(r.value >> 32);
+
+        // if nr != this rule's, skip the whole block (6 instructions ahead)
+        out.push_back(jeq(r.nr, 0, 6));
+        out.push_back(ld_abs(arg_lo_off(r.arg_index)));
+        out.push_back(jeq(lo, 0, 3));  // low mismatch -> reload nr and move on
+        out.push_back(ld_abs(arg_hi_off(r.arg_index)));
+        out.push_back(jeq(hi, 0, 1));  // high mismatch -> reload nr and move on
+        out.push_back(ret(act));
+        // restore the accumulator: every path that falls through here has
+        // clobbered it with an argument, and the tree needs the syscall number.
+        out.push_back(ld_abs(kOffNr));
+    }
+
     TreeEmitter emitter{prog.intervals, prog.default_ret};
     emitter.emit(out);
     prog.tree_depth = emitter.depth();
@@ -147,6 +176,11 @@ Result<Program> compile(const SyscallPolicy& policy, std::uint32_t arch) {
 }
 
 std::uint32_t evaluate(const Program& prog, std::uint32_t nr, std::uint32_t arch) {
+    return evaluate_with_args(prog, nr, arch, nullptr);
+}
+
+std::uint32_t evaluate_with_args(const Program& prog, std::uint32_t nr, std::uint32_t arch,
+                                 const std::uint64_t* args) {
     // minimal classic-BPF interpreter over struct seccomp_data. only the opcodes
     // we emit are handled; anything else means the emitter changed without the
     // interpreter, so we fail loud instead of guessing.
@@ -156,7 +190,21 @@ std::uint32_t evaluate(const Program& prog, std::uint32_t nr, std::uint32_t arch
         const Insn& in = prog.insns[pc];
         std::uint16_t cls = in.code & 0x07;
         if (cls == kLd) {
-            acc = (in.k == kOffArch) ? arch : nr;
+            if (in.k == kOffArch) {
+                acc = arch;
+            } else if (in.k == kOffNr) {
+                acc = nr;
+            } else if (in.k >= kOffArgs) {
+                // an argument half. index and which half fall out of the offset.
+                std::uint32_t rel = in.k - kOffArgs;
+                std::uint32_t idx = rel / 8;
+                bool high = (rel % 8) == 4;
+                std::uint64_t v = (args && idx < 6) ? args[idx] : 0;
+                acc = high ? static_cast<std::uint32_t>(v >> 32)
+                           : static_cast<std::uint32_t>(v & 0xffffffffu);
+            } else {
+                acc = 0;
+            }
             ++pc;
         } else if (cls == kRet) {
             return in.k;

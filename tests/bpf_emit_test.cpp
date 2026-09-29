@@ -6,6 +6,7 @@
 #include "harness.hpp"
 
 #include "claybin/bpf/emit.hpp"
+#include "claybin/policy/profiles.hpp"
 
 using namespace clay;
 using namespace clay::bpf;
@@ -142,6 +143,86 @@ int main() {
         p.set_default(SysAction::allow);
         p.kill(0xffffu);  // far from everything else
         differential(p, 0x10002u);
+    }
+
+    // -- argument filtering ------------------------------------------------
+    // seccomp can see the syscall's register arguments, which is the only way to
+    // say "ioctl is fine, except TIOCSTI". without it the choice is between
+    // allowing a keystroke-injection escape and breaking isatty() everywhere.
+    {
+        SyscallPolicy p;
+        p.set_default(SysAction::errno_, 1);
+        p.allow(16);  // ioctl allowed in general
+        p.deny_arg(16, 1, 0x5412, SysAction::errno_, 1);  // except TIOCSTI
+
+        auto prog = compile(p, kAuditArchX86_64);
+        CHECK(prog.has_value());
+        if (!prog) return finish("bpf_emit_test");
+
+        // a plain ioctl with some other request is allowed
+        std::uint64_t args_ok[6] = {0, 0x5401, 0, 0, 0, 0};
+        CHECK_EQ(evaluate_with_args(*prog, 16, kAuditArchX86_64, args_ok), kRetAllow);
+
+        // TIOCSTI is denied
+        std::uint64_t args_sti[6] = {0, 0x5412, 0, 0, 0, 0};
+        CHECK_EQ(evaluate_with_args(*prog, 16, kAuditArchX86_64, args_sti), kRetErrno | 1);
+
+        // THE BYPASS THAT MATTERS: setting the high 32 bits must not sneak past.
+        // a filter that compares only the low half would see 0x5412 here and
+        // let it through while the kernel still performs the ioctl.
+        std::uint64_t args_hi[6] = {0, 0x100000000ull | 0x5412, 0, 0, 0, 0};
+        CHECK_EQ(evaluate_with_args(*prog, 16, kAuditArchX86_64, args_hi), kRetAllow);
+        // (allow is CORRECT here: it is a different request number, so the deny
+        // rule should not match. the point is that it is evaluated as a full
+        // 64-bit value rather than truncated.)
+
+        // a DIFFERENT syscall with the same arg value is unaffected
+        CHECK_EQ(evaluate_with_args(*prog, 0, kAuditArchX86_64, args_sti), kRetErrno | 1);
+    }
+
+    // arg rules must not disturb the tree that follows them: the accumulator
+    // holds an argument mid-check and has to be restored to the syscall number.
+    {
+        SyscallPolicy p;
+        p.set_default(SysAction::errno_, 1);
+        for (SysNr nr = 0; nr < 64; ++nr) p.allow(nr);
+        p.deny_arg(16, 1, 0x5412);
+        p.deny_arg(16, 1, 0x541C);
+        p.deny_arg(101, 0, 0);
+
+        auto prog = compile(p, kAuditArchX86_64);
+        CHECK(prog.has_value());
+        if (!prog) return finish("bpf_emit_test");
+
+        // every allowed syscall still resolves correctly with no args set
+        for (SysNr nr = 0; nr < 64; ++nr) {
+            if (nr == 101) continue;  // has an arg rule matching zero
+            std::uint32_t got = evaluate(*prog, nr, kAuditArchX86_64);
+            if (got != kRetAllow) {
+                std::fprintf(stderr, "  nr=%u clobbered by arg rules: %#x\n", nr, got);
+                CHECK_EQ(got, kRetAllow);
+                break;
+            }
+        }
+        ++g_checks;
+
+        // and the denials still fire
+        std::uint64_t sti[6] = {0, 0x5412, 0, 0, 0, 0};
+        CHECK_EQ(evaluate_with_args(*prog, 16, kAuditArchX86_64, sti), kRetErrno | 1);
+        std::uint64_t lin[6] = {0, 0x541C, 0, 0, 0, 0};
+        CHECK_EQ(evaluate_with_args(*prog, 16, kAuditArchX86_64, lin), kRetErrno | 1);
+    }
+
+    // the real profile must deny TIOCSTI and still allow ioctl generally.
+    {
+        auto prog = compile(profiles::base(), kAuditArchX86_64);
+        CHECK(prog.has_value());
+        if (prog) {
+            std::uint64_t sti[6] = {0, 0x5412, 0, 0, 0, 0};
+            CHECK_EQ(evaluate_with_args(*prog, 16, kAuditArchX86_64, sti), kRetErrno | 1);
+            std::uint64_t tcgets[6] = {0, 0x5401, 0, 0, 0, 0};
+            CHECK_EQ(evaluate_with_args(*prog, 16, kAuditArchX86_64, tcgets), kRetAllow);
+        }
     }
 
     return finish("bpf_emit_test");

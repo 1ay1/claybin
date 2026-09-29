@@ -122,6 +122,10 @@ constexpr std::uint64_t kClayMountOptional = 1ull << 56;
 constexpr const char* kStageBase = "/tmp/.clay";
 constexpr const char* kNewRoot = "/tmp/.clay/newroot";
 constexpr const char* kOldRoot = "/tmp/.clay/oldroot";
+// an empty mode-0444 file we bind over procfs entries that must not be WRITABLE.
+// /dev/null will not do: a bind of it accepts writes, and remounting a device
+// bind read-only is EPERM.
+constexpr const char* kRoMaskFile = "/tmp/.clay/ro-mask";
 
 }  // namespace
 
@@ -272,6 +276,9 @@ Result<Compiled> compile(const Policy<Sealed>& policy, const HostCapabilities& h
         b.op(OpCode::mount, MountOp{b.intern(kNewRoot), b.intern(kNewRoot), b.intern("none"),
                                     Ref{}, kMsBind | kMsRec | kMsSilent});
         b.op(OpCode::mkdir_p, MkdirOp{b.intern(kOldRoot), 0755, 0});
+        // the read-only mask file, used to cover procfs entries a guest must not
+        // be able to write. created mode 0444 so the read-only remount works.
+        b.op(OpCode::touch, MkdirOp{b.intern(kRoMaskFile), 0444, 0});
 
         // 3. every requested mount, rebased under the NEW ROOT. the source
         //    is interned too, because apply() needs to stat it to decide
@@ -339,6 +346,68 @@ Result<Compiled> compile(const Policy<Sealed>& policy, const HostCapabilities& h
                     b.op(OpCode::mount, MountOp{b.intern("proc"), b.intern(dst),
                                                 b.intern("proc"), Ref{},
                                                 kMsNosuid | kMsNodev | kMsNoexec});
+
+                    // MASK THE LEAKY ENTRIES.
+                    //
+                    // a fresh procfs is namespaced for PIDs but NOT for the
+                    // kernel-global files, and several of those are a gift to an
+                    // attacker. /proc/kallsyms hands over every kernel symbol
+                    // address, which defeats KASLR and turns an unexploitable
+                    // bug into an exploitable one. bubblewrap leaves these
+                    // readable and expects the caller to think of it; the escape
+                    // corpus caught claybin doing the same, which is how this
+                    // list exists.
+                    //
+                    // masking is a bind of /dev/null over the file: reads get
+                    // EOF rather than EACCES, which keeps programs that
+                    // opportunistically peek at them working.
+                    //
+                    // but /dev/null ACCEPTS WRITES, so a bind of it over
+                    // sysrq-trigger still lets a guest reboot the host. the
+                    // corpus caught exactly that. so the write-dangerous ones get
+                    // a read-only remount on top, and the read-only ones do not
+                    // need it.
+                    for (const char* leak : {"kallsyms", "modules", "config.gz",
+                                             "slabinfo", "vmallocinfo",
+                                             "sched_debug", "timer_list",
+                                             "kcore", "kmsg"}) {
+                        std::string target = dst + "/" + leak;
+                        b.op(OpCode::mount,
+                             MountOp{b.intern("/dev/null"), b.intern(target), b.intern("none"),
+                                     Ref{}, kMsBind | kMsNosuid | kClayMountOptional});
+                    }
+                    // the write-dangerous ones need a READ-ONLY mask, and
+                    // /dev/null cannot provide one: a bind of /dev/null accepts
+                    // writes, and remounting THAT read-only returns EPERM (the
+                    // kernel refuses to remount a device bind). so we bind an
+                    // empty mode-0444 file from our own staging tmpfs instead,
+                    // which remounts read-only happily.
+                    //
+                    // without this a guest can write /proc/sysrq-trigger and
+                    // reboot the host. the escape corpus caught it, and then
+                    // caught the /dev/null version of the fix not working.
+                    for (const char* danger : {"sysrq-trigger", "sys/kernel/core_pattern",
+                                               "sys/kernel/modprobe",
+                                               "sys/kernel/uevent_helper"}) {
+                        std::string target = dst + "/" + danger;
+                        b.op(OpCode::mount,
+                             MountOp{b.intern(kRoMaskFile), b.intern(target), b.intern("none"),
+                                     Ref{}, kMsBind | kMsNosuid | kClayMountOptional});
+                        b.op(OpCode::mount,
+                             MountOp{b.intern("none"), b.intern(target), b.intern("none"),
+                                     Ref{}, kMsBind | kMsRemount | kMsRdonly | kMsNosuid |
+                                                kClayMountOptional});
+                    }
+                    // and the whole of /proc/sys, which is a large and
+                    // ever-growing attack surface. a read-only bind of an empty
+                    // tmpfs is the standard container answer.
+                    b.op(OpCode::mount,
+                         MountOp{b.intern("tmpfs"), b.intern(dst + "/sys"), b.intern("tmpfs"),
+                                 Ref{}, kMsNosuid | kMsNodev | kMsNoexec | kMsRdonly |
+                                            kClayMountOptional});
+
+                    report.record(CapId::device_isolation, Enforcement::partial,
+                                  "procfs leak masking");
                     break;
                 }
                 case MountKind::devtmpfs: {

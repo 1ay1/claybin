@@ -52,6 +52,31 @@ struct SyscallRule {
     friend bool operator==(const SyscallRule&, const SyscallRule&) = default;
 };
 
+// ---------------------------------------------------------------------------
+// argument filtering
+//
+// seccomp sees the syscall's REGISTER ARGUMENTS, not just its number, so a
+// filter can say "ioctl is fine, except TIOCSTI". that matters because the
+// alternative is binary: allow ioctl and accept keystroke injection into the
+// host terminal, or deny it and break isatty() for every program.
+//
+// the deliberate limitation: only scalar equality on one argument. seccomp
+// CANNOT dereference a pointer -- the memory could be changed between the check
+// and the syscall (a real TOCTOU the kernel documents), so any filter that
+// pretended to inspect a struct would be lying. equality on a register is the
+// only thing that is actually sound.
+// ---------------------------------------------------------------------------
+
+struct ArgRule {
+    SysNr nr;
+    std::uint8_t arg_index;   // 0-5
+    std::uint64_t value;      // the value to match
+    SysAction action;         // what to do when it MATCHES
+    std::uint16_t errno_value;
+
+    friend bool operator==(const ArgRule&, const ArgRule&) = default;
+};
+
 class SyscallPolicy {
   public:
     SyscallPolicy() = default;
@@ -96,6 +121,31 @@ class SyscallPolicy {
         return *this;
     }
 
+    // deny ONE value of one argument, leaving the syscall otherwise allowed.
+    //
+    // this is how you get "ioctl yes, TIOCSTI no" instead of choosing between a
+    // keystroke-injection escape and a broken isatty(). the argument rules are
+    // checked BEFORE the per-syscall action, so a match here wins.
+    SyscallPolicy& deny_arg(SysNr nr, std::uint8_t arg_index, std::uint64_t value,
+                            SysAction a = SysAction::errno_, std::uint16_t err = 1) {
+        for (auto& r : arg_rules_) {
+            if (r.nr == nr && r.arg_index == arg_index && r.value == value) {
+                r.action = a;
+                r.errno_value = err;
+                return *this;
+            }
+        }
+        arg_rules_.push_back({nr, arg_index, value, a, err});
+        std::sort(arg_rules_.begin(), arg_rules_.end(), [](const ArgRule& x, const ArgRule& y) {
+            if (x.nr != y.nr) return x.nr < y.nr;
+            if (x.arg_index != y.arg_index) return x.arg_index < y.arg_index;
+            return x.value < y.value;
+        });
+        return *this;
+    }
+
+    const std::vector<ArgRule>& arg_rules() const { return arg_rules_; }
+
     SysAction action_for(SysNr nr) const {
         // rules_ is sorted, so this is a binary search in the hot audit path.
         auto it = std::lower_bound(rules_.begin(), rules_.end(), nr,
@@ -129,6 +179,29 @@ class SyscallPolicy {
         for (const auto& r : o.rules_) add(r.nr);
         std::sort(out.rules_.begin(), out.rules_.end(),
                   [](const SyscallRule& x, const SyscallRule& y) { return x.nr < y.nr; });
+
+        // argument rules are restrictions, so the meet keeps EVERY one from both
+        // sides: a value either side wanted denied stays denied. that is the
+        // right direction -- composing policies must not re-permit an argument
+        // one of them ruled out.
+        out.arg_rules_ = arg_rules_;
+        for (const auto& r : o.arg_rules_) {
+            bool have = false;
+            for (auto& x : out.arg_rules_) {
+                if (x.nr == r.nr && x.arg_index == r.arg_index && x.value == r.value) {
+                    x.action = clay::meet(x.action, r.action);
+                    have = true;
+                    break;
+                }
+            }
+            if (!have) out.arg_rules_.push_back(r);
+        }
+        std::sort(out.arg_rules_.begin(), out.arg_rules_.end(),
+                  [](const ArgRule& x, const ArgRule& y) {
+                      if (x.nr != y.nr) return x.nr < y.nr;
+                      if (x.arg_index != y.arg_index) return x.arg_index < y.arg_index;
+                      return x.value < y.value;
+                  });
         return out;
     }
 
@@ -160,6 +233,7 @@ class SyscallPolicy {
     SysAction default_{SysAction::kill_process};
     std::uint16_t default_errno_{1};
     std::vector<SyscallRule> rules_;
+    std::vector<ArgRule> arg_rules_;
 };
 
 static_assert(Lattice<SyscallPolicy>);

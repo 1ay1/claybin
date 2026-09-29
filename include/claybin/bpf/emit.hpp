@@ -52,6 +52,14 @@ inline constexpr std::uint16_t kRet = 0x06;
 // offsets into struct seccomp_data. stable kernel ABI.
 inline constexpr std::uint32_t kOffNr = 0;
 inline constexpr std::uint32_t kOffArch = 4;
+// args[6], each 64 bits, little-endian on every arch we support: the LOW half
+// comes first. filtering a 64-bit register therefore takes two compares, and
+// checking only the low half is a classic seccomp bypass -- an attacker sets the
+// high bits and the value no longer matches while the syscall still does what
+// they wanted.
+inline constexpr std::uint32_t kOffArgs = 16;
+constexpr std::uint32_t arg_lo_off(std::uint8_t i) { return kOffArgs + 8u * i; }
+constexpr std::uint32_t arg_hi_off(std::uint8_t i) { return kOffArgs + 8u * i + 4u; }
 
 // seccomp return actions.
 inline constexpr std::uint32_t kRetKillProcess = 0x80000000u;
@@ -125,5 +133,10 @@ Result<Program> compile(const SyscallPolicy& policy, std::uint32_t arch = native
 // tiny reference interpreter over struct seccomp_data, used by tests to
 // differential-check the tree against a linear lookup. also handy for `explain`.
 std::uint32_t evaluate(const Program& prog, std::uint32_t nr, std::uint32_t arch);
+
+// same, with the six syscall arguments visible, so argument rules can be
+// verified. `args` may be null, which reads as all-zero.
+std::uint32_t evaluate_with_args(const Program& prog, std::uint32_t nr, std::uint32_t arch,
+                                 const std::uint64_t* args);
 
 }  // namespace clay::bpf
