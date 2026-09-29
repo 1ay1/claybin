@@ -57,6 +57,15 @@ if(CLAYBIN_TESTS)
   claybin_test(shapes_test)
   claybin_test(windows_backend_test)
   claybin_test(compile_fuzz_test)
+
+  # the syscall tables get an extra translation unit: it compiles the aarch64
+  # profile block on whatever host is building, so those ~130 numbers are
+  # actually exercised rather than just present.
+  add_executable(syscall_table_test tests/syscall_table_test.cpp
+                                    tests/profiles_aarch64.cpp)
+  target_link_libraries(syscall_table_test PRIVATE claybin claybin_test_support)
+  target_compile_options(syscall_table_test PRIVATE -Wall -Wextra -fno-exceptions -fno-rtti)
+  add_test(NAME syscall_table_test COMMAND syscall_table_test)
   if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
     claybin_test(escape_test)
     claybin_test(escape_corpus_test)
