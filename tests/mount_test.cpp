@@ -55,6 +55,43 @@ int probe(const char* what) {
         ::close(fd);
         return 0;
     }
+    if (std::strcmp(what, "dev_null_create") == 0) {
+        // O_CREAT on the EXISTING /dev/null, which is what a shell does for
+        // `cmd > /dev/null` -- it always passes O_CREAT|O_TRUNC.
+        //
+        // this is a separate probe from dev_null on purpose: plain O_WRONLY
+        // succeeded for months while the redirect was broken, so the cheaper
+        // check proved nothing. the cause was the /dev tmpfs being mounted with
+        // the default mode 1777, whose STICKY bit makes the kernel refuse
+        // O_CREAT on a file the guest does not own -- and every device node
+        // there is bind-mounted from the host, owned by the outer root.
+        int fd = ::open("/dev/null", O_WRONLY | O_CREAT | O_TRUNC, 0666);
+        if (fd < 0) return 1;
+        ::close(fd);
+        return 0;
+    }
+    if (std::strcmp(what, "tmpfs_size") == 0) {
+        // the tmpfs size must be a real limit. it used to be accepted and
+        // dropped, so a guest got an unbounded tmpfs and filling /tmp was host
+        // memory pressure rather than a contained ENOSPC.
+        //
+        // the policy asks for 64 MB, so writing 96 MB must fail with ENOSPC. any
+        // other outcome -- success, or a different errno -- is a fail.
+        int fd = ::open("/tmp/fill", O_WRONLY | O_CREAT | O_TRUNC, 0600);
+        if (fd < 0) return 2;
+        static char buf[256 * 1024];
+        std::memset(buf, 'x', sizeof buf);
+        for (int i = 0; i < 384; ++i) {  // 96 MB
+            ssize_t w = ::write(fd, buf, sizeof buf);
+            if (w < 0) {
+                int e = errno;
+                ::close(fd);
+                return e == ENOSPC ? 0 : 3;
+            }
+        }
+        ::close(fd);
+        return 1;  // wrote 96 MB into a 64 MB tmpfs: the size is not a limit
+    }
     if (std::strcmp(what, "dev_mem") == 0) {
         // /dev/mem must be absent from the allow-listed /dev
         return ::access("/dev/mem", F_OK) == 0 ? 0 : 1;
@@ -163,6 +200,12 @@ int main(int argc, char** argv) {
     expect("usr_readable", 0, "/usr was bound in");
     expect("tmp_writable", 0, "tmpfs is writable");
     expect("dev_null", 0, "/dev/null was bound in");
+    // and a shell redirect over it works, which is a stricter question: it needs
+    // O_CREAT to succeed on a bind-mounted node, so the /dev tmpfs must not be
+    // mounted sticky.
+    expect("dev_null_create", 0, "`cmd > /dev/null` must work");
+    // the tmpfs size is a real limit, not a decoration
+    expect("tmpfs_size", 0, "a 64 MB tmpfs must ENOSPC before 96 MB");
 
     // and the host tree is ABSENT, not merely denied. this is the property
     // landlock alone cannot give you: there is no path to the host's /home.

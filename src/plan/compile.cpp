@@ -266,8 +266,12 @@ Result<Compiled> compile(const Policy<Sealed>& policy, const HostCapabilities& h
         //    caller who binds something over / or over the staging path cannot
         //    then break our own access to the old root.
         b.op(OpCode::mkdir_p, MkdirOp{b.intern(kStageBase), 0755, 0});
+        // mode=0755 here too. the staging tmpfs holds the bind-data scratch
+        // files, and a sticky 1777 would make writing them fail for the same
+        // reason a shell redirect over /dev/null does.
         b.op(OpCode::mount, MountOp{b.intern("tmpfs"), b.intern(kStageBase),
-                                    b.intern("tmpfs"), Ref{}, kMsNosuid | kMsNodev});
+                                    b.intern("tmpfs"), b.intern("mode=0755"),
+                                    kMsNosuid | kMsNodev});
         b.op(OpCode::mkdir_p, MkdirOp{b.intern(kNewRoot), 0755, 0});
         // newroot must itself be a MOUNT POINT for the second pivot_root to
         // work -- pivot_root(".", ".") returns EINVAL on a plain directory. a
@@ -328,8 +332,38 @@ Result<Compiled> compile(const Policy<Sealed>& policy, const HostCapabilities& h
                 }
                 case MountKind::tmpfs: {
                     b.op(OpCode::mkdir_p, MkdirOp{b.intern(dst), 0755, 0});
+                    // mode=0755, matching bubblewrap. tmpfs defaults to 1777,
+                    // and the sticky bit there is not a small difference: it
+                    // makes the kernel refuse O_CREAT on any file the guest does
+                    // not own, which breaks a shell redirect over a bind-mounted
+                    // file. see the devtmpfs case for the full story.
+                    //
+                    // the size, when the caller gave one, goes in the same option
+                    // string. it was previously accepted and DROPPED, which made
+                    // `.tmpfs("/tmp", 64_MB)` a silent lie -- the guest got an
+                    // unbounded tmpfs, so a filled /tmp was host memory pressure
+                    // rather than a contained ENOSPC. a resource limit that is
+                    // quietly ignored is worse than one that is refused.
+                    char opts[64] = "mode=0755";
+                    if (m.size != 0) {
+                        std::size_t n = 9;  // strlen("mode=0755")
+                        const char* tail = ",size=";
+                        for (std::size_t i = 0; tail[i]; ++i) opts[n++] = tail[i];
+                        // decimal bytes, written by hand: this runs before the
+                        // fork in a path that avoids snprintf for consistency
+                        // with the rest of the compiler.
+                        char digits[24];
+                        std::size_t d = 0;
+                        std::uint64_t v = m.size;
+                        while (v) {
+                            digits[d++] = static_cast<char>('0' + (v % 10));
+                            v /= 10;
+                        }
+                        while (d) opts[n++] = digits[--d];
+                        opts[n] = '\0';
+                    }
                     b.op(OpCode::mount, MountOp{b.intern("tmpfs"), b.intern(dst),
-                                                b.intern("tmpfs"), Ref{},
+                                                b.intern("tmpfs"), b.intern(opts),
                                                 kMsNosuid | kMsNodev});
                     break;
                 }
@@ -423,8 +457,22 @@ Result<Compiled> compile(const Policy<Sealed>& policy, const HostCapabilities& h
                     // then a devpts instance with a ptmx symlink so a guest can
                     // actually allocate a pty.
                     b.op(OpCode::mkdir_p, MkdirOp{b.intern(dst), 0755, 0});
+                    // mode=0755 is NOT cosmetic, and it is the one detail here
+                    // that is easy to leave out.
+                    //
+                    // tmpfs defaults to 1777 -- world-writable plus the STICKY
+                    // bit. sticky means the kernel refuses to let you touch a
+                    // file you do not own, and O_CREAT counts as touching even
+                    // when the file already exists. every device node below is
+                    // bind-mounted from the host and owned by the outer root, so
+                    // with the default mode `sh -c 'cmd > /dev/null'` fails with
+                    // EACCES: the shell always passes O_CREAT on `>`.
+                    //
+                    // that reads exactly like a landlock denial, which is what
+                    // makes it worth a comment -- it is not. it reproduces with
+                    // zero landlock rules in the plan, and no grant fixes it.
                     b.op(OpCode::mount, MountOp{b.intern("tmpfs"), b.intern(dst),
-                                                b.intern("tmpfs"), Ref{},
+                                                b.intern("tmpfs"), b.intern("mode=0755"),
                                                 kMsNosuid | kMsNoexec});
                     for (const char* node : {"null", "zero", "full", "random", "urandom",
                                              "tty"}) {
