@@ -98,6 +98,7 @@ HostCapabilities probe_host() {
         h.cgroups = cg.availability;
         h.cgroup_memory = cg.memory;
         h.cgroup_pids = cg.pids;
+        h.cgroup_cpu = cg.cpu;
     }
 
     h.landlock_abi = probe_landlock_abi();

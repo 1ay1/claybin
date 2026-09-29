@@ -390,6 +390,14 @@ Result<Compiled> compile(const Policy<Sealed>& policy, const HostCapabilities& h
         rlimit(kRlimitCpu, secs ? secs : 1);
         report.record(CapId::cpu_limit, Enforcement::partial, "rlimit-cpu");
     }
+    if (!r.cpu_quota_percent.is_unlimited()) {
+        if (have_cgroup && host.cgroup_cpu)
+            report.record(CapId::cpu_limit, Enforcement::strong, "cgroup2 cpu.max");
+        else
+            // the cpu controller is frequently NOT delegated to user sessions,
+            // so asking for a quota and getting nothing is common. say so.
+            report.record(CapId::cpu_limit, Enforcement::none, "cpu controller not delegated");
+    }
 
     // wall-clock is not a kernel mechanism at all: it needs a supervisor with a
     // timer, which is the loop's job. record nothing rather than imply we did.
@@ -484,9 +492,12 @@ Result<Compiled> compile(const Policy<Sealed>& policy, const HostCapabilities& h
     // the single most important line in the whole report.
     report.record(CapId::host_kernel_isolation, Enforcement::none, "process-backend");
 
-    // devices are mediated by the mount namespace's /dev, which we do not build
-    // yet. no claim.
-    report.record(CapId::device_isolation, Enforcement::none, "no devtmpfs yet");
+    // devices: with a tree we mount an explicit allowlist, so /dev/mem and
+    // friends are ABSENT rather than denied. without one, the best we can do is
+    // whatever landlock covers, which does not mediate device nodes usefully.
+    if (!building_tree)
+        report.record(CapId::device_isolation, Enforcement::none,
+                      "needs a mount namespace for a /dev allowlist");
 
     auto plan = std::move(b).build();
     if (!plan) return std::unexpected(plan.error());

@@ -113,7 +113,6 @@ Probe probe() {
     pr.pids = has_word(mine, "pids");
     pr.cpu = has_word(mine, "cpu");
     pr.io = has_word(mine, "io");
-
     // can we actually delegate? the blocker is cgroup v2's no-internal-process
     // rule: controllers cannot be enabled in a cgroup's subtree while that
     // cgroup holds processes.
@@ -132,7 +131,8 @@ Probe probe() {
     // ask only for what we have; asking for an absent controller is its own EINVAL
     std::string want;
     if (pr.memory) want += "+memory ";
-    if (pr.pids) want += "+pids";
+    if (pr.pids) want += "+pids ";
+    if (pr.cpu) want += "+cpu";
     if (want.empty()) {
         ::rmdir(probe_dir.c_str());
         pr.availability = Availability::unusable;
@@ -197,7 +197,15 @@ Probe probe() {
     read_file(cc.c_str(), child_ctl, sizeof child_ctl);
     ::rmdir(probe_dir.c_str());
 
-    if (!has_word(child_ctl, "memory") && !has_word(child_ctl, "pids")) {
+    // report what the CHILD actually got, not what we asked for: a controller
+    // the parent has may still not be delegable down, and claiming otherwise is
+    // how a cpu quota silently does nothing.
+    pr.memory = has_word(child_ctl, "memory");
+    pr.pids = has_word(child_ctl, "pids");
+    pr.cpu = has_word(child_ctl, "cpu");
+    pr.io = has_word(child_ctl, "io");
+
+    if (!pr.memory && !pr.pids) {
         pr.availability = Availability::unusable;
         pr.reason = "subtree_control accepted but no controllers appeared";
         return pr;
@@ -262,6 +270,22 @@ Result<Group> create(const Probe& pr, const ResourceLimits& limits,
         if (w == 0) w = 1;
         if (w > 10000) w = 10000;
         (void)set("cpu.weight", w);
+    }
+
+    // cpu.max is a HARD quota: "$MAX $PERIOD" microseconds of cpu per period.
+    // this is the one that actually bounds a busy loop -- cpu.weight only
+    // decides who wins when there is contention, so on an idle machine a
+    // weight-limited guest still gets a whole core.
+    if (pr.cpu && !limits.cpu_quota_percent.is_unlimited()) {
+        std::uint64_t pct = limits.cpu_quota_percent.value();
+        if (pct == 0) pct = 1;
+        constexpr std::uint64_t kPeriod = 100000;  // 100ms, the kernel default
+        std::uint64_t quota = (kPeriod * pct) / 100;
+        if (quota == 0) quota = 1000;
+        char q[64];
+        std::snprintf(q, sizeof q, "%llu %llu", static_cast<unsigned long long>(quota),
+                      static_cast<unsigned long long>(kPeriod));
+        (void)write_file(g.path_ + "/cpu.max", q);
     }
 
     return g;

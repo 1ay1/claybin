@@ -57,23 +57,55 @@ that the ranking is per-capability, not per-OS.
 
 ## the matrix
 
-what a policy compiles to, per capability, on a modern host:
+what a policy compiles to, per capability, on a modern host. the linux column is
+measured on this machine (landlock abi 10, cgroup v2 delegated); the windows
+column is what `src/windows/compile.cpp` reports and is unit-tested, though the
+apply step is not written yet.
 
 | capability | linux | windows | macOS |
 |---|---|---|---|
-| filesystem read/write | strong (landlock) | partial (ACL/AppContainer) | strong (seatbelt) |
-| filesystem exec | strong | partial | strong |
-| network isolation | strong (netns) | partial (WFP/firewall) | partial (seatbelt) |
-| process isolation | strong (pid ns) | strong (job object) | partial |
-| syscall filter | strong (seccomp) | **none** | **none** |
-| memory limit | strong (cgroup2) | strong (job object) | partial (rlimit) |
-| pid limit | strong (cgroup2) | strong (job object) | partial (rlimit) |
-| privilege drop | strong | strong (restricted token) | partial |
-| device isolation | strong (devtmpfs) | partial | partial |
+| filesystem read/write | **strong** (landlock + mount ns) | partial (AppContainer/DACL) | strong (seatbelt) |
+| filesystem exec | **strong** | partial | strong |
+| network isolation | **strong** (netns) | **strong** (no net capability) | partial (seatbelt) |
+| process isolation | **strong** (user+pid ns) | **strong** (AppContainer) | partial |
+| syscall filter | **strong** (seccomp) | partial (mitigations) | **none** |
+| memory limit | **strong** (cgroup2) | **strong** (job object) | partial (rlimit) |
+| pid limit | **strong** (cgroup2) | **strong** (job object) | partial (rlimit) |
+| cpu limit | strong *if the cpu controller is delegated* | **strong** (job cpu rate, win8+) | partial |
+| privilege drop | **strong** | **strong** (restricted token) | partial |
+| device isolation | **strong** (/dev allowlist) | partial (object namespace) | partial |
 | host kernel isolation | **none** | **none** | **none** |
 
 that last row is `none` everywhere for the process backend, by definition. only
 a microvm backend changes it.
+
+two entries deserve a note because they surprised me:
+
+- **windows job objects are genuinely as strong as cgroup v2** for memory, pids
+  and cpu. windows is the *better* platform on that axis, which is a good
+  reminder that the ranking is per-capability and not per-OS.
+- **the linux cpu limit is conditional**, because distributions frequently do
+  not delegate the `cpu` controller to user sessions even when they delegate
+  `memory` and `pids`. claybin reports `none` with that exact reason rather than
+  pretending a quota was applied.
+
+## what "no syscall filter" costs
+
+windows and macOS both report `partial` or `none` for `syscall.filter`, and it is
+worth being precise about what that means rather than waving at it.
+
+seccomp lets claybin say "this process may call `read`, and calling `ptrace`
+kills it". windows Process Mitigation Policies are a fixed menu: no dynamic
+code, no child processes, no non-microsoft DLLs, no extension points. useful, and
+claybin sets the ones a policy implies -- a profile with no `fork`/`exec` maps
+exactly onto `CHILD_PROCESS_RESTRICTED` -- but it cannot express an arbitrary
+allow-list. so a program that needs "everything except these twelve syscalls"
+is simply not expressible there.
+
+the consequence for callers is concrete: `compile()` **refuses**
+`Isolation::hardened_process` on windows, because hardened means every wall and
+one of them does not exist. that refusal is the feature. a library that returned
+a weaker sandbox and let the caller find out later would be worse than useless.
 
 ## so is it "easily cross-platform"?
 

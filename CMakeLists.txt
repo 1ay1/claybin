@@ -12,6 +12,7 @@ add_library(claybin STATIC
   src/bpf/emit.cpp
   src/plan/compile.cpp
   src/plan/probe.cpp
+  src/windows/compile.cpp
 )
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
   target_sources(claybin PRIVATE src/linux/apply.cpp src/linux/spawn.cpp src/linux/cgroup.cpp)
@@ -52,6 +53,7 @@ if(CLAYBIN_TESTS)
   claybin_test(plan_test)
   claybin_test(mount_algebra_test)
   claybin_test(shapes_test)
+  claybin_test(windows_backend_test)
   if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
     claybin_test(escape_test)
     claybin_test(mount_test)

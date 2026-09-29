@@ -246,6 +246,12 @@ class Policy<Draft> {
         data_.resources.cpu_time = n;
         return std::move(*this);
     }
+    // a hard cpu ceiling as a percentage of one core: 50 = half a core,
+    // 200 = two cores' worth. this is the one that bounds a busy loop.
+    Policy&& cpu_percent(std::uint64_t pct) && {
+        data_.resources.cpu_quota_percent = Count{pct};
+        return std::move(*this);
+    }
     Policy&& wall_clock(Nanos n) && {
         data_.resources.wall_clock = n;
         return std::move(*this);

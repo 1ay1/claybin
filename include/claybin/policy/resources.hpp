@@ -206,6 +206,11 @@ class ResourceLimits {
     Nanos cpu_time{};
     Nanos wall_clock{};
     Count cpu_weight{};
+    // a HARD ceiling on cpu share, as a percentage of one core (200 = two
+    // cores' worth). distinct from cpu_weight, which only decides who wins
+    // under contention: on an idle machine a weight-limited guest still gets a
+    // whole core, so weight is not a limit at all in the sense a caller means.
+    Count cpu_quota_percent{};
     Bytes io_read_bps{};
     Bytes io_write_bps{};
     // note: unlimited here so `everything()` is a genuine top element. "no core
@@ -222,6 +227,7 @@ class ResourceLimits {
         r.cpu_time = Nanos::nothing();
         r.wall_clock = Nanos::nothing();
         r.cpu_weight = Count::nothing();
+        r.cpu_quota_percent = Count::nothing();
         r.io_read_bps = Bytes::nothing();
         r.io_write_bps = Bytes::nothing();
         r.core_size = Bytes::nothing();
@@ -239,6 +245,7 @@ class ResourceLimits {
         r.cpu_time = cpu_time.meet(o.cpu_time);
         r.wall_clock = wall_clock.meet(o.wall_clock);
         r.cpu_weight = cpu_weight.meet(o.cpu_weight);
+        r.cpu_quota_percent = cpu_quota_percent.meet(o.cpu_quota_percent);
         r.io_read_bps = io_read_bps.meet(o.io_read_bps);
         r.io_write_bps = io_write_bps.meet(o.io_write_bps);
         r.core_size = core_size.meet(o.core_size);
@@ -249,7 +256,9 @@ class ResourceLimits {
         return memory.subsumes(o.memory) && memory_swap.subsumes(o.memory_swap) &&
                pids.subsumes(o.pids) && open_files.subsumes(o.open_files) &&
                cpu_time.subsumes(o.cpu_time) && wall_clock.subsumes(o.wall_clock) &&
-               cpu_weight.subsumes(o.cpu_weight) && io_read_bps.subsumes(o.io_read_bps) &&
+               cpu_weight.subsumes(o.cpu_weight) &&
+               cpu_quota_percent.subsumes(o.cpu_quota_percent) &&
+               io_read_bps.subsumes(o.io_read_bps) &&
                io_write_bps.subsumes(o.io_write_bps) && core_size.subsumes(o.core_size);
     }
 

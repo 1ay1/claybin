@@ -38,6 +38,9 @@ struct HostCapabilities {
     cgroup::Availability cgroups{cgroup::Availability::absent};
     bool cgroup_memory{false};
     bool cgroup_pids{false};
+    // the cpu controller is frequently NOT delegated to user sessions even when
+    // memory and pids are, so it needs its own flag rather than being assumed.
+    bool cgroup_cpu{false};
 
     std::uint32_t landlock_abi{0};  // 0 = absent
     bool no_new_privs{false};
@@ -52,6 +55,7 @@ struct HostCapabilities {
         h.seccomp = h.seccomp_user_notif = true;
         h.cgroups = cgroup::Availability::delegated;
         h.cgroup_memory = h.cgroup_pids = true;
+        h.cgroup_cpu = true;
         h.landlock_abi = 5;
         h.no_new_privs = true;
         return h;
