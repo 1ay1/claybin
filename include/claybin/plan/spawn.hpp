@@ -28,6 +28,10 @@ struct Command {
 struct Spawned {
     int pid{-1};
     int pidfd{-1};  // -1 if the kernel is too old for CLONE_PIDFD
+    // the seccomp listener, when the policy brokers syscalls. the CALLER owns
+    // it: wrap it in a broker::Listener and answer every notification, or the
+    // guest blocks forever on its first brokered call.
+    int notify_fd{-1};
 };
 
 // fork, apply the plan in the child, exec. returns in the parent only.

@@ -85,6 +85,12 @@ struct Compiled {
     // post-fork work is one write of a pid.
     cgroup::Group cgroup{};
 
+    // true when the policy delegates at least one syscall to a supervisor, so
+    // spawn() knows to expect a listener fd back from the child. a caller that
+    // ignores it leaves the guest blocked forever on its first brokered call,
+    // which is why it is on the struct rather than inferred.
+    bool brokers_syscalls{false};
+
     // assert a floor, and fail if the host did not reach it.
     //
     // this is the difference between api portability and security portability.

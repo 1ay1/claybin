@@ -281,6 +281,9 @@ struct CloseRangeOp {
 // pipe fd at apply time. the compiler cannot know that number -- the pipe does
 // not exist until spawn runs -- so it reserves a slot instead.
 inline constexpr std::uint32_t kReportFdSentinel = 0xfffffffeu;
+// likewise for the broker relay pipe, which the guest writes its listener fd
+// number to after the phase that closes inherited descriptors.
+inline constexpr std::uint32_t kRelayFdSentinel = 0xfffffffdu;
 struct SetHostnameOp {
     Ref name;
 };
@@ -322,6 +325,9 @@ struct NoNewPrivsOp {
 struct SeccompInstallOp {
     Ref program;            // the BPF instructions, inline in the arena
     std::uint32_t insn_count;
+    // bit 0: the policy contains a `notify` action, so ask the kernel for a
+    // listener fd (SECCOMP_FILTER_FLAG_NEW_LISTENER) rather than installing the
+    // filter silently.
     std::uint32_t flags;
 };
 
@@ -435,6 +441,11 @@ class Plan {
     // spawn() in the child, before apply, because the pipe does not exist when
     // the plan is compiled.
     static void set_report_fd(int fd);
+    static void set_relay_fd(int fd);
+
+    // take the seccomp listener fd, if the policy asked for one. valid only in
+    // the child, immediately after apply(); spawn() passes it to the supervisor.
+    static int take_notify_fd();
 
   private:
     friend class PlanBuilder;

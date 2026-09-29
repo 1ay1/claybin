@@ -41,6 +41,21 @@ static std::uint32_t g_report_fd = 0xffffffffu;
 
 void Plan::set_report_fd(int fd) { g_report_fd = static_cast<std::uint32_t>(fd); }
 
+// the broker relay pipe, spared by the same mechanism as the report socket.
+static std::uint32_t g_relay_fd = 0xffffffffu;
+void Plan::set_relay_fd(int fd) { g_relay_fd = static_cast<std::uint32_t>(fd); }
+
+// the seccomp listener fd, when the policy asked for one. set by apply() in the
+// child and read by spawn(), which sends it to the supervisor over the report
+// pipe -- by the time seccomp is installed there is no other channel left open.
+static int g_notify_fd = -1;
+
+int Plan::take_notify_fd() {
+    int f = g_notify_fd;
+    g_notify_fd = -1;
+    return f;
+}
+
 namespace {
 
 // ---- raw syscall wrappers. no libc wrappers: several of them touch errno
@@ -736,6 +751,7 @@ Status Plan::apply_range(Phase first, Phase last) const {
                 for (std::uint32_t k = 0; k < op.keep_count && nkeep < 16; ++k) {
                     std::uint32_t want = op.keep[k];
                     if (want == kReportFdSentinel) want = g_report_fd;
+                    else if (want == kRelayFdSentinel) want = g_relay_fd;
                     if (want != 0xffffffffu) keep[nkeep++] = want;
                 }
                 // insertion sort; nkeep is tiny and this needs no allocation.
@@ -910,6 +926,26 @@ Status Plan::apply_range(Phase first, Phase last) const {
                         reinterpret_cast<struct sock_filter*>(
                             const_cast<std::byte*>(blob.data()))
                 };
+
+                // if the policy has any notify action, ask the kernel for a
+                // listener fd. SECCOMP_FILTER_FLAG_NEW_LISTENER makes the return
+                // value the fd rather than 0.
+                //
+                // the fd has to get back to the SUPERVISOR, which is a different
+                // process -- so it goes over the report pipe as ancillary data.
+                // there is no other channel: by this point we are about to exec
+                // and everything else is closed.
+                constexpr unsigned long kFlagNewListener = 8;
+                if (op.flags & 1u) {
+                    long lfd = sys(SYS_seccomp, SECCOMP_SET_MODE_FILTER,
+                                   static_cast<long>(kFlagNewListener),
+                                   reinterpret_cast<long>(&prog));
+                    if (lfd < 0)
+                        return die(Errc::permission_denied, "seccomp: new_listener", errno);
+                    g_notify_fd = static_cast<int>(lfd);
+                    return true;
+                }
+
                 if (sys(SYS_seccomp, SECCOMP_SET_MODE_FILTER, 0,
                         reinterpret_cast<long>(&prog)) < 0)
                     return die(Errc::permission_denied, "seccomp", errno);

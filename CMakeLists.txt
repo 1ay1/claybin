@@ -11,6 +11,7 @@ option(CLAYBIN_TESTS "build tests" ON)
 add_library(claybin STATIC
   src/bpf/emit.cpp
   src/plan/compile.cpp
+  src/broker/notify.cpp
   src/core/fd.cpp
   src/plan/probe.cpp
   src/windows/compile.cpp
@@ -61,6 +62,7 @@ if(CLAYBIN_TESTS)
     claybin_test(escape_corpus_test)
     claybin_test(mount_test)
     claybin_test(cgroup_test)
+    claybin_test(broker_test)
 
     # differential conformance against the real bwrap. skips itself when bwrap
     # is not installed, because the whole point is comparing against it rather

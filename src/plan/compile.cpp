@@ -696,6 +696,10 @@ Result<Compiled> compile(const Policy<Sealed>& policy, const HostCapabilities& h
             CloseRangeOp cr{3, 0xffffffffu, 0, {}};
             if (cr.keep_count < sizeof cr.keep / sizeof cr.keep[0])
                 cr.keep[cr.keep_count++] = kReportFdSentinel;
+            // and the broker relay, when brokering: the guest writes to it after
+            // this op runs, so closing it here would silently break the handoff.
+            if (cr.keep_count < sizeof cr.keep / sizeof cr.keep[0])
+                cr.keep[cr.keep_count++] = kRelayFdSentinel;
             b.op(OpCode::close_range, cr);
         }
 
@@ -822,16 +826,43 @@ Result<Compiled> compile(const Policy<Sealed>& policy, const HostCapabilities& h
             return std::unexpected(
                 Error{Errc::invalid_policy, "seccomp: empty allow-list would kill on exec"});
         }
+        // does the policy delegate anything to a supervisor? if so the kernel
+        // has to hand us a listener fd, which is a different install call.
+        bool wants_notify = sys.default_action() == SysAction::notify;
+        for (const auto& r : sys.rules())
+            if (r.action == SysAction::notify) wants_notify = true;
+
+        if (wants_notify && !host.seccomp_user_notif)
+            return std::unexpected(Error{
+                Errc::unsupported,
+                "policy brokers syscalls but the kernel has no SECCOMP_RET_USER_NOTIF"});
+
+        // a brokered policy needs sendmsg, and it needs it to be permitted by
+        // the very filter being installed.
+        //
+        // the listener fd the kernel returns has to reach the SUPERVISOR, which
+        // is a different process, and SCM_RIGHTS over a socket is the only
+        // channel left by that point. that means one sendmsg AFTER the filter is
+        // live -- so a filter that denies sendmsg makes brokering impossible and
+        // fails with EPERM from our own policy, which is a memorably confusing
+        // way to find out.
+        //
+        // sendmsg on an AF_UNIX socket the guest cannot name is not a meaningful
+        // grant: it has no descriptor to send on once the handshake fd is closed.
+        if (wants_notify) sys.allow(46 /* sendmsg */);
+
         auto prog = bpf::compile(sys);
         if (!prog) return std::unexpected(prog.error());
 
         auto blob = std::span<const std::byte>{
             reinterpret_cast<const std::byte*>(prog->insns.data()),
             prog->insns.size() * sizeof(bpf::Insn)};
+
         b.op(OpCode::seccomp_install,
              SeccompInstallOp{b.intern_blob(blob), static_cast<std::uint32_t>(prog->insns.size()),
-                              0});
+                              wants_notify ? 1u : 0u});
         report.record(CapId::syscall_filter, Enforcement::strong, "seccomp-bpf");
+        out.brokers_syscalls = wants_notify;
     } else {
         degrade(CapId::syscall_filter);
     }
