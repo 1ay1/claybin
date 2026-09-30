@@ -64,6 +64,14 @@ struct Probe {
     // our own cgroup's absolute path, e.g.
     // /sys/fs/cgroup/user.slice/.../app.scope
     std::string own_path;
+    // the cgroup whose subtree_control actually has the controllers -- i.e. the
+    // one a sandbox cgroup must be created UNDER.
+    //
+    // usually own_path, but not when the probe had to relocate us: cgroup v2
+    // forbids a cgroup from both holding processes and delegating, so if we live
+    // in a leaf then the delegating cgroup is our PARENT and a sandbox cgroup
+    // has to be our sibling. empty means "same as own_path".
+    std::string delegating_path;
     // why delegation is unavailable, for an honest error message
     const char* reason{""};
 };

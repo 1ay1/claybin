@@ -119,13 +119,67 @@ Probe probe() {
     //
     // that is almost always true of wherever we were launched -- even a fresh
     // `systemd-run --scope` contains the shell and its children. the standard
-    // fix is to move OURSELVES (and anything else here) into a leaf child
-    // first, which leaves the parent empty and free to delegate. that is a real
-    // change to our own process's cgroup, so we only do it when the caller has
-    // asked for limits, and we do it here in the probe only to a scratch cgroup
-    // we immediately remove.
-    std::string probe_dir = pr.own_path + "/.clay-probe";
-    ::mkdir(probe_dir.c_str(), 0755);
+    // fix is to move the processes into a leaf child, which leaves the parent
+    // empty and free to delegate.
+    //
+    // BUT the move is one-way, and getting that wrong cost me a shell. the
+    // no-internal-process rule is symmetric: once subtree_control is set on our
+    // own cgroup, that cgroup can no longer HOLD processes, so moving them back
+    // returns EBUSY forever. an earlier version did the move, delegated, and
+    // then tried to restore -- which silently could not work on exactly the
+    // path where it mattered, leaving every process in the session parked in a
+    // scratch cgroup. the next probe then nested another one inside it. i found
+    // my own shell 330 levels deep.
+    //
+    // so the design is: if a move is needed, the processes STAY in a permanent
+    // sibling leaf, not a scratch directory we intend to delete. that leaf is a
+    // normal place for them to live -- it is what systemd-run would have given
+    // us -- and nothing needs undoing afterwards.
+    // the leaf our processes live in, as a SIBLING of our cgroup rather than a
+    // child of it. that detail is the whole fix.
+    //
+    // a child does not work, and the reason took me three attempts to see: after
+    // the move, our own cgroup IS the leaf, so the next probe's own_path is one
+    // level deeper and creates another child inside that. reusing a fixed NAME
+    // does not help when the parent keeps descending. probe() runs on every
+    // compile, so this compounds per launch -- i found my shell 330 levels down,
+    // with the terminal unable to print its own cgroup path.
+    //
+    // a sibling is stable: once we live in <parent>/clay-main, a later probe
+    // computes the same <parent>/clay-main and the mkdir is a no-op EEXIST.
+    std::string leaf_dir;
+    bool already_leaf = false;
+    std::string parent_path;
+    {
+        std::size_t slash = pr.own_path.rfind('/');
+        if (slash != std::string::npos && slash > 0) {
+            parent_path = pr.own_path.substr(0, slash);
+            leaf_dir = parent_path + "/clay-main";
+            already_leaf = (pr.own_path == leaf_dir);
+        }
+    }
+    if (leaf_dir.empty()) leaf_dir = pr.own_path + "/clay-main";
+
+    // the case that matters for repeat runs: we are already the leaf, and our
+    // PARENT already delegates. nothing needs doing -- a sandbox cgroup becomes
+    // our sibling under that parent, where the controllers already are.
+    //
+    // getting here without this check is what made every probe after the first
+    // report `unusable`: we hold processes, so enabling controllers below
+    // OURSELVES is EBUSY forever, and that looked like failure when in fact the
+    // delegation was already in place one level up.
+    if (already_leaf && !parent_path.empty()) {
+        char pctl[512] = "";
+        if (read_file((parent_path + "/cgroup.subtree_control").c_str(), pctl, sizeof pctl) > 0 &&
+            (std::strstr(pctl, "memory") || std::strstr(pctl, "pids"))) {
+            pr.memory = std::strstr(pctl, "memory") != nullptr;
+            pr.pids = std::strstr(pctl, "pids") != nullptr;
+            pr.cpu = std::strstr(pctl, "cpu") != nullptr;
+            pr.delegating_path = parent_path;
+            pr.availability = Availability::delegated;
+            return pr;
+        }
+    }
 
     std::string subtree = pr.own_path + "/cgroup.subtree_control";
     // ask only for what we have; asking for an absent controller is its own EINVAL
@@ -134,7 +188,6 @@ Probe probe() {
     if (pr.pids) want += "+pids ";
     if (pr.cpu) want += "+cpu";
     if (want.empty()) {
-        ::rmdir(probe_dir.c_str());
         pr.availability = Availability::unusable;
         pr.reason = "no memory or pids controller delegated to us";
         return pr;
@@ -142,47 +195,71 @@ Probe probe() {
 
     auto st = write_file(subtree, want.c_str());
     if (!st && st.error().sys_errno == EBUSY) {
-        // the expected case. try the leaf dance: move every process here into
-        // the scratch cgroup, then delegate, then move them back.
+        // our cgroup holds processes, so controllers cannot be enabled below it.
+        // move them to the sibling leaf and LEAVE them there -- the move is
+        // one-way, because setting subtree_control here makes this cgroup unable
+        // to hold processes ever again.
+        //
+        // if we are already the leaf, there is nowhere better to go: the
+        // processes are ours and EBUSY here means we genuinely cannot delegate.
+        // say so rather than digging another level.
+        if (already_leaf) {
+            pr.availability = Availability::unusable;
+            pr.reason = "cgroup holds processes we cannot move; launch in a delegated "
+                        "scope (systemd-run --user --scope) for cgroup limits";
+            return pr;
+        }
+        if (::mkdir(leaf_dir.c_str(), 0755) < 0 && errno != EEXIST) {
+            pr.availability = Availability::unusable;
+            pr.reason = "cannot create a leaf cgroup to move our processes into";
+            return pr;
+        }
         std::string procs_path = pr.own_path + "/cgroup.procs";
+        std::string leaf_procs = leaf_dir + "/cgroup.procs";
         char procs[8192];
         long n = read_file(procs_path.c_str(), procs, sizeof procs);
         bool moved_any = false;
         if (n > 0) {
-            std::string leaf_procs = probe_dir + "/cgroup.procs";
             const char* line = procs;
             while (line && *line) {
                 const char* end = std::strchr(line, '\n');
                 std::string pid(line, end ? static_cast<std::size_t>(end - line)
                                           : std::strlen(line));
+                // a pid that will not move is not fatal: it may have exited, or
+                // belong to something we cannot touch. we only need the cgroup
+                // to end up EMPTY, which the retry below actually tests.
                 if (!pid.empty() && write_file(leaf_procs, pid.c_str())) moved_any = true;
                 line = end ? end + 1 : nullptr;
             }
         }
         if (moved_any) st = write_file(subtree, want.c_str());
+        // we now live in the leaf, so the delegating cgroup is the one we just
+        // left -- a sandbox cgroup must be created there, beside us.
+        if (st) pr.delegating_path = pr.own_path;
 
-        // whatever happened, put everyone back where they were: leaving our own
-        // process parked in a scratch cgroup we are about to rmdir would be
-        // rude at best.
-        char leaf_now[8192];
-        std::string leaf_procs_r = probe_dir + "/cgroup.procs";
-        long m = read_file(leaf_procs_r.c_str(), leaf_now, sizeof leaf_now);
-        if (m > 0) {
-            const char* line = leaf_now;
-            while (line && *line) {
-                const char* end = std::strchr(line, '\n');
-                std::string pid(line, end ? static_cast<std::size_t>(end - line)
-                                          : std::strlen(line));
-                if (!pid.empty()) (void)write_file(procs_path, pid.c_str());
-                line = end ? end + 1 : nullptr;
+        // if delegation still failed, the move bought nothing -- so undo it.
+        // THIS restore is safe precisely because subtree_control did not get
+        // set: the parent can still hold processes.
+        if (!st) {
+            char leaf_now[8192];
+            long m = read_file(leaf_procs.c_str(), leaf_now, sizeof leaf_now);
+            if (m > 0) {
+                const char* line = leaf_now;
+                while (line && *line) {
+                    const char* end = std::strchr(line, '\n');
+                    std::string pid(line, end ? static_cast<std::size_t>(end - line)
+                                              : std::strlen(line));
+                    if (!pid.empty()) (void)write_file(procs_path, pid.c_str());
+                    line = end ? end + 1 : nullptr;
+                }
             }
+            ::rmdir(leaf_dir.c_str());
         }
     }
 
     if (!st) {
-        ::rmdir(probe_dir.c_str());
         pr.availability = Availability::unusable;
-        // EBUSY even after the leaf dance means something else holds this
+        // EBUSY even after the leaf move means something else holds this
         // cgroup, and the fix is on the launching side, not in claybin.
         pr.reason = st.error().sys_errno == EBUSY
                         ? "cgroup holds processes we cannot move; launch in a delegated "
@@ -191,11 +268,19 @@ Probe probe() {
         return pr;
     }
 
-    // it worked. confirm the child actually got the controllers.
+    // it worked. confirm a child actually gets the controllers, using a scratch
+    // cgroup that holds NO processes -- so removing it cannot fail and cannot
+    // strand anything.
+    std::string probe_dir = pr.own_path + "/.clay-probe";
+    ::mkdir(probe_dir.c_str(), 0755);
     char child_ctl[512] = "";
     std::string cc = probe_dir + "/cgroup.controllers";
     read_file(cc.c_str(), child_ctl, sizeof child_ctl);
-    ::rmdir(probe_dir.c_str());
+    if (::rmdir(probe_dir.c_str()) < 0) {
+        // should be impossible: we never put a process in it. if it ever
+        // happens, say so rather than leaving a stray cgroup behind silently.
+        pr.reason = "probe cgroup could not be removed";
+    }
 
     // report what the CHILD actually got, not what we asked for: a controller
     // the parent has may still not be delegable down, and claiming otherwise is
@@ -227,7 +312,17 @@ Result<Group> create(const Probe& pr, const ResourceLimits& limits,
                   name_hint.data(), static_cast<int>(::getpid()));
 
     Group g;
-    g.path_ = pr.own_path + "/" + name;
+    // the sandbox cgroup goes beside us, not beneath us.
+    //
+    // cgroup v2's no-internal-process rule means the cgroup we OCCUPY can never
+    // have controllers enabled in its subtree while we are in it -- so a child
+    // of it gets memory.max, pids.max and friends only if we first vacate, and
+    // vacating is what caused the 330-deep runaway. a sibling under the same
+    // delegating parent has the controllers already and needs no moving.
+    //
+    // pr.delegating_path is that parent when the probe had to relocate us, and
+    // own_path otherwise, so this is correct in both shapes.
+    g.path_ = (pr.delegating_path.empty() ? pr.own_path : pr.delegating_path) + "/" + name;
 
     if (::mkdir(g.path_.c_str(), 0755) < 0 && errno != EEXIST)
         return std::unexpected(Error{Errc::io_error, "cgroup: mkdir", errno});

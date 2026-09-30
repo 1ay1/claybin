@@ -81,6 +81,7 @@ void usage() {
                  "  --allow-bind-port PORT allow TCP bind to PORT only\n"
                  "  --memory BYTES         memory cap (cgroup2 when available)\n"
                  "  --processes N          max processes (cgroup2 pids.max)\n"
+                 "  --cpu-percent N        cpu cap, 100 = one core (cgroup2 cpu.max)\n"
                  "  --audit                compile THESE flags, print the plan and guarantee\n"
                  "                         report, and exit without spawning. this is the tool\n"
                  "                         for 'what will my sandbox actually do' -- claybin-audit\n"
@@ -231,6 +232,14 @@ int main(int argc, char** argv) {
         } else if (std::strcmp(a, "--processes") == 0) {
             if (!need(1, a)) return 1;
             policy = std::move(policy).processes(std::strtoull(eargv[i + 1], nullptr, 10));
+            i += 1;
+        } else if (std::strcmp(a, "--cpu-percent") == 0) {
+            // the library has always supported this and the tool never exposed
+            // it, so `resource.cpu` read `none` on every audit -- which looked
+            // like a missing capability rather than a missing flag.
+            if (!need(1, a)) return 1;
+            policy = std::move(policy).cpu_percent(
+                static_cast<std::uint32_t>(std::strtoul(eargv[i + 1], nullptr, 10)));
             i += 1;
         } else if (std::strcmp(a, "--dir") == 0) {
             if (!need(1, a)) return 1;
