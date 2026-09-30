@@ -1,8 +1,20 @@
-// prints what the running kernel supports and what a policy would compile to.
-// this is the seed of `claybin audit`: everything here is a pure query over a
-// compiled plan, so it works without spawning anything.
+// prints what the running kernel supports, and what ONE FIXED EXAMPLE policy
+// compiles to on it.
+//
+// the example is hardcoded, and that is worth saying loudly because it does not
+// look hardcoded from the outside: this program takes no arguments and ignores
+// anything you pass it. i lost real time during a debugging session reading its
+// output as though it described the invocation i had just typed -- it reported 2
+// landlock rules and a 15-op plan while the actual plan had 77 ops, and that sent
+// me looking in entirely the wrong place.
+//
+// to audit a REAL invocation, use `claybin-run --audit` with the flags you
+// actually care about. it compiles the policy those flags describe and prints the
+// same report. this program is for "what can this kernel do", not "what will my
+// sandbox do".
 
 #include <cstdio>
+#include <cstring>
 
 #include "claybin/linux/cgroup.hpp"
 #include "claybin/plan/compile.hpp"
@@ -11,7 +23,20 @@
 using namespace clay;
 using namespace clay::literals;
 
-int main() {
+int main(int argc, char** argv) {
+    // refuse to silently ignore arguments. a tool that accepts flags and does
+    // something unrelated to them is worse than one that has none.
+    if (argc > 1) {
+        bool help = std::strcmp(argv[1], "-h") == 0 || std::strcmp(argv[1], "--help") == 0;
+        std::fprintf(help ? stdout : stderr,
+                     "claybin-audit: reports host capabilities and compiles one FIXED\n"
+                     "example policy. it takes no arguments.\n"
+                     "\n"
+                     "to audit a real invocation, use:\n"
+                     "  claybin-run --audit <the flags you care about> -- /bin/true\n");
+        return help ? 0 : 2;
+    }
+
     HostCapabilities h = probe_host();
 
     std::printf("HOST\n");
@@ -32,6 +57,9 @@ int main() {
     else
         std::printf("  landlock       no\n");
 
+    // the fixed example. changing it changes nothing about any real sandbox --
+    // it is here to give the plan printer something to print.
+    std::printf("\nEXAMPLE POLICY (fixed; not your arguments)\n");
     auto policy = Policy<Draft>{}
                       .read("/usr")
                       .read_write("/workspace")

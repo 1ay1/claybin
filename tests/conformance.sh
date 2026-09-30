@@ -366,6 +366,72 @@ check_stricter "--cap-add CAP_SYS_ADMIN" \
 check_stricter "--cap-add ALL" \
     $BASE --cap-add ALL --chdir / -- /usr/bin/true
 
+# ---- --audit must describe the invocation it was GIVEN -----------------------
+#
+# this exists because of a debugging session, not a hypothesis. the build
+# directory had a stale claybin-why binary left over from a deleted source file;
+# it compiled its own hardcoded policy and reported a 12-op plan while the real
+# invocation had 77 ops. i read its output as authoritative and spent a long time
+# looking in the wrong layer for a bug that was somewhere else entirely.
+#
+# nothing tested any audit output, so nothing objected. these checks make the
+# audit path answer for itself: if it stops reflecting the flags it was handed,
+# that is now a failure rather than a trap for whoever debugs next.
+
+audit_of() { $CLAY --audit "$@" -- /usr/bin/true 2>&1; }
+
+# more mounts must mean more ops. a hardcoded policy cannot vary.
+small=$(audit_of --ro-bind /usr /usr --chdir / | sed -n 's/^PLAN  \([0-9]*\) ops.*/\1/p')
+big=$(audit_of --ro-bind /usr /usr --proc /proc --dev /dev --tmpfs /tmp \
+              --symlink usr/lib /lib --chdir / | sed -n 's/^PLAN  \([0-9]*\) ops.*/\1/p')
+if [ -n "$small" ] && [ -n "$big" ] && [ "$big" -gt "$small" ]; then
+    PASS=$((PASS+1))
+    printf '  ok    --audit op count tracks the flags (%s -> %s ops)\n' "$small" "$big"
+else
+    FAIL=$((FAIL+1))
+    printf '  FAIL  --audit op count did not track the flags (small=[%s] big=[%s])\n' \
+        "$small" "$big"
+fi
+
+# a flag that changes the plan's SHAPE must show up in it. --dev adds the
+# devtmpfs bind set, so the op list has to grow a mount for it.
+with_dev=$(audit_of --ro-bind /usr /usr --dev /dev --chdir / | grep -c 'mounts')
+no_dev=$(audit_of --ro-bind /usr /usr --chdir / | grep -c 'mounts')
+if [ "$with_dev" -gt "$no_dev" ]; then
+    PASS=$((PASS+1))
+    printf '  ok    --audit reflects --dev in the mount ops\n'
+else
+    FAIL=$((FAIL+1))
+    printf '  FAIL  --audit ignored --dev (%s vs %s mount ops)\n' "$with_dev" "$no_dev"
+fi
+
+# a guarantee that depends on a flag must move with it. no --unshare-net means
+# network isolation cannot be claimed as strong via a netns.
+netline=$(audit_of --ro-bind /usr /usr --share-net --chdir / | grep 'network.isolation')
+if printf '%s' "$netline" | grep -qv 'strong'; then
+    PASS=$((PASS+1))
+    printf '  ok    --audit guarantees track the flags (--share-net)\n'
+else
+    FAIL=$((FAIL+1))
+    printf '  FAIL  --audit claimed strong net isolation with --share-net: [%s]\n' "$netline"
+fi
+
+# and claybin-audit, which takes NO arguments, must refuse them rather than
+# ignore them -- the exact behaviour that made the stale binary so misleading.
+AUDIT_BIN=$(dirname "$CLAY")/claybin-audit
+if [ -x "$AUDIT_BIN" ]; then
+    if "$AUDIT_BIN" --ro-bind /usr /usr >/dev/null 2>&1; then
+        FAIL=$((FAIL+1))
+        printf '  FAIL  claybin-audit silently accepted arguments it ignores\n'
+    else
+        PASS=$((PASS+1))
+        printf '  ok    claybin-audit refuses arguments it would ignore\n'
+    fi
+else
+    SKIP=$((SKIP+1))
+    printf '  skip  claybin-audit not built\n'
+fi
+
 echo
 echo "pass=$PASS fail=$FAIL skip=$SKIP"
 [ "$FAIL" -eq 0 ]

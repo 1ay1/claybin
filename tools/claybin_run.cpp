@@ -81,7 +81,10 @@ void usage() {
                  "  --allow-bind-port PORT allow TCP bind to PORT only\n"
                  "  --memory BYTES         memory cap (cgroup2 when available)\n"
                  "  --processes N          max processes (cgroup2 pids.max)\n"
-                 "  --audit                print the guarantee report and exit\n"
+                 "  --audit                compile THESE flags, print the plan and guarantee\n"
+                 "                         report, and exit without spawning. this is the tool\n"
+                 "                         for 'what will my sandbox actually do' -- claybin-audit\n"
+                 "                         reports host capabilities against a fixed example.\n"
                  "  --require LEVEL        fail unless every wall reaches LEVEL\n");
 }
 
