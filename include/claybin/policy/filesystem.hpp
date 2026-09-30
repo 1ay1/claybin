@@ -217,7 +217,24 @@ class FsAuthority {
         return true;
     }
 
-    bool is_nothing() const {
+    // is this authority EMPTY -- i.e. did the caller say nothing at all?
+    //
+    // NOT "does it grant nothing". A policy made only of denials grants
+    // nothing and is very much not empty: it is the caller saying "whatever
+    // the mounts imply, not THAT path". compile() asks this question to decide
+    // whether the mount-implied authority should REPLACE the explicit one, so
+    // conflating the two silently discarded every deny.
+    //
+    // that was a real bug, found by agentty masking ~/.aws under a
+    // deliberately permissive scope: with only `.deny()` calls the authority
+    // reported nothing, the implied grants replaced it wholesale, and the
+    // credentials stayed readable. the mask looked applied and enforced
+    // nothing.
+    bool is_nothing() const { return grants_.empty(); }
+
+    // does this authority GRANT anything? the other half of the question
+    // above, kept separate so a caller has to pick which one it meant.
+    bool grants_nothing() const {
         for (const auto& g : grants_)
             if (!g.rights.is_nothing()) return false;
         return true;
