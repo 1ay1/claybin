@@ -67,19 +67,6 @@ bool own_cgroup(std::string& out) {
     return false;
 }
 
-// count entries in cgroup.procs. the "no internal process" rule means a cgroup
-// with any process in it cannot enable controllers in its subtree.
-long count_procs(const std::string& dir) {
-    std::string p = dir + "/cgroup.procs";
-    char buf[8192];
-    long n = read_file(p.c_str(), buf, sizeof buf);
-    if (n < 0) return -1;
-    long count = 0;
-    for (long i = 0; i < n; ++i)
-        if (buf[i] == '\n') ++count;
-    return count;
-}
-
 }  // namespace
 
 Probe probe() {
@@ -346,11 +333,19 @@ Result<Group> create(const Probe& pr, const ResourceLimits& limits,
         if (auto st = set("memory.max", limits.memory.value()); !st)
             return std::unexpected(st.error());
         // without this, the guest can exceed its memory cap by swapping. a
-        // memory limit that swap defeats is not a memory limit.
-        if (limits.memory_swap.is_unlimited())
-            write_file(g.path_ + "/memory.swap.max", "0");
-        else
-            (void)set("memory.swap.max", limits.memory_swap.value());
+        // memory limit that swap defeats is not a memory limit, so a failure
+        // here is fatal rather than ignored -- the report would otherwise say
+        // `strong` for a cap the guest can walk straight past.
+        //
+        // clang's -Wunused-value caught this: the first version discarded the
+        // nodiscard Status from the unlimited branch while checking it in the
+        // other, which is the inconsistency that lets a silent failure through.
+        if (limits.memory_swap.is_unlimited()) {
+            if (auto st = write_file(g.path_ + "/memory.swap.max", "0"); !st)
+                return std::unexpected(st.error());
+        } else if (auto st = set("memory.swap.max", limits.memory_swap.value()); !st) {
+            return std::unexpected(st.error());
+        }
     }
 
     if (pr.pids && !limits.pids.is_unlimited()) {

@@ -362,12 +362,33 @@ int main(int argc, char** argv) {
         single = true;
     }
 
-    const int iters = single ? 1 : 3000;
+    // the default is sized to keep `ctest` quick. a CI lane or an overnight run
+    // wants far more than that, and it also wants DIFFERENT cases rather than
+    // the same 3000 again -- the seeds are derived from a base, so without a way
+    // to move the base, running the binary eight times just does identical work.
+    // i tried exactly that and got eight identical passes.
+    std::uint64_t base = 0xC1A7B10Bull;
+    int iters = 3000;
+    int compose_iters = 800;
+    if (const char* e = std::getenv("CLAY_FUZZ_CASES")) {
+        long v = std::strtol(e, nullptr, 10);
+        if (v > 0) {
+            iters = static_cast<int>(v);
+            compose_iters = static_cast<int>(v / 4 + 1);
+        }
+    }
+    if (const char* e = std::getenv("CLAY_FUZZ_SEED")) {
+        // mixed in rather than replacing, so the default campaign stays exactly
+        // reproducible while a different base explores new ground.
+        base += std::strtoull(e, nullptr, 10) * 0x9E3779B97F4A7C15ull;
+    }
+    if (single) iters = 1;
+
     int compiled = 0;
     int refused = 0;
 
     for (int i = 0; i < iters; ++i) {
-        std::uint64_t seed = single ? only_seed : (0xC1A7B10Bull + static_cast<std::uint64_t>(i));
+        std::uint64_t seed = single ? only_seed : (base + static_cast<std::uint64_t>(i));
         Rng r{seed};
 
         Policy<Sealed> pol = gen_policy(r);
@@ -393,8 +414,8 @@ int main(int argc, char** argv) {
     // the headline property of the whole library, fuzzed: meeting two policies
     // must not let the result reach anything neither input could.
     {
-        for (int i = 0; i < 800; ++i) {
-            std::uint64_t seed = 0xC0FFEE00ull + static_cast<std::uint64_t>(i);
+        for (int i = 0; i < compose_iters; ++i) {
+            std::uint64_t seed = base ^ (0xC0FFEE00ull + static_cast<std::uint64_t>(i));
             Rng r{seed};
             Policy<Sealed> a = gen_policy(r);
             Policy<Sealed> b = gen_policy(r);

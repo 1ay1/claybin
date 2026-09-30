@@ -66,6 +66,16 @@ if(CLAYBIN_TESTS)
   target_link_libraries(syscall_table_test PRIVATE claybin claybin_test_support)
   target_compile_options(syscall_table_test PRIVATE -Wall -Wextra -fno-exceptions -fno-rtti)
   add_test(NAME syscall_table_test COMMAND syscall_table_test)
+
+  # the aarch64 tables have never executed -- no hardware, no cross toolchain --
+  # so they get a second, INDEPENDENT check: dump what they permit and resolve
+  # every number through the kernel's own header. the C++ test above shares an
+  # author (and any misreading) with the tables; this does not.
+  add_executable(clay_dump_aarch64 tests/dump_aarch64.cpp)
+  target_link_libraries(clay_dump_aarch64 PRIVATE claybin)
+  add_test(NAME aarch64_audit
+           COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/aarch64_audit.sh
+                   $<TARGET_FILE:clay_dump_aarch64>)
   if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
     claybin_test(escape_test)
     claybin_test(escape_corpus_test)

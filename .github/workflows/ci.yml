@@ -1,0 +1,112 @@
+name: ci
+
+# claybin has never built or run anywhere but one developer machine: one kernel,
+# one arch, one libc, one compiler. for a sandbox that is the single biggest
+# credibility gap, because every "it works" claim is really "it works there".
+#
+# so this matrix is deliberately about VARIETY rather than depth. the lanes are
+# cheap; the point is that a bug which only shows up under clang, or on a
+# different kernel, or with the sanitizers on, stops being invisible.
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+  schedule:
+    # the long fuzz campaign is too slow for every push but worth running daily.
+    - cron: '0 3 * * *'
+
+jobs:
+  linux:
+    name: ${{ matrix.cc }} ${{ matrix.build }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - cc: gcc
+            cxx: g++
+            build: Debug
+          - cc: gcc
+            cxx: g++
+            build: Release
+          - cc: clang
+            cxx: clang++
+            build: Debug
+    steps:
+      - uses: actions/checkout@v4
+      - name: toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake ninja-build bubblewrap
+      - name: configure
+        env:
+          CC: ${{ matrix.cc }}
+          CXX: ${{ matrix.cxx }}
+        run: cmake -S . -B build -G Ninja -DCLAYBIN_TESTS=ON -DCMAKE_BUILD_TYPE=${{ matrix.build }}
+      - name: build
+        run: cmake --build build -j
+      - name: kernel and host capabilities
+        # print what this runner actually supports. a lane that silently skips
+        # every interesting test is worse than no lane, so make the skips visible.
+        run: |
+          uname -srm
+          ./build/claybin-audit || true
+      - name: test
+        run: ctest --test-dir build --output-on-failure -j2
+
+  sanitizers:
+    name: asan+ubsan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo apt-get update && sudo apt-get install -y cmake ninja-build
+      - name: configure
+        run: |
+          cmake -S . -B build -G Ninja -DCLAYBIN_TESTS=ON \
+            -DCMAKE_BUILD_TYPE=Debug \
+            -DCMAKE_CXX_FLAGS="-fsanitize=address,undefined -fno-omit-frame-pointer -g"
+      - run: cmake --build build -j
+      - name: test
+        # the forking tests cannot run instrumented: ASan reserves ~20 TB of
+        # shadow address space, which claybin's own RLIMIT_AS refuses, so the
+        # sandboxed guest cannot start. that is a property of the sandbox
+        # working, not a bug -- so those tests are excluded here and covered by
+        # the plain lanes above.
+        env:
+          UBSAN_OPTIONS: print_stacktrace=1:halt_on_error=1
+        run: |
+          ctest --test-dir build --output-on-failure -j2 \
+            -E 'escape_test|escape_corpus_test|mount_test|broker_test|cgroup_test|conformance'
+
+  cross-arch:
+    name: aarch64 tables
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo apt-get update && sudo apt-get install -y cmake ninja-build
+      - run: cmake -S . -B build -G Ninja -DCLAYBIN_TESTS=ON
+      - run: cmake --build build -j
+      - name: audit the aarch64 syscall tables
+        # these tables cannot be EXECUTED without aarch64 hardware, so they are
+        # cross-checked against the kernel's own asm-generic/unistd.h instead.
+        run: ctest --test-dir build --output-on-failure -R 'aarch64_audit|syscall_table_test'
+
+  fuzz:
+    name: long fuzz campaign
+    runs-on: ubuntu-latest
+    if: github.event_name == 'schedule'
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo apt-get update && sudo apt-get install -y cmake ninja-build
+      - run: cmake -S . -B build -G Ninja -DCLAYBIN_TESTS=ON -DCMAKE_BUILD_TYPE=Release
+      - run: cmake --build build -j
+      - name: fuzz the policy compiler
+        # a different seed base per shard, or every shard explores the same
+        # cases -- which is exactly the mistake that made an earlier eight-run
+        # campaign eight identical passes.
+        run: |
+          for seed in 1 2 3 4 5 6 7 8; do
+            printf 'seed %s: ' "$seed"
+            CLAY_FUZZ_SEED=$seed CLAY_FUZZ_CASES=50000 ./build/compile_fuzz_test | tail -1
+          done
