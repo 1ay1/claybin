@@ -66,6 +66,17 @@ inline SyscallPolicy base() {
         10,   // mprotect
         11,   // munmap
         12,   // brk
+        25,   // mremap
+        //   mremap belongs with the other four, not with anything optional.
+        //   glibc's realloc() grows a block past the mmap threshold by
+        //   remapping it, so denying mremap makes realloc return NULL on a
+        //   perfectly reasonable request -- and a caller that checks its
+        //   allocations then reports out of memory on a machine with free
+        //   RAM. curl does exactly that: it failed with CURLE_OUT_OF_MEMORY
+        //   (27) talking to a raw IP, which reads like a network denial and
+        //   is not one. A filter whose failures lie about their cause is
+        //   worse than a looser one, and mremap grants no authority the
+        //   other four don't already: it moves the caller's own mapping.
         13,   // rt_sigaction
         14,   // rt_sigprocmask
         15,   // rt_sigreturn
@@ -411,6 +422,7 @@ inline SyscallPolicy base() {
         226,  // mprotect
         215,  // munmap
         214,  // brk
+        216,  // mremap  -- see the x86_64 table: realloc needs it
         134,  // rt_sigaction
         135,  // rt_sigprocmask
         139,  // rt_sigreturn

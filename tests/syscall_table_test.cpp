@@ -97,6 +97,7 @@ constexpr Named kExpected[] = {
     {"getrandom", SYS_getrandom},
     {"rseq", SYS_rseq},
     {"clone3", SYS_clone3},
+    {"mremap", SYS_mremap},
 
     // job control. this is the group the bug was in.
     {"setpgid", SYS_setpgid},
@@ -319,6 +320,19 @@ int main() {
     // clone when the kernel says the syscall does not exist.
     CHECK_EQ(profiles::base().action_for(SYS_clone3), SysAction::errno_);
     CHECK_EQ(profiles::base().errno_for(SYS_clone3), std::uint16_t{38});
+
+    // mremap is in base(), so it is in every profile. It was once missing, and
+    // the way that presented is the reason this check exists: glibc's realloc
+    // grows a large block by remapping it, so a denied mremap turned into a
+    // NULL realloc, and every caller that checks its allocations reported out
+    // of memory. curl said CURLE_OUT_OF_MEMORY while fetching a raw IP, which
+    // looks like a network denial and is not one -- an hour went into the
+    // network rules before the allocator was suspected. Assert it at the
+    // bottom profile so no profile can lose it again.
+    CHECK(permitted(profiles::base(), SYS_mremap));
+    CHECK(permitted(profiles::with_filesystem(), SYS_mremap));
+    CHECK(permitted(profiles::compiler(), SYS_mremap));
+    CHECK(permitted(profiles::compiler_with_network(), SYS_mremap));
 
     // -- the aarch64 tables, checked on an x86_64 host ---------------------
     //
