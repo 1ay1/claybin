@@ -33,17 +33,27 @@ jobs:
           - cc: clang
             cxx: clang++
             build: Debug
+            # Ubuntu's default clang pairs with a libstdc++ older than
+            # <expected>, and claybin is built on std::expected. libc++ has it,
+            # so the clang lane uses that -- which also makes this lane test a
+            # genuinely different standard library rather than just a different
+            # front end, which is the more useful thing to cover.
+            extra_flags: -stdlib=libc++
+            extra_packages: libc++-dev libc++abi-dev
     steps:
       - uses: actions/checkout@v4
       - name: toolchain
         run: |
           sudo apt-get update
-          sudo apt-get install -y cmake ninja-build bubblewrap
+          sudo apt-get install -y cmake ninja-build bubblewrap ${{ matrix.extra_packages }}
       - name: configure
         env:
           CC: ${{ matrix.cc }}
           CXX: ${{ matrix.cxx }}
-        run: cmake -S . -B build -G Ninja -DCLAYBIN_TESTS=ON -DCMAKE_BUILD_TYPE=${{ matrix.build }}
+        run: |
+          cmake -S . -B build -G Ninja -DCLAYBIN_TESTS=ON \
+            -DCMAKE_BUILD_TYPE=${{ matrix.build }} \
+            -DCMAKE_CXX_FLAGS="${{ matrix.extra_flags }}"
       - name: build
         run: cmake --build build -j
       - name: kernel and host capabilities

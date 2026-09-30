@@ -6,6 +6,30 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
+# claybin is built on std::expected -- Result<T> and Status are aliases for it,
+# and every fallible operation returns one. a toolchain without it fails with a
+# few hundred lines of "no template named 'Result'", which says nothing useful.
+#
+# this check exists because CI hit exactly that: Ubuntu's default clang pairs
+# with a libstdc++ too old for <expected>, and the build failed deep in
+# bpf/emit.cpp rather than at configure time with a sentence anyone could act
+# on. -std=c++23 alone does not imply the LIBRARY has it.
+include(CheckCXXSourceCompiles)
+set(CMAKE_REQUIRED_FLAGS "-std=c++23")
+check_cxx_source_compiles("
+  #include <expected>
+  int main() { std::expected<int, char> e{1}; return e.has_value() ? 0 : 1; }
+" CLAYBIN_HAS_EXPECTED)
+unset(CMAKE_REQUIRED_FLAGS)
+if(NOT CLAYBIN_HAS_EXPECTED)
+  message(FATAL_ERROR
+    "this compiler's standard library has no working <expected>.\n"
+    "claybin needs it: Result<T> and Status are aliases for std::expected.\n"
+    "known-good: gcc 13+, or clang 17+ built against libstdc++ 13+ or libc++ 16+.\n"
+    "with clang on a distro whose default libstdc++ is older, either install a\n"
+    "newer libstdc++ or add -stdlib=libc++ to CMAKE_CXX_FLAGS.")
+endif()
+
 option(CLAYBIN_TESTS "build tests" ON)
 
 add_library(claybin STATIC
