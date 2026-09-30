@@ -416,7 +416,9 @@ int main(int argc, char** argv) {
     // future kernel changes it (at which point bind_fd can be made race-free).
     //
     // the rule: mount("/proc/self/fd/N", MS_BIND) works, but ONLY for a
-    // descriptor opened in the same mount namespace as the mount call.
+    // descriptor opened in the same mount namespace as the mount call. the same
+    // scoping applies to open_tree(OPEN_TREE_CLONE), which is the other route to
+    // a path-free bind -- so neither can close bind_fd's window.
     {
         char dir[] = "/tmp/clay-fdmount-XXXXXX";
         if (::mkdtemp(dir) != nullptr) {
@@ -472,12 +474,27 @@ int main(int argc, char** argv) {
                     int inner_rc = ::mount(magic, dst, nullptr, MS_BIND, nullptr);
                     if (inner_rc == 0) ::umount2(dst, MNT_DETACH);
 
+                    // open_tree(OPEN_TREE_CLONE) is the other route to a
+                    // path-free bind, and it is scoped the same way: it can
+                    // clone a mount from OUR namespace but not one handed in
+                    // from the parent's. we hold CAP_SYS_ADMIN here, so a
+                    // refusal is about the namespace, not about privilege.
+                    constexpr unsigned kOpenTreeClone = 1u;
+                    constexpr unsigned kAtEmptyPath = 0x1000u;
+                    long ot_outer = ::syscall(428 /* open_tree */, outer, "",
+                                              kOpenTreeClone | kAtEmptyPath);
+                    if (ot_outer >= 0) ::close(static_cast<int>(ot_outer));
+                    long ot_inner = ::syscall(428, inner, "", kOpenTreeClone | kAtEmptyPath);
+                    if (ot_inner >= 0) ::close(static_cast<int>(ot_inner));
+
                     // expected: the outer fd is refused with EINVAL, the inner
-                    // one works. exit code encodes both so the parent can tell
-                    // which half changed.
+                    // one works. exit code encodes each half so the parent can
+                    // tell which rule changed.
                     int code = 0;
                     if (!(outer_rc < 0 && outer_err == EINVAL)) code |= 1;
                     if (inner_rc != 0) code |= 2;
+                    if (ot_outer >= 0) code |= 4;  // a foreign fd became cloneable
+                    if (ot_inner < 0) code |= 8;   // our own fd stopped being
                     ::_exit(code);
                 }
                 int st = 0;
@@ -495,6 +512,15 @@ int main(int argc, char** argv) {
                         std::fprintf(stderr,
                                      "  fd-mount rule CHANGED: a same-namespace fd is no\n"
                                      "  longer mountable\n");
+                    if (code & 4)
+                        std::fprintf(stderr,
+                                     "  open_tree rule CHANGED: a foreign-namespace fd is now\n"
+                                     "  cloneable -- bind_fd can be made race-free via\n"
+                                     "  open_tree+move_mount\n");
+                    if (code & 8)
+                        std::fprintf(stderr,
+                                     "  open_tree rule CHANGED: our own fd is no longer\n"
+                                     "  cloneable\n");
                     CHECK_EQ(code, 0);
                 }
                 ::close(outer);

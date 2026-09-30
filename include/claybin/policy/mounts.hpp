@@ -281,18 +281,38 @@ class MountPlan {
     // opened before unshare(CLONE_NEWNS) and succeeds for one opened after.
     // a caller's fd is always the former, so the approach cannot apply.
     //
-    // open_tree(fd, OPEN_TREE_CLONE|AT_EMPTY_PATH) + move_mount() genuinely does
-    // bind a descriptor without naming any path, and it works -- but it carries
-    // the same namespace restriction, so it would have to happen in the parent
-    // before the fork. that is a real option for a future version; it is not a
-    // one-line change.
+    // open_tree(fd, OPEN_TREE_CLONE|AT_EMPTY_PATH) + move_mount() DOES bind a
+    // descriptor without naming any path, and I recorded it here as a way to
+    // close the window properly. having actually tried it: it cannot work, and
+    // the reason is the same restriction wearing a different hat.
     //
-    // so: a TOCTOU window between resolution and mount remains. bubblewrap has
-    // it too and documents it. it is narrower here because resolution happens
-    // pre-fork in the parent, capturing the caller's own view of the filesystem
-    // -- but it is a window, and a caller passing an fd into a directory
-    // somebody else can rename should know that. verified: with the swap done
-    // after seal() and before spawn(), the guest sees the replacement.
+    // OPEN_TREE_CLONE is scoped to the mount namespace the descriptor belongs
+    // to, and needs CAP_SYS_ADMIN over it. measured, all three orderings:
+    //   - in the parent, pre-fork: EPERM. we are unprivileged there.
+    //   - in the child after unshare(CLONE_NEWUSER|CLONE_NEWNS): EINVAL on the
+    //     caller's fd, ok on an fd opened in the child. the same cross-namespace
+    //     rule as the magic symlink.
+    //   - userns first (to gain caps), clone while still in the original mount
+    //     namespace, then unshare(CLONE_NEWNS): still EPERM. an unprivileged
+    //     userns does not OWN the parent mount namespace, so caps in it do not
+    //     reach that namespace's mounts.
+    //
+    // a descriptor handed in from outside can therefore never be cloned by us,
+    // whichever order we unshare in. this is a kernel-design boundary, not a
+    // missing flag: it is what stops an unprivileged process from lifting mounts
+    // out of a namespace it does not control.
+    //
+    // so: a TOCTOU window between resolution and mount remains, and it is not
+    // closable from inside claybin. bubblewrap has it too and documents it. it is
+    // narrower here because resolution happens pre-fork in the parent, capturing
+    // the caller's own view of the filesystem -- but it is a window, and a caller
+    // passing an fd into a directory somebody else can rename should know that.
+    // verified: with the swap done after seal() and before spawn(), the guest
+    // sees the replacement.
+    //
+    // what a caller CAN do about it: bind a path they control, or keep the fd's
+    // directory somewhere no other writer can rename. mount_test pins the kernel
+    // rules above so the day one of them changes, we find out.
     MountPlan& bind_fd(BorrowedFd fd, std::string dst, bool ro = false) {
         Mount m{};
         m.kind = ro ? MountKind::bind_ro : MountKind::bind;
