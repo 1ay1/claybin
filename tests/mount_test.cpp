@@ -165,13 +165,22 @@ int main(int argc, char** argv) {
     // at /home/.../build would recreate /home inside the sandbox and make the
     // "is the host tree absent" checks vacuously false. remapping is the point
     // of the mount model, so the test uses it.
+    //
+    // /lib and /lib64 are bound from the HOST rather than symlinked to usr/lib,
+    // because the symlink encodes a distro layout. on arch the loader really is
+    // /usr/lib/ld-linux-x86-64.so.2, so `--symlink usr/lib /lib64` works; on
+    // debian and ubuntu it lives in /usr/lib/x86_64-linux-gnu and the symlink
+    // resolves to nothing. CI caught this as execve errno=2 on 18 of 29 checks
+    // -- the sandbox built fine and the guest simply had no interpreter.
+    //
+    // bind_try, so a host without one of these still runs the rest.
     auto make = [&] {
         return Policy<Draft>{}
             .ro_bind("/usr", "/usr")
             .ro_bind(dir, "/app")   // the test binary, remapped
-            .symlink("usr/lib", "/lib")
-            .symlink("usr/lib", "/lib64")
-            .symlink("usr/bin", "/bin")
+            .bind_try("/lib", "/lib")
+            .bind_try("/lib64", "/lib64")
+            .bind_try("/bin", "/bin")
             .proc_fs("/proc")
             .dev_fs("/dev")
             .tmpfs("/tmp", 64_MB)
