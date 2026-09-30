@@ -4,12 +4,19 @@ a drop-in replacement for [bubblewrap](https://github.com/containers/bubblewrap)
 and the authority compiler underneath it.
 
 ```sh
-# same flags, same resulting tree
-bwrap        --unshare-all --ro-bind /usr /usr --proc /proc --dev /dev \
-             --tmpfs /tmp --chdir / -- /usr/bin/ls /
-claybin-run  --unshare-all --ro-bind /usr /usr --proc /proc --dev /dev \
-             --tmpfs /tmp --chdir / -- /usr/bin/ls /
+# same flags, same resulting tree. the /lib symlinks are not decoration:
+# a dynamically linked binary needs its loader, and without them BOTH
+# commands fail with ENOENT -- which is the first thing you would have hit.
+bwrap        --unshare-all --ro-bind /usr /usr \
+             --symlink usr/lib /lib --symlink usr/lib /lib64 --symlink usr/bin /bin \
+             --proc /proc --dev /dev --tmpfs /tmp --chdir / -- /bin/ls /
+claybin-run  --unshare-all --ro-bind /usr /usr \
+             --symlink usr/lib /lib --symlink usr/lib /lib64 --symlink usr/bin /bin \
+             --proc /proc --dev /dev --tmpfs /tmp --chdir / -- /bin/ls /
 ```
+
+(on debian and ubuntu the loader lives in `/usr/lib/x86_64-linux-gnu`, so bind
+`/lib` and `/lib64` from the host instead of symlinking them.)
 
 the difference is what happens underneath. bubblewrap gives you a mount
 namespace; claybin gives you a mount namespace **and** a landlock ruleset **and**
@@ -22,10 +29,45 @@ it owns no event loop. supervising a sandboxed process is an event-loop job, and
 that job belongs to [jaal](https://github.com/1ay1/jaal) — see
 [docs/jaal.md](docs/jaal.md).
 
-> **Status: early.** the mount model, landlock, seccomp and the policy algebra
-> work and are tested, including an escape suite that spawns real processes and
-> tries to break out. cgroup limits are not implemented yet, so resource caps
-> report as `partial`. it has not been audited or reviewed by anyone but me.
+> **Status: early — read this before using it for anything that matters.**
+>
+> claybin is days old. what follows is the honest state, not a pitch.
+>
+> **works and is tested.** the mount model, landlock (including abi 6 scoping),
+> seccomp with argument filtering, cgroup2 memory/pids/cpu limits, the policy
+> algebra, and seccomp-notify brokering. 19 test binaries, an escape corpus of
+> 47 named attacks that spawns real processes and tries to break out (46
+> blocked, 0 escaped, 1 not applicable on this kernel), a differential BPF
+> interpreter, 1.28M fuzzed policies, and 57 conformance checks against real
+> bubblewrap. CI runs gcc, clang+libc++, asan+ubsan, and a lane that fails if
+> the sandboxing tests skip themselves.
+>
+> **not tested.** aarch64 and riscv64 have never executed — the aarch64 syscall
+> tables are cross-checked against the kernel's own headers, which is not the
+> same thing. macOS and Windows compile a plan but cannot apply one. only two
+> kernels have ever run this (6.8 and 7.2).
+>
+> **known open.** `bind_fd` has a TOCTOU window between resolving the descriptor
+> and mounting its path. it is not closable from inside claybin — both
+> path-free bind routes are scoped to the mount namespace the fd came from, and
+> the kernel rules are pinned in `mount_test` so a future relaxation is
+> noticed. bubblewrap has the same window.
+>
+> **nobody has reviewed this but me.** that is the single biggest reason not to
+> trust it yet. one focused session on it found six real bugs, including a
+> seccomp bypass (ioctl's request is 32 bits, so a filter comparing 64 was
+> defeated by setting a high bit), three symlink escapes where a caller-supplied
+> path could write outside the sandbox, and a capability probe that reported
+> "user namespaces: yes" on hosts where the uid_map write fails. all fixed, each
+> with a test that fails when the fix is reverted — but a defect-discovery rate
+> like that is the signal, and there is no reason to think that session was the
+> last one.
+>
+> if you want a sandbox in production today, use
+> [bubblewrap](https://github.com/containers/bubblewrap). it is a decade old,
+> audited, and runs under every flatpak on earth. use claybin if you want the
+> stronger seccomp and landlock story, can tolerate finding bugs, and are
+> willing to report them.
 
 ## the library underneath
 
