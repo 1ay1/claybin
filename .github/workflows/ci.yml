@@ -46,6 +46,21 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y cmake ninja-build bubblewrap ${{ matrix.extra_packages }}
+      - name: allow unprivileged user namespaces
+        # WITHOUT THIS THE LANE IS DECORATIVE.
+        #
+        # ubuntu 24.04 ships an apparmor restriction that lets unshare(CLONE_NEWUSER)
+        # succeed but denies the uid_map write, so every test that builds a real
+        # sandbox skips -- six of eighteen, including the entire escape corpus and
+        # the mount tests. the first green run "passed" all of them in 0.00 sec,
+        # which is exactly the kind of reassuring nonsense a sandbox project must
+        # not ship.
+        #
+        # `|| true` because the knob does not exist on every image, and a lane
+        # that skips honestly is still better than one that fails to start.
+        run: |
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
+          sudo sysctl -w kernel.unprivileged_userns_clone=1 || true
       - name: configure
         env:
           CC: ${{ matrix.cc }}
@@ -64,6 +79,21 @@ jobs:
           ./build/claybin-audit || true
       - name: test
         run: ctest --test-dir build --output-on-failure -j2
+      - name: assert the sandbox tests actually RAN
+        # the guard on the guard. these tests skip themselves when the host
+        # cannot build a sandbox, which is right -- but it means a green tick
+        # proves nothing about sandboxing unless something checks that they were
+        # not all skipped. this fails the lane if the real ones sat out.
+        run: |
+          if ./build/escape_corpus_test 2>&1 | grep -q '^skip'; then
+            echo "::error::escape_corpus_test skipped -- this lane is not testing a real sandbox"
+            exit 1
+          fi
+          if ./build/mount_test 2>&1 | grep -q '^skip'; then
+            echo "::error::mount_test skipped -- this lane is not testing a real sandbox"
+            exit 1
+          fi
+          echo "sandbox tests ran for real"
 
   sanitizers:
     name: asan+ubsan
