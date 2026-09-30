@@ -548,6 +548,33 @@ Result<Compiled> compile(const Policy<Sealed>& policy, const HostCapabilities& h
                          SymlinkOp{b.intern(m.source), b.intern(dst)});
                     break;
                 }
+                case MountKind::mask: {
+                    // make the path be nothing. two ops, because the target may
+                    // be a file or a directory and the plan may be applied on a
+                    // machine where it is the other one:
+                    //
+                    //   * an empty tmpfs, for a directory
+                    //   * the mode-0444 mask file, for a file
+                    //
+                    // both are marked optional, so whichever does not apply
+                    // fails harmlessly -- mounting a tmpfs over a regular file
+                    // is ENOTDIR, and binding a file over a directory is
+                    // EISDIR. that is the same "emit both, let apply pick"
+                    // shape bind_target already uses for exactly this reason.
+                    //
+                    // NOT a landlock deny: landlock has no negative rule, so a
+                    // deny under a grant is silently inherited. see
+                    // MountKind::mask.
+                    b.op(OpCode::mount,
+                         MountOp{b.intern("tmpfs"), b.intern(dst), b.intern("tmpfs"),
+                                 b.intern("mode=0555,size=4k"),
+                                 kMsNosuid | kMsNodev | kMsNoexec | kMsRdonly |
+                                     kClayMountOptional});
+                    b.op(OpCode::mount,
+                         MountOp{b.intern(kRoMaskFile), b.intern(dst), b.intern("none"),
+                                 Ref{}, kMsBind | kMsSilent | kClayMountOptional});
+                    break;
+                }
                 case MountKind::dir: {
                     b.op(OpCode::mkdir_p, MkdirOp{b.intern(dst), m.perms ? m.perms : 0755u, 0});
                     break;
@@ -849,9 +876,32 @@ Result<Compiled> compile(const Policy<Sealed>& policy, const HostCapabilities& h
                 // mounted, so this grants nothing the caller did not ask for.
                 implied.grant("/", FileRights::read());
             }
-            // if the caller said nothing about access, the mounts decide it.
-            // otherwise intersect: a path must be both mounted AND granted.
-            effective = d.fs.is_nothing() ? implied : d.fs.meet(implied);
+            // three cases, and the middle one is the interesting one.
+            //
+            //   caller said NOTHING          -> the mounts decide.
+            //   caller said only "NOT THAT"  -> the mounts decide, minus that.
+            //   caller named grants          -> intersect: a path must be both
+            //                                  mounted AND granted.
+            //
+            // the middle case used to fall into the third, and meet() treats
+            // an unmentioned path as denied -- so an authority consisting only
+            // of denials erased every mount-implied grant and the compiled
+            // ruleset came out empty. a policy of "everything the mounts give
+            // me, except my credentials" is the single most useful thing a
+            // caller can say, and it produced a sandbox that could read
+            // nothing at all.
+            //
+            // expressed as implied-THEN-deny rather than as a meet, because
+            // that is what the caller meant: the denials are a subtraction
+            // from whatever the tree provides, not a whitelist of their own.
+            if (d.fs.is_nothing()) {
+                effective = implied;
+            } else if (d.fs.grants_nothing()) {
+                effective = implied;
+                for (const auto& g : d.fs.grants()) effective.deny(g.path);
+            } else {
+                effective = d.fs.meet(implied);
+            }
         }
 
         for (const auto& g : effective.grants()) {
@@ -859,7 +909,25 @@ Result<Compiled> compile(const Policy<Sealed>& policy, const HostCapabilities& h
             // rather than trusting the translation keeps a future FileRights
             // bit from silently breaking every sandbox.
             std::uint64_t allowed = to_landlock(g.rights, host.landlock_abi) & handled;
-            if (allowed == 0) continue;  // a pure deny needs no rule: absence is denial
+            // a pure deny emits NO landlock rule, and this is a kernel limit
+            // rather than a choice.
+            //
+            // landlock has no negative rule. landlock_add_rule() with
+            // allowed_access == 0 is rejected outright -- measured, ENOMSG on
+            // abi 10 -- and omitting the rule means the path INHERITS its
+            // ancestor's grant, because resolution takes the most specific
+            // matching rule and there now isn't one.
+            //
+            // so "grant $HOME, deny $HOME/.aws" is not expressible here at
+            // all. i tried: the rule was written into the plan, reached the
+            // kernel, and the credentials stayed readable, because the only
+            // thing a zero-rights rule can do is fail to be added.
+            //
+            // the only ways to express it are to grant each SIBLING instead of
+            // the parent, or to mask the path with a mount -- which is what
+            // MountKind::file over an empty file does, and is how a caller
+            // should spell a credential mask. see agentty's kAlwaysMasked.
+            if (allowed == 0) continue;
             b.op(OpCode::landlock_rule, LandlockRuleOp{b.intern(g.path), allowed});
         }
         // network rules, one per allowed port. a port of 0 means "any", which

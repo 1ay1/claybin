@@ -266,6 +266,17 @@ class Policy<Draft> {
         data_.mounts.dev(std::move(dst));
         return std::move(*this);
     }
+
+    // make a path be nothing, whatever the binds around it say.
+    //
+    // the sound way to express "everything under here except that", and the
+    // one a credential mask needs: bind $HOME, then mask $HOME/.aws. `deny()`
+    // cannot do this -- landlock has no negative rule (see MountKind::mask),
+    // so a deny under a grant is silently inherited.
+    Policy&& mask(std::string dst) && {
+        data_.mounts.mask(std::move(dst));
+        return std::move(*this);
+    }
     Policy&& mqueue(std::string dst = "/dev/mqueue") && {
         data_.mounts.mqueue(std::move(dst));
         return std::move(*this);

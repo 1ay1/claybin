@@ -36,6 +36,26 @@ enum class MountKind : std::uint8_t {
     symlink,   // a symlink, not a mount, but part of tree construction
     dir,       // mkdir
 
+    // make a path be NOTHING, whatever the tree around it says.
+    //
+    // this is the only sound way to express "everything under here except
+    // that". landlock cannot: landlock_add_rule() with allowed_access == 0 is
+    // rejected with ENOMSG (measured, abi 10), and omitting a rule means the
+    // path INHERITS its ancestor's grant, because resolution takes the most
+    // specific rule that exists. so a deny under a grant has no landlock
+    // spelling at all -- I wrote one, watched it reach the plan, and read the
+    // file anyway.
+    //
+    // what works is making the path not be the file: an empty tmpfs over a
+    // directory, an empty read-only file over a file. the guest sees an empty
+    // ~/.aws rather than a denied one, which is also the better failure mode --
+    // a tool reading it gets no credentials instead of an EACCES it may report
+    // as a bug.
+    //
+    // apply() stats the target to pick which, because a plan may be applied on
+    // a machine where the path is a different kind of thing than it was here.
+    mask,
+
     // overlayfs. `sources` holds the lower layers, lowest-priority LAST --
     // which is overlayfs's own convention and the opposite of intuition, so it
     // is worth stating twice.
@@ -67,6 +87,7 @@ constexpr const char* to_string(MountKind k) {
         case MountKind::devtmpfs: return "dev";
         case MountKind::mqueue: return "mqueue";
         case MountKind::symlink: return "symlink";
+        case MountKind::mask: return "mask";
         case MountKind::dir: return "dir";
         case MountKind::overlay: return "overlay";
         case MountKind::tmp_overlay: return "tmp-overlay";
@@ -203,6 +224,18 @@ class MountPlan {
     }
     MountPlan& dev(std::string dst = "/dev") {
         mounts_.push_back({MountKind::devtmpfs, {}, std::move(dst), 0, 0, false, {}, {}});
+        return *this;
+    }
+
+    // make `dst` be nothing: an empty directory or an empty read-only file,
+    // whichever it already is. see MountKind::mask for why this is a mount and
+    // not a landlock rule.
+    //
+    // optional by default, because the usual caller is masking a list of
+    // credential paths and a user who has no ~/.aws should not fail to start.
+    MountPlan& mask(std::string dst, bool optional = true) {
+        mounts_.push_back(
+            {MountKind::mask, {}, std::move(dst), 0, 0, optional, {}, {}});
         return *this;
     }
     MountPlan& mqueue(std::string dst = "/dev/mqueue") {
@@ -396,6 +429,14 @@ class MountPlan {
                     f = Fidelity::impossible;
                     why = "creating a symlink would mutate the host filesystem";
                     break;
+                case MountKind::mask:
+                    // windows can do this one: an ACL denying the AppContainer
+                    // SID on that object is exactly "make this path be nothing
+                    // to you", and unlike the landlock case it composes with
+                    // the grants around it.
+                    f = Fidelity::approximate;
+                    why = "masked by a deny ACE for the container SID, not an empty mount";
+                    break;
                 case MountKind::dir:
                     f = Fidelity::impossible;
                     why = "creating a directory would mutate the host filesystem";
@@ -471,6 +512,16 @@ class MountPlan {
                     // to be readable or `ls -l` on it fails with EPERM, which
                     // looks like a broken sandbox rather than a missing grant.
                     fs.grant(m.dest, FileRights::read());
+                    break;
+                case MountKind::mask:
+                    // the one mount kind that REMOVES authority. an empty thing
+                    // is mounted over the path, so the tree itself no longer
+                    // offers the content -- and the implied authority has to say
+                    // so, or the landlock ruleset would still grant read on a
+                    // path the mount just emptied. harmless either way (there is
+                    // nothing left to read) but the report would overstate what
+                    // the guest can reach, and the report is the product.
+                    fs.deny(m.dest);
                     break;
                 case MountKind::dir:
                     // a directory we created for the guest should be usable.
