@@ -167,6 +167,67 @@ inline SyscallPolicy base() {
     };
     p.allow(std::span<const SysNr>{kJobControl});
 
+    // Calls ordinary programs make that grant NO authority.
+    //
+    // This group is here because leaving it out did not produce "the sandbox
+    // is strict", it produced "the sandbox is broken": curl died with
+    // CURLE_OUT_OF_MEMORY (27) on a machine with gigabytes free, while
+    // python3 fetched the same URL fine. Error 27 sends you to memory caps
+    // and network rules, and the cause was neither -- it took dumping the
+    // profile table to find it. A filter whose failures lie about their cause
+    // is worse than a looser one, because nobody can act on the lie.
+    //
+    // The bar for each of these is AUTHORITY, not convenience: does it let
+    // the guest reach something it could not already reach? For every entry
+    // below the answer is no, and the note says why. mlockall is deliberately
+    // NOT here -- see after the list.
+    static constexpr SysNr kOrdinary[] = {
+        // openssl mlocks the pages holding key material so they cannot be
+        // swapped to disk. bounded by RLIMIT_MEMLOCK, which the sandbox sets,
+        // and it pins only the caller's OWN pages -- no new reach. denying it
+        // is what broke curl: openssl treats the failure as an allocation
+        // failure and reports OOM.
+        149,  // mlock
+        150,  // munlock
+        // no authority at all: these read a clock or yield. sleep() and every
+        // retry/backoff loop needs nanosleep, and a tool that cannot sleep
+        // looks hung rather than denied.
+        35,   // nanosleep
+        229,  // clock_getres
+        // glibc and rseq use membarrier for lock-free fast paths. it
+        // synchronises the caller's own threads and nothing else.
+        324,  // membarrier
+        // topology probes. they leak which CPU we are on, which is not a
+        // capability -- /proc/cpuinfo says more and is already readable.
+        309,  // getcpu
+        // new DESCRIPTORS, no new reach. an eventfd/timerfd is a private
+        // notification object; every event loop (libuv, glib, tokio) opens
+        // one at startup.
+        290,  // eventfd2
+        283,  // timerfd_create
+        // AF_UNIX only, and both ends belong to the caller -- it cannot be
+        // used to reach a socket outside the sandbox. git and ssh use it to
+        // talk to their own helper processes. the network namespace still
+        // governs anything routable.
+        53,   // socketpair
+        // anonymous memory with a file descriptor. the descriptor refers to
+        // memory, not to anything in the filesystem, so it grants no path
+        // access. NOTE: a memfd can be mapped executable, so this interacts
+        // with the W^X rule below -- that rule still applies to the mapping,
+        // which is where the protection actually lives.
+        319,  // memfd_create
+    };
+    p.allow(std::span<const SysNr>{kOrdinary});
+
+    // mlockall stays DENIED, and the asymmetry with mlock is the point.
+    //
+    // mlock pins a named range the caller already owns. mlockall pins
+    // EVERYTHING, current and future, which under a cgroup memory cap is a
+    // denial-of-service lever rather than a convenience. Nothing in the
+    // toolchains this profile targets needs it; gnupg and some JVMs do, and
+    // they can run under a profile that says so.
+    p.deny(151 /* mlockall */, 1 /* EPERM */);
+
     // the modern variants glibc actually calls. the older numbers are not
     // enough on their own: libc prefers pipe2/dup3/openat and only falls back
     // to pipe/dup2/open on ancient kernels, so a list with just the classic
@@ -482,6 +543,29 @@ inline SyscallPolicy base() {
         44,   // fstatfs
     };
     p.allow(std::span<const SysNr>{kAllowed});
+
+    // The same no-authority group as x86_64 -- see the long note there for why
+    // each one is safe and why mlockall is not in it. Numbers verified against
+    // the kernel's asm-generic/unistd.h (which is aarch64's table), NOT
+    // translated by hand from the x86_64 list: hand-translating a syscall
+    // number is exactly how 122/124 got mislabelled the first time.
+    static constexpr SysNr kOrdinary[] = {
+        228,  // mlock
+        229,  // munlock
+        101,  // nanosleep
+        114,  // clock_getres
+        283,  // membarrier
+        168,  // getcpu
+        19,   // eventfd2
+        85,   // timerfd_create
+        199,  // socketpair
+        279,  // memfd_create
+    };
+    p.allow(std::span<const SysNr>{kOrdinary});
+
+    // mlockall denied here too: it pins ALL memory, current and future, which
+    // is a DoS lever under a cgroup cap rather than a convenience.
+    p.deny(230 /* mlockall */, 1 /* EPERM */);
 
     // clone3: denied with ENOSYS, for the same reason as on x86_64. its flags
     // live behind a pointer that seccomp cannot read, so it is a hole straight

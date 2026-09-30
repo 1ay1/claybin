@@ -98,6 +98,21 @@ constexpr Named kExpected[] = {
     {"rseq", SYS_rseq},
     {"clone3", SYS_clone3},
     {"mremap", SYS_mremap},
+    // the no-authority group. every one of these was denied once, and the
+    // symptom was never "denied" -- curl said out of memory on a box with
+    // gigabytes free. resolved through the kernel's own headers so a
+    // mislabelled number fails here instead of sitting in the table.
+    {"mlock", SYS_mlock},
+    {"munlock", SYS_munlock},
+    {"mlockall", SYS_mlockall},
+    {"nanosleep", SYS_nanosleep},
+    {"clock_getres", SYS_clock_getres},
+    {"membarrier", SYS_membarrier},
+    {"getcpu", SYS_getcpu},
+    {"eventfd2", SYS_eventfd2},
+    {"timerfd_create", SYS_timerfd_create},
+    {"socketpair", SYS_socketpair},
+    {"memfd_create", SYS_memfd_create},
 
     // job control. this is the group the bug was in.
     {"setpgid", SYS_setpgid},
@@ -333,6 +348,31 @@ int main() {
     CHECK(permitted(profiles::with_filesystem(), SYS_mremap));
     CHECK(permitted(profiles::compiler(), SYS_mremap));
     CHECK(permitted(profiles::compiler_with_network(), SYS_mremap));
+
+    // The no-authority group: allowed in every profile, because they are in
+    // base(). Denying them did not make the sandbox stricter in any useful
+    // sense -- it made ordinary tools fail with errors that pointed at the
+    // wrong cause. curl reported CURLE_OUT_OF_MEMORY while python3 fetched
+    // the same URL, and finding out why took a dump of this table.
+    //
+    // Each is checked at base() so no profile can lose it.
+    for (long nr : {(long)SYS_mlock, (long)SYS_munlock, (long)SYS_nanosleep,
+                    (long)SYS_clock_getres, (long)SYS_membarrier,
+                    (long)SYS_getcpu, (long)SYS_eventfd2,
+                    (long)SYS_timerfd_create, (long)SYS_socketpair,
+                    (long)SYS_memfd_create}) {
+        CHECK(permitted(profiles::base(), (SysNr)nr));
+        CHECK(permitted(profiles::compiler_with_network(), (SysNr)nr));
+    }
+
+    // mlockall is the deliberate exception, and the asymmetry is the point:
+    // mlock pins a range the caller already owns, mlockall pins EVERYTHING
+    // including future mappings, which under a cgroup memory cap is a DoS
+    // lever. EPERM rather than a kill -- it is a refusal, not an attack
+    // signature.
+    CHECK(!permitted(profiles::base(), SYS_mlockall));
+    CHECK_EQ(profiles::base().action_for(SYS_mlockall), SysAction::errno_);
+    CHECK_EQ(profiles::base().errno_for(SYS_mlockall), std::uint16_t{1});
 
     // -- the aarch64 tables, checked on an x86_64 host ---------------------
     //
