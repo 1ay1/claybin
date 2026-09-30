@@ -7,8 +7,11 @@
 #include <cstring>
 
 #if defined(__linux__)
+#include <cerrno>
 #include <cstdlib>
 #include <fcntl.h>
+#include <sched.h>
+#include <sys/mount.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -399,6 +402,105 @@ int main(int argc, char** argv) {
             ::unlink(payload);
             ::rmdir(evil);
             ::rmdir(victim);
+            ::rmdir(dir);
+        }
+    }
+
+    // ---- why bind_fd resolves to a path, pinned ------------------------
+    //
+    // mounts.hpp explains that binding a descriptor would be better than
+    // binding the path we resolve it to, and that the kernel will not let us.
+    // the comment used to give the WRONG reason -- it said mounting a magic
+    // symlink is refused outright, and it is not. this pins the real rule so
+    // nobody spends an afternoon rediscovering it, and so it is noticed if a
+    // future kernel changes it (at which point bind_fd can be made race-free).
+    //
+    // the rule: mount("/proc/self/fd/N", MS_BIND) works, but ONLY for a
+    // descriptor opened in the same mount namespace as the mount call.
+    {
+        char dir[] = "/tmp/clay-fdmount-XXXXXX";
+        if (::mkdtemp(dir) != nullptr) {
+            char src[256], dst[256];
+            std::snprintf(src, sizeof src, "%s/src", dir);
+            std::snprintf(dst, sizeof dst, "%s/dst", dir);
+            ::mkdir(src, 0755);
+            ::mkdir(dst, 0755);
+
+            // opened in OUR namespace, before the child unshares
+            int outer = ::open(src, O_PATH | O_DIRECTORY | O_CLOEXEC);
+            CHECK(outer >= 0);
+
+            if (outer >= 0) {
+                // read the uid BEFORE unsharing. after it, getuid() returns the
+                // overflow uid (65534) and the map line names a uid we do not
+                // own, so the write fails with EPERM -- which reads as "no
+                // unprivileged userns here" and silently skips the test.
+                uid_t real_uid = ::getuid();
+                gid_t real_gid = ::getgid();
+                pid_t p = ::fork();
+                if (p == 0) {
+                    // a fresh mount namespace, exactly as the sandbox makes
+                    if (::unshare(CLONE_NEWUSER | CLONE_NEWNS) != 0) ::_exit(70);
+                    // deny setgroups then map ourselves, or nothing is permitted
+                    int f = ::open("/proc/self/setgroups", O_WRONLY);
+                    if (f >= 0) {
+                        ssize_t w = ::write(f, "deny", 4);
+                        (void)w;
+                        ::close(f);
+                    }
+                    char b[64];
+                    f = ::open("/proc/self/uid_map", O_WRONLY);
+                    int n = std::snprintf(b, sizeof b, "0 %u 1\n", real_uid);
+                    if (f < 0 || ::write(f, b, static_cast<std::size_t>(n)) != n) ::_exit(71);
+                    ::close(f);
+                    f = ::open("/proc/self/gid_map", O_WRONLY);
+                    n = std::snprintf(b, sizeof b, "0 %u 1\n", real_gid);
+                    if (f < 0 || ::write(f, b, static_cast<std::size_t>(n)) != n) ::_exit(73);
+                    ::close(f);
+                    ::mount(nullptr, "/", nullptr, MS_REC | MS_PRIVATE, nullptr);
+
+                    char magic[64];
+                    std::snprintf(magic, sizeof magic, "/proc/self/fd/%d", outer);
+                    int outer_rc = ::mount(magic, dst, nullptr, MS_BIND, nullptr);
+                    int outer_err = errno;
+                    if (outer_rc == 0) ::umount2(dst, MNT_DETACH);
+
+                    // and the same thing for an fd opened AFTER the unshare
+                    int inner = ::open(src, O_PATH | O_DIRECTORY | O_CLOEXEC);
+                    if (inner < 0) ::_exit(72);
+                    std::snprintf(magic, sizeof magic, "/proc/self/fd/%d", inner);
+                    int inner_rc = ::mount(magic, dst, nullptr, MS_BIND, nullptr);
+                    if (inner_rc == 0) ::umount2(dst, MNT_DETACH);
+
+                    // expected: the outer fd is refused with EINVAL, the inner
+                    // one works. exit code encodes both so the parent can tell
+                    // which half changed.
+                    int code = 0;
+                    if (!(outer_rc < 0 && outer_err == EINVAL)) code |= 1;
+                    if (inner_rc != 0) code |= 2;
+                    ::_exit(code);
+                }
+                int st = 0;
+                ::waitpid(p, &st, 0);
+                int code = WIFEXITED(st) ? WEXITSTATUS(st) : -1;
+                if (code >= 70) {
+                    // no unprivileged userns on this box: nothing to assert
+                    std::fprintf(stderr, "  skip fd-mount rule (setup %d)\n", code);
+                } else {
+                    if (code & 1)
+                        std::fprintf(stderr,
+                                     "  fd-mount rule CHANGED: a cross-namespace fd is now\n"
+                                     "  mountable -- bind_fd can be made race-free\n");
+                    if (code & 2)
+                        std::fprintf(stderr,
+                                     "  fd-mount rule CHANGED: a same-namespace fd is no\n"
+                                     "  longer mountable\n");
+                    CHECK_EQ(code, 0);
+                }
+                ::close(outer);
+            }
+            ::rmdir(src);
+            ::rmdir(dst);
             ::rmdir(dir);
         }
     }

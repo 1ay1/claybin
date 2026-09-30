@@ -308,6 +308,33 @@ Result<Compiled> compile(const Policy<Sealed>& policy, const HostCapabilities& h
                     // apply step pick -- mkdir_p fails harmlessly if a file is
                     // already there, and touch fails harmlessly if a directory
                     // is. `bind_target` does exactly that.
+                    //
+                    // a bind_fd binds the PATH we resolved the descriptor to,
+                    // not the descriptor. that is a real TOCTOU window and it is
+                    // worth recording why it stays open, because two plausible
+                    // ways of closing it do not work:
+                    //
+                    //   mount("/proc/self/fd/N", MS_BIND) is NOT refused by the
+                    //   kernel -- mounts.hpp used to claim it was, and that is
+                    //   wrong; it succeeds, and it follows the object rather than
+                    //   the name. but only for a descriptor opened in the SAME
+                    //   mount namespace. measured: the identical bind returns
+                    //   EINVAL for an fd opened before unshare(CLONE_NEWNS) and
+                    //   succeeds for one opened after. a caller's fd is always
+                    //   the former, by definition, so this does not help.
+                    //
+                    //   open_tree(fd, OPEN_TREE_CLONE|AT_EMPTY_PATH) plus
+                    //   move_mount() does bind a descriptor with no path at all,
+                    //   and it works -- but it has the same namespace
+                    //   restriction, and it would have to run in the PARENT
+                    //   before the fork, which is a different shape of change
+                    //   than this line.
+                    //
+                    // so the window is narrowed rather than closed: resolution
+                    // happens in the parent, pre-fork, capturing the caller's own
+                    // view. bubblewrap has the same window and documents it. a
+                    // caller who needs it shut should bind a path they control
+                    // rather than an fd into somebody else's directory.
                     b.op(OpCode::bind_target,
                          BindTargetOp{b.intern(m.source), b.intern(dst)});
                     b.op(OpCode::mount, MountOp{b.intern(m.source), b.intern(dst),

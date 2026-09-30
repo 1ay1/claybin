@@ -260,21 +260,39 @@ class MountPlan {
     // ---- descriptors as sources ------------------------------------------
     //
     // an fd names an OBJECT, not a path, so binding one is immune to every
-    // symlink and TOCTOU race that path resolution suffers from. that is why
-    // bubblewrap offers these and why they are worth having.
+    // symlink and TOCTOU race that path resolution suffers from -- in principle.
+    // in practice see bind_fd below: the kernel will not let us mount a
+    // descriptor that came from another mount namespace, which a caller's fd
+    // always has, so these resolve to a path and inherit its races. the property
+    // is real for `file`/`bind_data`, which READ the fd rather than mount it.
 
     // bind whatever `fd` refers to.
     //
     // the fd is resolved to its real path via readlink(/proc/self/fd/N) HERE,
-    // pre-fork, and the path is what gets bound. that is not as strong as
-    // binding the descriptor itself would be -- the kernel refuses to bind
-    // through a magic symlink, so nobody can do that -- but resolving it in the
-    // parent, before any namespace work, is the closest available thing: the
-    // caller's own view of the filesystem is what we capture.
+    // pre-fork, and the path is what gets bound.
     //
-    // the residual risk is a TOCTOU window between resolution and mount, which
-    // bubblewrap has too and documents. it is narrower here because resolution
-    // happens before we fork rather than inside the sandboxed child.
+    // that is weaker than binding the descriptor, and the reason is NOT the one
+    // this comment used to give. it claimed the kernel refuses to bind through a
+    // magic symlink -- it does not. mount("/proc/self/fd/N", MS_BIND) succeeds,
+    // and it follows the object rather than the name, which would be exactly
+    // what we want. the real obstacle is narrower and was only found by trying
+    // it: the bind works only for a descriptor opened in the SAME mount
+    // namespace. measured on 7.2, the identical call returns EINVAL for an fd
+    // opened before unshare(CLONE_NEWNS) and succeeds for one opened after.
+    // a caller's fd is always the former, so the approach cannot apply.
+    //
+    // open_tree(fd, OPEN_TREE_CLONE|AT_EMPTY_PATH) + move_mount() genuinely does
+    // bind a descriptor without naming any path, and it works -- but it carries
+    // the same namespace restriction, so it would have to happen in the parent
+    // before the fork. that is a real option for a future version; it is not a
+    // one-line change.
+    //
+    // so: a TOCTOU window between resolution and mount remains. bubblewrap has
+    // it too and documents it. it is narrower here because resolution happens
+    // pre-fork in the parent, capturing the caller's own view of the filesystem
+    // -- but it is a window, and a caller passing an fd into a directory
+    // somebody else can rename should know that. verified: with the swap done
+    // after seal() and before spawn(), the guest sees the replacement.
     MountPlan& bind_fd(BorrowedFd fd, std::string dst, bool ro = false) {
         Mount m{};
         m.kind = ro ? MountKind::bind_ro : MountKind::bind;
