@@ -191,6 +191,15 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "skip escape_test: host lacks landlock/seccomp\n");
         return 0;
     }
+    // user namespaces too: without them there is no mount namespace to build the
+    // tree in, and every case here spawns a real sandbox. this guard was missing
+    // and the first CI run failed all 12 checks with a bare errno=13 -- the
+    // probe said userns was available because it read sysctls instead of trying
+    // a uid_map write.
+    if (!host.user_namespaces || !host.mount_namespaces) {
+        std::fprintf(stderr, "skip escape_test: no user/mount namespaces\n");
+        return 0;
+    }
 
     // the policy under test: read /usr, exec our own binary, nothing else.
     //

@@ -20,6 +20,23 @@ if [ ! -x "$CLAY" ]; then
     exit 1
 fi
 
+# can EITHER tool actually build a sandbox here?
+#
+# this preflight exists because of the first CI run. GitHub's runners are
+# already inside a container: unshare(CLONE_NEWUSER) succeeds but writing
+# uid_map is EACCES, so every case failed -- including the check_stricter ones,
+# which expect bwrap to SUCCEED and claybin to refuse. seven red checks, none of
+# them about claybin.
+#
+# a suite that goes red for environmental reasons trains people to ignore the
+# colour, which is worse than having no suite. so: if bwrap itself cannot run a
+# trivial guest, there is nothing to compare against and we say so.
+if ! $BWRAP --ro-bind /usr /usr --chdir / -- /usr/bin/true >/dev/null 2>&1; then
+    echo "skip: bwrap cannot build a sandbox on this host (containerised runner?),"
+    echo "      so there is no baseline to compare against"
+    exit 0
+fi
+
 PASS=0
 FAIL=0
 SKIP=0

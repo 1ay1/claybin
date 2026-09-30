@@ -29,6 +29,25 @@ inline int finish(const char* name) {
     return 1;
 }
 
+// can this host build a sandbox at all?
+//
+// a test that needs a real sandbox has nothing to say on a host that cannot
+// make one, and saying it LOUDLY as a failure is worse than saying nothing: the
+// first CI run went red on three lanes for purely environmental reasons, which
+// trains everyone to ignore the colour.
+//
+// the check is deliberately the same one the library uses -- probe_host() now
+// actually attempts a uid_map write rather than reading sysctls -- so a test
+// skips exactly when claybin would have degraded, and never when it would have
+// worked.
+//
+// callers use it as:
+//   if (!can_sandbox()) return skip("mount_test");
+inline int skip(const char* name, const char* why = "host cannot build a sandbox") {
+    std::fprintf(stderr, "skip %s: %s\n", name, why);
+    return 0;
+}
+
 // deterministic prng: property tests must reproduce exactly on failure.
 class Rng {
   public:

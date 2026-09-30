@@ -10,9 +10,11 @@
 #include <cerrno>
 #include <cstdio>
 #include <fcntl.h>
+#include <sched.h>
 #include <sys/prctl.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
+#include <sys/wait.h>
 #include <unistd.h>
 #endif
 
@@ -67,7 +69,55 @@ bool probe_userns() {
         if (buf[0] == '0') return false;
     if (read_small("/proc/sys/user/max_user_namespaces", buf, sizeof buf))
         if (buf[0] == '0') return false;
-    return path_exists("/proc/self/ns/user");
+    if (!path_exists("/proc/self/ns/user")) return false;
+
+    // the sysctls and the path are necessary but NOT sufficient, and trusting
+    // them was a real bug: on a GitHub Actions runner all three say yes, the
+    // unshare succeeds, and writing uid_map then fails with EACCES -- so claybin
+    // reported `user ns yes`, claimed process isolation, and every spawn died at
+    // setup with a bare errno=13.
+    //
+    // the only honest test is to DO it: fork, unshare, and try the uid_map write
+    // that a real sandbox depends on. a probe that asks "is the feature
+    // compiled in" instead of "can I use it" will keep being wrong in exactly
+    // this way, because the interesting failures are policy, not absence --
+    // containers, seccomp filters and LSMs all block the map while leaving the
+    // sysctls untouched.
+    //
+    // the cost is one fork per probe, which is nothing next to the mount work
+    // that follows.
+    //
+    // read the uid BEFORE unsharing. after unshare(CLONE_NEWUSER) and before the
+    // map is written, getuid() returns the OVERFLOW uid (65534), so a map line
+    // built from it names a uid we do not own and the write is EPERM -- which
+    // this function would then report as "user namespaces unavailable" on a host
+    // where they work perfectly. i made this exact mistake twice today, once
+    // here and once in mount_test, and both times it looked like a genuine
+    // capability failure rather than a bug in the probe.
+    const uid_t real_uid = ::getuid();
+    pid_t pid = ::fork();
+    if (pid < 0) return false;  // cannot tell; assume not available
+    if (pid == 0) {
+        if (::unshare(CLONE_NEWUSER) != 0) ::_exit(1);
+        // deny setgroups first or gid_map is refused; ignore its failure, since
+        // uid_map is the one that decides.
+        int f = ::open("/proc/self/setgroups", O_WRONLY | O_CLOEXEC);
+        if (f >= 0) {
+            ssize_t w = ::write(f, "deny", 4);
+            (void)w;
+            ::close(f);
+        }
+        char line[64];
+        int n = std::snprintf(line, sizeof line, "0 %u 1\n", real_uid);
+        f = ::open("/proc/self/uid_map", O_WRONLY | O_CLOEXEC);
+        if (f < 0) ::_exit(2);
+        bool ok = ::write(f, line, static_cast<std::size_t>(n)) == n;
+        ::close(f);
+        ::_exit(ok ? 0 : 3);
+    }
+    int status = 0;
+    if (::waitpid(pid, &status, 0) < 0) return false;
+    return WIFEXITED(status) && WEXITSTATUS(status) == 0;
 }
 
 bool probe_cgroup2() {
