@@ -110,6 +110,45 @@ inline bool covers(std::string_view ancestor, std::string_view p) {
     return p.size() == ancestor.size() || p[ancestor.size()] == '/';
 }
 
+// the final component. no allocation: a view into the input.
+inline std::string_view basename(std::string_view p) {
+    const auto slash = p.rfind('/');
+    return slash == std::string_view::npos ? p : p.substr(slash + 1);
+}
+
+// does `needle` appear as a whole COMPONENT of `p`, at any depth?
+//
+// whole-component, which is the entire point: a substring test matches
+// ".gitignore" for ".git" and "configure.ac" for "config". this is the
+// predicate a path-shape rule needs, and getting it wrong in either direction
+// is a documented vulnerability class --
+//
+//   too loose: every false positive trains a user to ignore the warning.
+//   too tight: an exact-name check against a flexible tool is always one
+//              entry short. Cursor matched `.git` literally and
+//              `git --git-dir=.anything` walked past it (fixed in 3.0.0).
+//
+// a multi-component needle ("node_modules/.bin") matches as a contiguous run,
+// so a rule can name a nested shape without a second mechanism.
+inline bool has_component(std::string_view p, std::string_view needle) {
+    if (needle.empty()) return false;
+    std::size_t pos = 0;
+    while (pos <= p.size()) {
+        const std::size_t next = p.find('/', pos);
+        const std::string_view comp =
+            p.substr(pos, next == std::string_view::npos ? p.size() - pos : next - pos);
+        if (comp == needle) return true;
+        if (needle.find('/') != std::string_view::npos &&
+            p.compare(pos, needle.size(), needle) == 0) {
+            const std::size_t after = pos + needle.size();
+            if (after == p.size() || p[after] == '/') return true;
+        }
+        if (next == std::string_view::npos) break;
+        pos = next + 1;
+    }
+    return false;
+}
+
 }  // namespace path
 
 // ---------------------------------------------------------------------------

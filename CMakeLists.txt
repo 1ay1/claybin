@@ -73,6 +73,7 @@ if(CLAYBIN_TESTS)
 
   claybin_test(lattice_laws_test)
   claybin_test(fs_algebra_test)
+  claybin_test(path_shape_test)
   claybin_test(bpf_emit_test)
   claybin_test(policy_typestate_test)
   claybin_test(readme_example_test)
