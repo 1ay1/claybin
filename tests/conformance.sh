@@ -20,6 +20,14 @@ if [ ! -x "$CLAY" ]; then
     exit 1
 fi
 
+# the loader bits every dynamically linked guest needs. kept in one place so a
+# case only states what it is actually testing.
+#
+# defined HERE, above the preflight, because the preflight uses it -- it was
+# below, so $BASE expanded to nothing and the probe bound only /usr. that
+# reported "bwrap cannot sandbox" on a perfectly working host.
+BASE="--ro-bind /usr /usr --symlink usr/lib /lib --symlink usr/lib64 /lib64 --symlink usr/bin /bin"
+
 # can EITHER tool actually build a sandbox here?
 #
 # this preflight exists because of the first CI run. GitHub's runners are
@@ -31,7 +39,13 @@ fi
 # a suite that goes red for environmental reasons trains people to ignore the
 # colour, which is worse than having no suite. so: if bwrap itself cannot run a
 # trivial guest, there is nothing to compare against and we say so.
-if ! $BWRAP --ro-bind /usr /usr --chdir / -- /usr/bin/true >/dev/null 2>&1; then
+#
+# note the binds. the first version bound only /usr and ran /usr/bin/true,
+# which fails with ENOENT on any distro whose loader lives outside /usr --
+# a MISSING LIBRARY reported as a missing sandbox, and it skipped the whole
+# suite on my own machine. $BASE is the same set the real cases use, so the
+# preflight and the tests agree about what a working host looks like.
+if ! $BWRAP $BASE --chdir / -- /bin/sh -c 'exit 0' >/dev/null 2>&1; then
     echo "skip: bwrap cannot build a sandbox on this host (containerised runner?),"
     echo "      so there is no baseline to compare against"
     exit 0
@@ -40,10 +54,6 @@ fi
 PASS=0
 FAIL=0
 SKIP=0
-
-# the loader bits every dynamically linked guest needs. kept in one place so a
-# case only states what it is actually testing.
-BASE="--ro-bind /usr /usr --symlink usr/lib /lib --symlink usr/lib64 /lib64 --symlink usr/bin /bin"
 
 # run one case under both tools and compare stdout+exit code.
 #

@@ -112,6 +112,22 @@ Result<Spawned> spawn_in(const Plan& plan, const Command& cmd, const cgroup::Gro
         // AFTER the privdrop phase that does the closing.
         if (brokering) Plan::set_relay_fd(relay[1]);
         if (brokering) Plan::set_relay_fd2(relay[0]);
+        // and the caller's own descriptors -- the pipe an embedder is polling,
+        // typically. these are registered as the PARENT-side numbers, because
+        // that is what exists right now; the dup2 onto the child-side numbers
+        // happens after the plan, just before exec.
+        {
+            unsigned slot = 0;
+            auto reserve = [&](int fd) {
+                if (fd < 0 || slot >= kMaxPreservedFds) return;
+                Plan::set_preserved_fd(slot++, fd);
+            };
+            reserve(cmd.stdin_fd);
+            reserve(cmd.stdout_fd);
+            reserve(cmd.stderr_fd);
+            for (int i = 0; i < cmd.fd_count && i < Command::kMaxFdMaps; ++i)
+                reserve(cmd.fds[i].parent_fd);
+        }
 
         struct Failure {
             int stage;  // 0 = plan, 1 = exec
@@ -289,6 +305,69 @@ Result<Spawned> spawn_in(const Plan& plan, const Command& cmd, const cgroup::Gro
             ssize_t ignored = ::write(report[1], &f, sizeof f);
             (void)ignored;
             ::_exit(kExitPlanFailed);
+        }
+
+        // ---- descriptors, last thing before exec --------------------------
+        //
+        // after the plan (so the fd phase's close sweep has already run) and
+        // before execve, because these are the only descriptors the guest is
+        // meant to keep.
+        //
+        // the ordering hazard is real: dup2(a, b) where some later pair still
+        // needs the OLD b silently reads the wrong file. minijail solves it by
+        // moving every source out of the target range first, and so do we --
+        // each parent_fd is relocated above the highest child_fd before any
+        // dup2 lands, so no assignment can clobber a source that has not been
+        // consumed yet.
+        {
+            Command::FdMap maps[Command::kMaxFdMaps];
+            int n = 0;
+            // stdio shorthand expands first, so an explicit fds[] entry for the
+            // same child_fd wins by being applied later.
+            auto add = [&](int parent, int child) {
+                if (parent == -1 || n >= Command::kMaxFdMaps) return;
+                maps[n].parent_fd = parent;
+                maps[n].child_fd = child;
+                ++n;
+            };
+            int devnull = -1;
+            auto resolve = [&](int v) {
+                if (v != Command::kDevNull) return v;
+                if (devnull < 0) devnull = ::open("/dev/null", O_RDWR | O_CLOEXEC);
+                return devnull;
+            };
+            add(resolve(cmd.stdin_fd), 0);
+            add(resolve(cmd.stdout_fd), 1);
+            add(resolve(cmd.stderr_fd), 2);
+            for (int i = 0; i < cmd.fd_count && i < Command::kMaxFdMaps; ++i)
+                add(cmd.fds[i].parent_fd, cmd.fds[i].child_fd);
+
+            int highest = 2;
+            for (int i = 0; i < n; ++i)
+                if (maps[i].child_fd > highest) highest = maps[i].child_fd;
+
+            // phase 1: lift every source clear of the destination range.
+            for (int i = 0; i < n; ++i) {
+                if (maps[i].parent_fd > highest) continue;
+                int moved = ::fcntl(maps[i].parent_fd, F_DUPFD_CLOEXEC, highest + 1);
+                if (moved >= 0) maps[i].parent_fd = moved;
+            }
+            // phase 2: place them, and clear CLOEXEC so they survive execve.
+            bool fd_ok = true;
+            for (int i = 0; i < n; ++i) {
+                if (::dup2(maps[i].parent_fd, maps[i].child_fd) < 0) {
+                    fd_ok = false;
+                    break;
+                }
+                ::fcntl(maps[i].child_fd, F_SETFD, 0);
+            }
+            if (!fd_ok) {
+                f.stage = 2;
+                f.sys_errno = errno;
+                ssize_t ignored = ::write(report[1], &f, sizeof f);
+                (void)ignored;
+                ::_exit(kExitPlanFailed);
+            }
         }
 
         ::execve(cmd.program, const_cast<char* const*>(cmd.argv),

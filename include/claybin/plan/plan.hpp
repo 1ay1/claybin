@@ -271,10 +271,11 @@ struct CloseRangeOp {
     std::uint32_t hi;
     // descriptors to spare. close_range() itself cannot express an exception, so
     // apply() walks /proc/self/fd when this is non-empty. small and fixed: the
-    // only things that ever need sparing are spawn's report pipe and any --file
-    // source not yet copied.
+    // report pipe, the two broker relay ends, any --file source not yet copied,
+    // and the slots reserved for descriptors the caller asks spawn() to carry
+    // into the guest (kPreservedFdSentinelBase, kMaxPreservedFds of them).
     std::uint32_t keep_count;
-    std::uint32_t keep[13];
+    std::uint32_t keep[24];
 };
 
 // a placeholder in CloseRangeOp::keep that spawn() rewrites to its own report
@@ -288,6 +289,18 @@ inline constexpr std::uint32_t kRelayFdSentinel = 0xfffffffdu;
 // number on one, and the CLONE_FILES helper -- which shares the same descriptor
 // table -- reads it on the other. closing either breaks the handoff silently.
 inline constexpr std::uint32_t kRelayFd2Sentinel = 0xfffffffcu;
+
+// descriptors the CALLER asked to carry into the guest (Command::fds and the
+// stdio shorthand). a range rather than one sentinel, because an embedder
+// legitimately needs several -- stdin, a stdout/stderr pipe, maybe a status fd
+// -- and the plan is compiled before any of their numbers are known.
+//
+// spawn() fills the matching slots just before applying the plan, the same way
+// the report and relay pipes work. without this the close sweep runs first and
+// the pipe an embedder is polling is already gone by the time the child reaches
+// exec, which presents as a command that produces no output at all.
+inline constexpr std::uint32_t kPreservedFdSentinelBase = 0xfffffff0u;
+inline constexpr std::uint32_t kMaxPreservedFds = 8;
 struct SetHostnameOp {
     Ref name;
 };
@@ -453,6 +466,9 @@ class Plan {
     static void set_report_fd(int fd);
     static void set_relay_fd(int fd);
     static void set_relay_fd2(int fd);
+    // slot N corresponds to kPreservedFdSentinelBase + N in the plan. set by
+    // spawn() from Command's fd list before apply() runs.
+    static void set_preserved_fd(unsigned slot, int fd);
 
     // take the seccomp listener fd, if the policy asked for one. valid only in
     // the child, immediately after apply(); spawn() passes it to the supervisor.

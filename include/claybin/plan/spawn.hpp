@@ -23,6 +23,49 @@ struct Command {
     // the child side of a fork cannot safely allocate.
     const char* const* argv{nullptr};
     const char* const* envp{nullptr};
+
+    // ---- descriptors to carry into the child ----------------------------
+    //
+    // spawn() closes every descriptor it did not create, which is the right
+    // default -- an inherited fd is authority the sandbox cannot see or revoke,
+    // and bubblewrap leaks one here. but a caller that wants the guest's output
+    // needs a pipe to survive that, so it has to be declared rather than
+    // assumed.
+    //
+    // this is libminijail's minijail_preserve_fd(j, parent_fd, child_fd), and
+    // the shape is worth copying rather than inventing: the CALLER owns the
+    // descriptor and says where it should land, so the ordering hazard of
+    // dup2-ing onto a number that is still in use is handled in one place
+    // instead of at every call site. it is also the piece that lets an embedder
+    // keep its own supervise loop -- poll the read end, reap the pid -- which is
+    // the difference between a library and a subprocess.
+    //
+    // a pair is applied as dup2(parent_fd, child_fd) in the child, after the
+    // plan's fd phase and before exec. child_fd is exempt from the close sweep.
+    // to send stdout and stderr to one pipe, pass the same parent_fd twice with
+    // child_fd 1 and 2.
+    struct FdMap {
+        int parent_fd{-1};
+        int child_fd{-1};
+    };
+    // a fixed array, not a vector: this is read on the child side of a fork,
+    // where allocation is not safe. eight covers stdio plus a status pipe or
+    // two, which is every case an embedder has needed so far.
+    static constexpr int kMaxFdMaps = 8;
+    FdMap fds[kMaxFdMaps]{};
+    int fd_count{0};
+
+    // stdio convenience. the common case is "stdin from /dev/null, stdout and
+    // stderr to this pipe", and spelling that as three FdMaps at every call
+    // site is noise.
+    //
+    // -1 means "leave it alone", which for stdin is inherit and for stdout and
+    // stderr is whatever the plan's fd phase left. use kDevNull for stdin to get
+    // an explicit empty input rather than the caller's terminal.
+    static constexpr int kDevNull = -2;
+    int stdin_fd{-1};
+    int stdout_fd{-1};
+    int stderr_fd{-1};
 };
 
 struct Spawned {

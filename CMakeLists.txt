@@ -104,6 +104,10 @@ if(CLAYBIN_TESTS)
     claybin_test(escape_test)
     claybin_test(escape_corpus_test)
     claybin_test(mount_test)
+    # the embedder's path: spawn() with a caller-owned pipe and the caller's own
+    # wait. this is what makes claybin a library rather than a subprocess, so it
+    # gets a test of its own.
+    claybin_test(embed_test)
     claybin_test(cgroup_test)
     claybin_test(broker_test)
 

@@ -777,6 +777,19 @@ Result<Compiled> compile(const Policy<Sealed>& policy, const HostCapabilities& h
                 cr.keep[cr.keep_count++] = kRelayFdSentinel;
             if (cr.keep_count < sizeof cr.keep / sizeof cr.keep[0])
                 cr.keep[cr.keep_count++] = kRelayFd2Sentinel;
+            // and whatever descriptors the CALLER will ask spawn() to carry in.
+            //
+            // the sentinels are always emitted, even though most callers use
+            // none: the plan is compiled before Command exists, so the compiler
+            // cannot know how many there will be. an unused slot resolves to
+            // 0xffffffff and is skipped, which costs nothing. the alternative --
+            // compiling the plan per-spawn once the fds are known -- would make
+            // a Plan no longer reusable across launches, which is one of the
+            // points of having an IR at all.
+            for (std::uint32_t s = 0; s < kMaxPreservedFds; ++s) {
+                if (cr.keep_count >= sizeof cr.keep / sizeof cr.keep[0]) break;
+                cr.keep[cr.keep_count++] = kPreservedFdSentinelBase + s;
+            }
             b.op(OpCode::close_range, cr);
         }
 

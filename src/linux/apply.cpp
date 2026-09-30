@@ -47,6 +47,18 @@ void Plan::set_relay_fd(int fd) { g_relay_fd = static_cast<std::uint32_t>(fd); }
 static std::uint32_t g_relay_fd2 = 0xffffffffu;
 void Plan::set_relay_fd2(int fd) { g_relay_fd2 = static_cast<std::uint32_t>(fd); }
 
+// descriptors the caller asked to carry into the guest. same mechanism as the
+// pipes above, but a small array: the plan is compiled before the caller's fd
+// numbers exist, so the ops carry sentinels and these slots are filled in just
+// before apply() runs.
+static std::uint32_t g_preserved_fds[kMaxPreservedFds] = {
+    0xffffffffu, 0xffffffffu, 0xffffffffu, 0xffffffffu,
+    0xffffffffu, 0xffffffffu, 0xffffffffu, 0xffffffffu,
+};
+void Plan::set_preserved_fd(unsigned slot, int fd) {
+    if (slot < kMaxPreservedFds) g_preserved_fds[slot] = static_cast<std::uint32_t>(fd);
+}
+
 // the seccomp listener fd, when the policy asked for one. set by apply() in the
 // child and read by spawn(), which sends it to the supervisor over the report
 // pipe -- by the time seccomp is installed there is no other channel left open.
@@ -1143,14 +1155,17 @@ Status Plan::apply_range(Phase first, Phase last) const {
                 // silently closed stdout) we sort the small keep set and issue
                 // close_range over the gaps between them. bounded, obvious, and
                 // impossible to get subtly wrong.
-                std::uint32_t keep[16];
+                std::uint32_t keep[32];
                 std::uint32_t nkeep = 0;
                 if (ll_fd >= 0) keep[nkeep++] = static_cast<std::uint32_t>(ll_fd);
-                for (std::uint32_t k = 0; k < op.keep_count && nkeep < 16; ++k) {
+                for (std::uint32_t k = 0; k < op.keep_count && nkeep < 32; ++k) {
                     std::uint32_t want = op.keep[k];
                     if (want == kReportFdSentinel) want = g_report_fd;
                     else if (want == kRelayFdSentinel) want = g_relay_fd;
                     else if (want == kRelayFd2Sentinel) want = g_relay_fd2;
+                    else if (want >= kPreservedFdSentinelBase &&
+                             want < kPreservedFdSentinelBase + kMaxPreservedFds)
+                        want = g_preserved_fds[want - kPreservedFdSentinelBase];
                     if (want != 0xffffffffu) keep[nkeep++] = want;
                 }
                 // insertion sort; nkeep is tiny and this needs no allocation.
