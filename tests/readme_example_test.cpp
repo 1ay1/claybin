@@ -39,7 +39,9 @@ int main() {
     // composition is intersection: it can only ever be more restrictive.
     auto tighter = policy & Policy<Sealed>::nothing();
     CHECK(policy.subsumes(tighter));
-    CHECK(tighter.data().fs.is_nothing());
+    // grants_nothing: the paths are still named, with zero rights. see
+    // FsAuthority::is_nothing for why those are different questions.
+    CHECK(tighter.data().fs.grants_nothing());
 
     return finish("readme_example_test");
 }

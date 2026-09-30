@@ -112,7 +112,12 @@ int main() {
     {
         auto p = Policy<Draft>{}.read_write("/").memory(8_GB).seal();
         auto m = p & Policy<Sealed>::nothing();
-        CHECK(m.data().fs.is_nothing());
+        // grants_nothing, not is_nothing: meeting with bottom leaves the paths
+        // NAMED with zero rights, which is a deny-everything authority rather
+        // than an absent one. the distinction exists because compile() lets
+        // the mounts decide when a caller said nothing at all, and must not
+        // when the caller said "not that".
+        CHECK(m.data().fs.grants_nothing());
         CHECK(m.data().resources.memory.is_nothing());
         // and it escalates the isolation level, never relaxes it
         CHECK(m.data().isolation == Isolation::microvm);

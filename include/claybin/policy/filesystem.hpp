@@ -262,7 +262,21 @@ class FsAuthority {
                 }
             }
             if (found && inherited == g.rights) continue;   // redundant
-            if (!found && g.rights.is_nothing()) continue;  // no-op deny
+            // a denial with no EXPLICIT ancestor grant used to be dropped here
+            // as a no-op. it is not: compile() intersects this authority with
+            // the one the MOUNTS imply, and that happens after normalize(), so
+            // a deny on a path some later bind covers is doing real work.
+            //
+            // dropping it is how agentty's credential mask enforced nothing --
+            // `.deny("~/.aws")` with no matching `.grant()` vanished at seal(),
+            // and ~/.aws stayed readable through the $HOME bind. a rule that
+            // disappears between being written and being compiled is the worst
+            // shape a security control can have, because the policy still
+            // reads correct.
+            //
+            // so a denial is only redundant against an ancestor that is ALSO a
+            // denial, which the `inherited == g.rights` line above already
+            // covers.
             kept.push_back(g);
         }
         grants_ = std::move(kept);
