@@ -12,6 +12,16 @@ on:
   push:
     branches: [master]
   pull_request:
+  # manual trigger, so the schedule-only lane can be PROVEN to work instead of
+  # sitting at "skipped" forever. a lane nobody has ever run is not passing, it
+  # is untested -- and it would first execute at 3am on a night when something
+  # else was already broken.
+  workflow_dispatch:
+    inputs:
+      run_fuzz:
+        description: 'run the long fuzz campaign'
+        type: boolean
+        default: false
   schedule:
     # the long fuzz campaign is too slow for every push but worth running daily.
     - cron: '0 3 * * *'
@@ -135,7 +145,11 @@ jobs:
   fuzz:
     name: long fuzz campaign
     runs-on: ubuntu-latest
-    if: github.event_name == 'schedule'
+    # nightly, or on demand. the manual path exists so this lane can be verified
+    # rather than assumed -- see the workflow_dispatch input above.
+    if: >-
+      github.event_name == 'schedule' ||
+      (github.event_name == 'workflow_dispatch' && inputs.run_fuzz)
     steps:
       - uses: actions/checkout@v4
       - run: sudo apt-get update && sudo apt-get install -y cmake ninja-build
