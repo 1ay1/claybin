@@ -987,7 +987,23 @@ Result<Compiled> compile(const Policy<Sealed>& policy, const HostCapabilities& h
         b.op(OpCode::seccomp_install,
              SeccompInstallOp{b.intern_blob(blob), static_cast<std::uint32_t>(prog->insns.size()),
                               wants_notify ? 1u : 0u});
-        report.record(CapId::syscall_filter, Enforcement::strong, "seccomp-bpf");
+        // a filter that permits everything is INSTALLED but is not a wall, and
+        // saying `strong` for it is exactly the kind of claim this report
+        // exists to make impossible. the arch guard alone is worth something --
+        // it kills a foreign syscall convention -- so this is `partial`, not
+        // `none`.
+        //
+        // found by agentty's settings pane: its "syscall filter: off" row
+        // compiled to SyscallPolicy::everything() and the report cheerfully
+        // said `strong syscall.filter`, which would have put a green wall on
+        // screen for a filter the user had just turned off.
+        if (sys.default_action() == SysAction::allow && sys.rules().empty() &&
+            sys.arg_rules().empty() && sys.arg_allow_sets().empty()) {
+            report.record(CapId::syscall_filter, Enforcement::partial,
+                          "seccomp-bpf: arch guard only, all syscalls permitted");
+        } else {
+            report.record(CapId::syscall_filter, Enforcement::strong, "seccomp-bpf");
+        }
         out.brokers_syscalls = wants_notify;
     } else {
         degrade(CapId::syscall_filter);
