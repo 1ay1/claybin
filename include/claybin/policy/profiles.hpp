@@ -205,6 +205,37 @@ inline SyscallPolicy base() {
         // one at startup.
         290,  // eventfd2
         283,  // timerfd_create
+        // POSIX interval timers. SAME authority as timerfd_create above --
+        // the timer is per-process, fires a signal at the caller, and
+        // reaches nothing outside it -- but denying them breaks something
+        // that LOOKS like it worked, which is worse than an honest EPERM.
+        //
+        // coreutils `timeout` arms a timer, prints
+        //     timeout: warning: timer_create: Operation not permitted
+        // to stderr, and then runs the command WITHOUT A TIMEOUT, exiting 0.
+        // A caller that greps for a non-zero exit sees success. So a hung
+        // command inside the sandbox is never killed, and anything relying
+        // on `timeout` for its own watchdog silently has none. Python's
+        // signal.setitimer and every SIGALRM-based watchdog fail the same
+        // way.
+        //
+        // Allowing these does not weaken the wall-clock cap: that is
+        // enforced by the RUNNER (subprocess.cpp's deadline + SIGTERM/
+        // SIGKILL) from outside the sandbox, where the guest cannot reach
+        // it. These let a guest time ITSELF, which it can already do with
+        // timerfd + poll.
+        222,  // timer_create
+        223,  // timer_settime
+        224,  // timer_gettime
+        225,  // timer_getoverrun
+        226,  // timer_delete
+        38,   // setitimer
+        36,   // getitimer
+        37,   // alarm       (the oldest spelling of the same thing)
+        // Reads the caller's own supplementary group list. No authority at
+        // all -- the ids are already in /proc/self/status, which is
+        // readable. Denying it only makes `id` print an error.
+        115,  // getgroups
         // AF_UNIX only, and both ends belong to the caller -- it cannot be
         // used to reach a socket outside the sandbox. git and ssh use it to
         // talk to their own helper processes. the network namespace still
@@ -558,6 +589,20 @@ inline SyscallPolicy base() {
         168,  // getcpu
         19,   // eventfd2
         85,   // timerfd_create
+        // POSIX interval timers -- see the long note on the x86_64 list for
+        // why these are no-authority and why denying them is worse than an
+        // honest refusal (`timeout` warns, then runs with NO timeout and
+        // exits 0). Numbers from asm-generic/unistd.h, same as the rest of
+        // this table. aarch64 has no `alarm`: glibc implements it on
+        // setitimer there, so the x86_64 entry 37 has no counterpart.
+        107,  // timer_create
+        110,  // timer_settime
+        108,  // timer_gettime
+        109,  // timer_getoverrun
+        111,  // timer_delete
+        103,  // setitimer
+        102,  // getitimer
+        158,  // getgroups
         199,  // socketpair
         279,  // memfd_create
     };
