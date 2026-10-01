@@ -109,6 +109,19 @@ check_stricter() {
     if [ "$b_rc" -eq 0 ] && [ "$c_rc" -ne 0 ]; then
         PASS=$((PASS+1))
         printf '  ok    %s (claybin refuses, by design)\n' "$desc"
+    elif [ "$b_rc" -ne 0 ] && [ "$c_rc" -ne 0 ]; then
+        # BOTH refused, so there is nothing to compare.
+        #
+        # These cases assert "bwrap allows this, claybin deliberately does
+        # not" -- which is only meaningful when bwrap allows it. An older
+        # bwrap that does not know the flag, or a host where it cannot build
+        # the sandbox at all, exits non-zero for its own reasons, and scoring
+        # that as a product failure is a harness bug: claybin behaved exactly
+        # as designed and got marked down for the comparison being
+        # unavailable. (GitHub's runner ships a bwrap that rejects
+        # --not-a-security-boundary, which is why this was red on every push.)
+        SKIP=$((SKIP+1))
+        printf '  skip  %s (bwrap also refuses here; nothing to compare)\n' "$desc"
     else
         FAIL=$((FAIL+1))
         printf '  FAIL  %s: expected bwrap=0 clay!=0, got bwrap=%s clay=%s\n' \
@@ -184,12 +197,41 @@ check "unshare-pid gives us a fresh pid space" \
 # ---- overlays ----------------------------------------------------------------
 # these need scratch directories, so they are set up and torn down here rather
 # than assumed to exist.
+#
+# GATED on whether this kernel will actually mount an overlay from inside a
+# user namespace. Unprivileged overlayfs is a relatively recent and
+# distro-patched capability: Ubuntu carries it, GitHub's runner kernel does
+# not, and a plain upstream kernel below 5.11 never had it.
+#
+# Without the gate these four read as FAILURES on any such host -- claybin and
+# bwrap both correctly decline to mount, the outputs match, and the test still
+# scores it a loss. That is a harness bug reported as a product bug, and it is
+# the worst kind: it trains everyone to ignore a red conformance run, which is
+# exactly what happened here (5 failures, every push, for weeks).
+#
+# Probed rather than version-sniffed: the question is "does mount(2) succeed",
+# and only mount(2) can answer it.
 OVL_LOWER=$(mktemp -d)
 OVL_LOWER2=$(mktemp -d)
 OVL_UPPER=$(mktemp -d)
 OVL_WORK=$(mktemp -d)
 echo "from-lower" > "$OVL_LOWER/a.txt"
 echo "from-lower2" > "$OVL_LOWER2/b.txt"
+
+# Can we overlay at all here? Ask the binary under test, with the simplest
+# possible overlay, and look only at whether it came back.
+#
+# $CLAY is required: $BASE is a flag STRING, not a command, so probing with
+# $BASE alone runs `--ro-bind ...` as an executable, always fails, and would
+# skip the overlay suite on every host including ones where it works.
+if $CLAY $BASE --overlay-src "$OVL_LOWER" --tmp-overlay /data --chdir / \
+       -- /bin/sh -c 'cat /data/a.txt' >/dev/null 2>&1; then
+    OVERLAY_OK=1
+else
+    OVERLAY_OK=0
+fi
+
+if [ "$OVERLAY_OK" = "1" ]; then
 
 check "tmp-overlay reads the lower layer" \
     $BASE --overlay-src "$OVL_LOWER" --tmp-overlay /data --chdir / \
@@ -217,6 +259,13 @@ if [ -e "$OVL_LOWER/leaked.txt" ]; then
 else
     PASS=$((PASS+1))
     printf '  ok    tmp-overlay discards writes (host untouched)\n'
+fi
+
+else
+    # One skip line, not five: the reason is the same for all of them, and a
+    # wall of repeated skips reads like something is wrong.
+    SKIP=$((SKIP+1))
+    printf '  skip  overlays (this kernel will not mount one unprivileged)\n'
 fi
 
 rm -rf "$OVL_LOWER" "$OVL_LOWER2" "$OVL_UPPER" "$OVL_WORK"
