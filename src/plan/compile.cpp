@@ -1,12 +1,41 @@
 #include "claybin/plan/compile.hpp"
 
 #include <cstdio>
+#if defined(_WIN32)
+#include <cstdint>
+#else
 #include <unistd.h>
+#endif
 
 #include "claybin/bpf/emit.hpp"
 
 namespace clay {
 namespace {
+
+// The caller's uid/gid, for the uid_map/gid_map writes and the setids op.
+//
+// Shimmed rather than #ifdef'd at each of the four call sites, because the
+// surrounding code is PORTABLE by design: compile() turns a policy into a
+// plan on any host (the file's own header says so, and agentty's settings
+// pane calls it on macOS and Windows to preview the walls). Only apply() is
+// linux-only. A bare <unistd.h> broke that promise and took the whole MinGW
+// build down with it -- `'::getuid' has not been declared`.
+//
+// Windows returns 0/0. The values only ever reach a /proc write or a
+// setresuid, neither of which exists there, and a plan built on Windows is
+// inspected rather than applied -- so the number is a placeholder in a field
+// nothing on that platform reads.
+#if defined(_WIN32)
+[[nodiscard]] inline std::uint32_t caller_uid() noexcept { return 0; }
+[[nodiscard]] inline std::uint32_t caller_gid() noexcept { return 0; }
+#else
+[[nodiscard]] inline std::uint32_t caller_uid() noexcept {
+    return static_cast<std::uint32_t>(::getuid());
+}
+[[nodiscard]] inline std::uint32_t caller_gid() noexcept {
+    return static_cast<std::uint32_t>(::getgid());
+}
+#endif
 
 // ---------------------------------------------------------------------------
 // linux ABI constants. hardcoded rather than #included so this file compiles
@@ -185,7 +214,7 @@ Result<Compiled> compile(const Policy<Sealed>& policy, const HostCapabilities& h
         if (d.uid != kUnsetId) {
             char buf[64];
             std::snprintf(buf, sizeof buf, "%u %u 1\n", d.uid,
-                          static_cast<unsigned>(::getuid()));
+                          caller_uid());
             b.op(OpCode::write_file,
                  WriteFileOp{b.intern("/proc/self/uid_map"), b.intern(buf)});
         } else {
@@ -194,7 +223,7 @@ Result<Compiled> compile(const Policy<Sealed>& policy, const HostCapabilities& h
         if (d.gid != kUnsetId) {
             char buf[64];
             std::snprintf(buf, sizeof buf, "%u %u 1\n", d.gid,
-                          static_cast<unsigned>(::getgid()));
+                          caller_gid());
             b.op(OpCode::write_file,
                  WriteFileOp{b.intern("/proc/self/gid_map"), b.intern(buf)});
         } else {
@@ -708,8 +737,8 @@ Result<Compiled> compile(const Policy<Sealed>& policy, const HostCapabilities& h
     // the setresuid/setresgid that actually adopts it.
     if (d.uid != kUnsetId || d.gid != kUnsetId) {
         b.op(OpCode::set_ids,
-             SetIdsOp{d.uid == kUnsetId ? static_cast<std::uint32_t>(::getuid()) : d.uid,
-                      d.gid == kUnsetId ? static_cast<std::uint32_t>(::getgid()) : d.gid});
+             SetIdsOp{d.uid == kUnsetId ? caller_uid() : d.uid,
+                      d.gid == kUnsetId ? caller_gid() : d.gid});
     }
 
     b.op(OpCode::chdir, ChdirOp{b.intern(d.workdir)});

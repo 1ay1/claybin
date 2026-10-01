@@ -8,6 +8,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <iterator>   // back_inserter — libstdc++ leaks it via <algorithm>, libc++ does not
 #include <span>
 #include <vector>
 

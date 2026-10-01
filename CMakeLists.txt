@@ -35,13 +35,27 @@ option(CLAYBIN_TESTS "build tests" ON)
 add_library(claybin STATIC
   src/bpf/emit.cpp
   src/plan/compile.cpp
-  src/broker/notify.cpp
-  src/core/fd.cpp
-  src/plan/probe.cpp
   src/windows/compile.cpp
 )
+# POSIX-only implementations.
+#
+# These are not "linux-flavoured but portable" the way compile.cpp is -- they
+# call open/read/close/readlink/getuid directly and have no Windows analogue,
+# so there is nothing to shim. They were in the unconditional list, which only
+# worked because compile.cpp sorts first and failed the MinGW build before the
+# linker reached them.
+#
+# Grouped with the linux/ sources rather than given their own guard: the
+# question "does this file need a POSIX host" has one answer and should have
+# one list.
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
-  target_sources(claybin PRIVATE src/linux/apply.cpp src/linux/spawn.cpp src/linux/cgroup.cpp)
+  target_sources(claybin PRIVATE
+    src/broker/notify.cpp
+    src/core/fd.cpp
+    src/plan/probe.cpp
+    src/linux/apply.cpp
+    src/linux/spawn.cpp
+    src/linux/cgroup.cpp)
 endif()
 target_include_directories(claybin PUBLIC include)
 target_compile_options(claybin PRIVATE
@@ -51,10 +65,20 @@ target_compile_options(claybin PRIVATE
 # the whole point: no libseccomp, no libcap, no libmount. raw syscalls only.
 target_link_libraries(claybin PUBLIC)
 
-add_executable(claybin-audit tools/claybin_audit.cpp)
-target_link_libraries(claybin-audit PRIVATE claybin)
-
+# Both CLI tools are Linux-only.
+#
+# claybin-audit reports what THIS host enforces, which means it calls
+# probe_host() and cgroup::probe() -- the POSIX-only sources above. The
+# library still builds everywhere (agentty's settings pane compiles a plan on
+# macOS and Windows to preview the walls), but a tool that measures a live
+# kernel has nothing to measure off one.
+#
+# It used to be unconditional and only linked because nobody had built the
+# library for Windows far enough to reach it.
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+  add_executable(claybin-audit tools/claybin_audit.cpp)
+  target_link_libraries(claybin-audit PRIVATE claybin)
+
   add_executable(claybin-run tools/claybin_run.cpp)
   target_link_libraries(claybin-run PRIVATE claybin)
 endif()
