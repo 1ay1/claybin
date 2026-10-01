@@ -522,6 +522,82 @@ else
     printf '  skip  claybin-audit not built\n'
 fi
 
+# ── --memory / --size parse their SUFFIXES ─────────────────────────────────
+#
+# the regression this locks out, which was live and silent: --memory went
+# through a bare strtoull, so `--memory 16G` parsed as 16 and the cgroup got
+# memory.max=16 BYTES. every sandbox with a memory cap was SIGKILLed the
+# instant it was attached -- exit 137, no diagnostic, at any size the user
+# asked for. it read as "the sandbox is broken" rather than "your flag was
+# truncated", which is why it survived so long.
+#
+# checked by OBSERVING the cgroup from the host while the guest runs, not by
+# trusting the exit code: a cap that is silently wrong still exits 0 if it
+# happens to be large enough, and that is exactly the failure mode here.
+if [ -x "$CLAY" ]; then
+    # a cap the guest can live under must actually appear, at the right size.
+    want=$((2 * 1024 * 1024 * 1024))
+    got=""
+    MEMMAX_OUT=$(mktemp)
+    if [ -d /sys/fs/cgroup ]; then
+        parent=$(cut -d: -f3 /proc/self/cgroup | head -1)
+        base="/sys/fs/cgroup${parent%/*}"
+        (
+            n=0
+            while [ $n -lt 60 ]; do
+                d=$(ls -d "$base"/clay-box-* 2>/dev/null | head -1)
+                if [ -n "$d" ] && [ -r "$d/memory.max" ]; then
+                    cat "$d/memory.max" > "$MEMMAX_OUT" 2>/dev/null
+                    break
+                fi
+                n=$((n+1))
+                sleep 0.05
+            done
+        ) &
+        watcher=$!
+        "$CLAY" $BASE --memory 2G --chdir / -- /bin/sh -c 'sleep 1.2' \
+            >/dev/null 2>&1
+        rc=$?
+        wait "$watcher" 2>/dev/null
+        got=$(cat "$MEMMAX_OUT" 2>/dev/null)
+        rm -f "$MEMMAX_OUT"
+
+        if [ "$rc" -ne 0 ]; then
+            FAIL=$((FAIL+1))
+            printf '  FAIL  --memory 2G killed the guest (rc=%s)\n' "$rc"
+        elif [ -z "$got" ]; then
+            SKIP=$((SKIP+1))
+            printf '  skip  could not observe the sandbox cgroup\n'
+        elif [ "$got" = "$want" ]; then
+            PASS=$((PASS+1))
+            printf '  ok    --memory 2G reaches memory.max as %s bytes\n' "$want"
+        else
+            FAIL=$((FAIL+1))
+            printf '  FAIL  --memory 2G wrote memory.max=%s, want %s\n' \
+                "$got" "$want"
+        fi
+    else
+        SKIP=$((SKIP+1))
+        printf '  skip  no cgroup2 to observe\n'
+    fi
+
+    # and a size we cannot honour must be REFUSED, not truncated. these are
+    # the shapes that used to slip through to a lethal cgroup.
+    for bad in 16 0 16Gi 16X sixteen; do
+        if "$CLAY" $BASE --memory "$bad" --chdir / -- /bin/true >/dev/null 2>&1
+        then
+            FAIL=$((FAIL+1))
+            printf '  FAIL  --memory %s was accepted\n' "$bad"
+        else
+            PASS=$((PASS+1))
+            printf '  ok    --memory %s is refused up front\n' "$bad"
+        fi
+    done
+else
+    SKIP=$((SKIP+1))
+    printf '  skip  claybin-run not built\n'
+fi
+
 echo
 echo "pass=$PASS fail=$FAIL skip=$SKIP"
 [ "$FAIL" -eq 0 ]

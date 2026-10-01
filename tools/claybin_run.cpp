@@ -43,6 +43,49 @@ bool strcasecmp_eq(const char* a, const char* b) {
     return *a == '\0' && *b == '\0';
 }
 
+// A byte count, with the K/M/G/T suffixes every other tool in this space
+// accepts. Returns false on anything it cannot represent exactly.
+//
+// THE BUG THIS FIXES, and it is the worst shape a bug can have: `--memory 16G`
+// went through a bare strtoull, which stops at the 'G' and returns 16. The
+// cgroup then got memory.max=16 -- sixteen BYTES -- so every sandbox with a
+// memory cap was SIGKILLed the instant it was attached, at any size the user
+// asked for. The symptom was exit 137 with no diagnostic, which reads as "the
+// sandbox is broken" rather than "your flag was silently truncated".
+//
+// So trailing garbage is an ERROR, not a stopping point. `16GB`, `16g` and
+// `16777216` are all accepted; `16Gi`, `16X` and `sixteen` are refused with a
+// message naming the argument. A size flag that quietly means something other
+// than what it says is worse than one that fails.
+//
+// Overflow is checked rather than wrapped: `--memory 99999999999999999999G`
+// must not become a small number.
+bool parse_size(const char* s, std::uint64_t& out) {
+    if (!s || !*s) return false;
+    char* end = nullptr;
+    errno = 0;
+    const unsigned long long raw = std::strtoull(s, &end, 10);
+    if (end == s || errno == ERANGE) return false;   // no digits, or too big
+
+    std::uint64_t mult = 1;
+    switch (*end) {
+        case '\0': break;
+        case 'k': case 'K': mult = 1ull << 10; ++end; break;
+        case 'm': case 'M': mult = 1ull << 20; ++end; break;
+        case 'g': case 'G': mult = 1ull << 30; ++end; break;
+        case 't': case 'T': mult = 1ull << 40; ++end; break;
+        default: return false;
+    }
+    // Allow a trailing 'B' ("16GB"), then insist on end-of-string. Anything
+    // else -- "16Gi", "16G ", "16Gx" -- is a typo we must not guess at.
+    if (*end == 'b' || *end == 'B') ++end;
+    if (*end != '\0') return false;
+
+    if (mult > 1 && raw > (UINT64_MAX / mult)) return false;   // would overflow
+    out = static_cast<std::uint64_t>(raw) * mult;
+    return true;
+}
+
 void usage() {
     std::fprintf(stderr,
                  "usage: claybin-run [OPTIONS...] [--] COMMAND [ARGS...]\n"
@@ -72,14 +115,14 @@ void usage() {
                  "  --setenv VAR VAL       set an environment variable\n"
                  "  --unshare-all          unshare every namespace (default)\n"
                  "  --share-net            keep the network namespace\n"
-                 "  --size BYTES           size for the next --tmpfs\n"
+                 "  --size SIZE            size for the next --tmpfs\n"
                  "\n"
                  "claybin additions:\n"
                  "  --profile NAME         syscall profile: base|proc|fs|net|compiler|compiler-net\n"
                  "  --deny PATH            punch a landlock hole inside a bind\n"
                  "  --allow-port PORT      allow TCP connect to PORT only (landlock, abi4+)\n"
                  "  --allow-bind-port PORT allow TCP bind to PORT only\n"
-                 "  --memory BYTES         memory cap (cgroup2 when available)\n"
+                 "  --memory SIZE          memory cap (cgroup2 when available)\n"
                  "  --processes N          max processes (cgroup2 pids.max)\n"
                  "  --cpu-percent N        cpu cap, 100 = one core (cgroup2 cpu.max)\n"
                  "  --audit                compile THESE flags, print the plan and guarantee\n"
@@ -87,6 +130,12 @@ void usage() {
                  "                         for 'what will my sandbox actually do' -- claybin-audit\n"
                  "                         reports host capabilities against a fixed example.\n"
                  "  --require LEVEL        fail unless every wall reaches LEVEL\n");
+    std::fprintf(stderr,
+                 "\n"
+                 "SIZE is a byte count with an optional K/M/G/T suffix:\n"
+                 "  --memory 512M   --memory 2G   --memory 1073741824\n"
+                 "A suffix is required to mean anything bigger than bytes --\n"
+                 "`--memory 2` really is two bytes, and is refused as such.\n");
 }
 
 }  // namespace
@@ -223,15 +272,60 @@ int main(int argc, char** argv) {
             i += 1;
         } else if (std::strcmp(a, "--size") == 0) {
             if (!need(1, a)) return 1;
-            next_size = std::strtoull(eargv[i + 1], nullptr, 10);
+            if (!parse_size(eargv[i + 1], next_size)) {
+                std::fprintf(stderr,
+                             "claybin-run: --size: bad byte count '%s' "
+                             "(want digits with an optional K/M/G/T suffix)\n",
+                             eargv[i + 1]);
+                return 1;
+            }
             i += 1;
         } else if (std::strcmp(a, "--memory") == 0) {
             if (!need(1, a)) return 1;
-            policy = std::move(policy).memory(Bytes{std::strtoull(eargv[i + 1], nullptr, 10)});
+            std::uint64_t bytes = 0;
+            if (!parse_size(eargv[i + 1], bytes)) {
+                std::fprintf(stderr,
+                             "claybin-run: --memory: bad byte count '%s' "
+                             "(want digits with an optional K/M/G/T suffix)\n",
+                             eargv[i + 1]);
+                return 1;
+            }
+            // A cap below one page cannot hold a process: the kernel kills it
+            // the moment it is attached, before anything of the caller's
+            // program runs, and exit 137 with no output is indistinguishable
+            // from a broken sandbox. Refusing is the honest answer -- this is
+            // the exact failure `--memory 16G` produced when the suffix was
+            // dropped, and the number that made it so hard to spot.
+            if (bytes < 1024 * 1024) {
+                std::fprintf(stderr,
+                             "claybin-run: --memory %s is %llu bytes; a cap "
+                             "under 1M kills the guest before it can run. "
+                             "Did you mean %sM or %sG?\n",
+                             eargv[i + 1], (unsigned long long)bytes,
+                             eargv[i + 1], eargv[i + 1]);
+                return 1;
+            }
+            policy = std::move(policy).memory(Bytes{bytes});
             i += 1;
         } else if (std::strcmp(a, "--processes") == 0) {
             if (!need(1, a)) return 1;
-            policy = std::move(policy).processes(std::strtoull(eargv[i + 1], nullptr, 10));
+            // A plain count, NOT parse_size: "--processes 4K" is far more
+            // likely a typo than a request for 4096 workers, and a pids cap
+            // is small by nature.
+            {
+                char* pend = nullptr;
+                errno = 0;
+                const unsigned long long n =
+                    std::strtoull(eargv[i + 1], &pend, 10);
+                if (pend == eargv[i + 1] || *pend != '\0' || errno == ERANGE
+                    || n == 0) {
+                    std::fprintf(stderr,
+                                 "claybin-run: --processes: want a positive "
+                                 "count, got '%s'\n", eargv[i + 1]);
+                    return 1;
+                }
+                policy = std::move(policy).processes(n);
+            }
             i += 1;
         } else if (std::strcmp(a, "--cpu-percent") == 0) {
             // the library has always supported this and the tool never exposed
