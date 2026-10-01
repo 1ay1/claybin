@@ -810,15 +810,52 @@ Status Plan::apply_range(Phase first, Phase last) const {
                 // bind of a file onto a directory fails with ENOTDIR, and vice
                 // versa, so this cannot be decided at compile time -- the plan
                 // may well be applied on a different machine.
-                struct kstat {
-                    unsigned long st_dev, st_ino, st_nlink;
-                    unsigned int st_mode, st_uid, st_gid, _pad;
-                    unsigned long st_rdev, st_size;
-                    long _rest[11];
-                } st{};
+                //
+                // statx, not newfstatat. SYS_newfstatat does not exist on
+                // 32-bit x86 (it is SYS_fstatat64 there, number 300 vs 262),
+                // so the i686 release build failed to compile outright --
+                // `error: use of undeclared identifier 'SYS_newfstatat'`.
+                //
+                // Picking the per-arch syscall would also mean picking the
+                // per-arch STRUCT: the hand-rolled kstat above is the x86_64
+                // layout, and i686's stat64 orders and sizes its fields
+                // differently, so a build that merely compiled would have
+                // read st_mode out of the wrong offset -- silently treating
+                // files as directories. statx avoids both problems at once:
+                // it exists on every arch the kernel supports (4.11+), and
+                // struct statx has ONE layout everywhere because the kernel
+                // defines it with explicit widths.
+                //
+                // Only st_mode is read, so ask for STATX_TYPE alone and let
+                // the kernel skip the rest.
+                //
+                // The trailing padding is LOAD-BEARING. The kernel writes a
+                // full `struct statx` -- 256 bytes, verified against
+                // <linux/stat.h> on both x86_64 and i686 -- so a struct that
+                // only covers the fields we read would be overwritten past
+                // its end, straight into the stack. Only the prefix layout
+                // matters for correctness (stx_mode at offset 28, identical
+                // on both arches because the kernel fixes the widths); the
+                // tail just has to EXIST.
+                struct kstatx {
+                    unsigned int   stx_mask, stx_blksize;
+                    unsigned long long stx_attributes;
+                    unsigned int   stx_nlink, stx_uid, stx_gid;
+                    unsigned short stx_mode, _pad1;
+                    unsigned long long stx_ino, stx_size, stx_blocks,
+                                       stx_attributes_mask;
+                    long long      _rest[24];
+                } stx{};
+                static_assert(sizeof(kstatx) >= 256,
+                              "the kernel writes 256 bytes of struct statx; "
+                              "a smaller buffer is a stack overwrite");
+                static_assert(offsetof(kstatx, stx_mode) == 28,
+                              "stx_mode must sit where the kernel puts it");
                 char scratch[4096];
-                if (sys(SYS_newfstatat, AT_FDCWD, reinterpret_cast<long>(src),
-                        reinterpret_cast<long>(&st), 0) < 0) {
+                constexpr int kStatxType = 0x00000001;   // STATX_TYPE
+                if (sys(SYS_statx, AT_FDCWD, reinterpret_cast<long>(src),
+                        0 /* flags */, kStatxType,
+                        reinterpret_cast<long>(&stx)) < 0) {
                     // the source does not exist. create NOTHING: for a
                     // --bind-try the whole point is that the path is absent,
                     // and leaving an empty directory behind would be a visible
@@ -826,7 +863,7 @@ Status Plan::apply_range(Phase first, Phase last) const {
                     return true;
                 }
                 constexpr unsigned int kIfmt = 0170000, kIfdir = 0040000;
-                if ((st.st_mode & kIfmt) == kIfdir) {
+                if ((stx.stx_mode & kIfmt) == kIfdir) {
                     // a bind's mount POINT is a guest path, so it gets confined
                     // resolution -- this is the op that made `--bind src
                     // /work/out/mnt` create a directory at /tmp/victim/mnt on the

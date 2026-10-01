@@ -58,9 +58,24 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
     src/linux/cgroup.cpp)
 endif()
 target_include_directories(claybin PUBLIC include)
+# GNU-style flags are GNU-ONLY. MSVC takes `/W4` and treats `-Wextra` as a
+# malformed `/W` -- `cl : Command line error D8021 : invalid numeric argument
+# '/Wextra'` -- which kills the Windows release build on the FIRST claybin TU
+# it reaches. It went unnoticed because the library only started being built
+# on Windows recently (the tools were moved into the Linux block for exactly
+# that reason); before that nothing compiled far enough to see these.
+#
+# -fno-exceptions / -fno-rtti have no MSVC spelling that means the same thing
+# (/EH- changes ABI and the consumer sets /EHsc anyway), so they are simply
+# not applied there. claybin's sources throw nothing and use no dynamic_cast,
+# which is a property of the code rather than of the flag -- the flag is a
+# guard against regressing it, and that guard still runs on every Linux and
+# macOS build.
 target_compile_options(claybin PRIVATE
-  -Wall -Wextra -Wconversion -Wshadow -Wold-style-cast
-  -fno-exceptions -fno-rtti
+  $<$<CXX_COMPILER_ID:GNU,Clang,AppleClang>:
+    -Wall -Wextra -Wconversion -Wshadow -Wold-style-cast
+    -fno-exceptions -fno-rtti>
+  $<$<CXX_COMPILER_ID:MSVC>:/W4 /utf-8>
 )
 # the whole point: no libseccomp, no libcap, no libmount. raw syscalls only.
 target_link_libraries(claybin PUBLIC)
@@ -91,7 +106,9 @@ if(CLAYBIN_TESTS)
   function(claybin_test name)
     add_executable(${name} tests/${name}.cpp)
     target_link_libraries(${name} PRIVATE claybin claybin_test_support)
-    target_compile_options(${name} PRIVATE -Wall -Wextra -fno-exceptions -fno-rtti)
+    target_compile_options(${name} PRIVATE
+      $<$<CXX_COMPILER_ID:GNU,Clang,AppleClang>:-Wall -Wextra -fno-exceptions -fno-rtti>
+      $<$<CXX_COMPILER_ID:MSVC>:/W4 /utf-8>)
     add_test(NAME ${name} COMMAND ${name})
   endfunction()
 
@@ -113,7 +130,9 @@ if(CLAYBIN_TESTS)
   add_executable(syscall_table_test tests/syscall_table_test.cpp
                                     tests/profiles_aarch64.cpp)
   target_link_libraries(syscall_table_test PRIVATE claybin claybin_test_support)
-  target_compile_options(syscall_table_test PRIVATE -Wall -Wextra -fno-exceptions -fno-rtti)
+  target_compile_options(syscall_table_test PRIVATE
+    $<$<CXX_COMPILER_ID:GNU,Clang,AppleClang>:-Wall -Wextra -fno-exceptions -fno-rtti>
+    $<$<CXX_COMPILER_ID:MSVC>:/W4 /utf-8>)
   add_test(NAME syscall_table_test COMMAND syscall_table_test)
 
   # the aarch64 tables have never executed -- no hardware, no cross toolchain --
