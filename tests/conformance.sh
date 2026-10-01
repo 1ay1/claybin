@@ -218,14 +218,22 @@ OVL_WORK=$(mktemp -d)
 echo "from-lower" > "$OVL_LOWER/a.txt"
 echo "from-lower2" > "$OVL_LOWER2/b.txt"
 
-# Can we overlay at all here? Ask the binary under test, with the simplest
-# possible overlay, and look only at whether it came back.
+# Can BWRAP overlay here? That is the gate, and it is deliberately not
+# claybin's capability.
 #
-# $CLAY is required: $BASE is a flag STRING, not a command, so probing with
-# $BASE alone runs `--ro-bind ...` as an executable, always fails, and would
-# skip the overlay suite on every host including ones where it works.
-if $CLAY $BASE --overlay-src "$OVL_LOWER" --tmp-overlay /data --chdir / \
-       -- /bin/sh -c 'cat /data/a.txt' >/dev/null 2>&1; then
+# `check` is a DIFFERENTIAL: it runs both and compares. So the question is not
+# "can this host overlay" but "can both sides be asked" -- and bwrap is the one
+# that cannot, on two separate counts. GitHub's runner ships a bwrap old enough
+# to lack --overlay-src entirely, and its kernel may refuse an unprivileged
+# overlay mount anyway. claybin does the overlay correctly on exactly those
+# hosts (CI shows `clay rc=0 out=[from-lower]` against `bwrap rc=1 out=[]`),
+# which the harness then scored as a claybin failure — marking it down for
+# being MORE capable than its reference.
+#
+# Probed rather than version-sniffed: --overlay-src may exist and still fail on
+# the mount, and only running it distinguishes those.
+if [ -n "$BWRAP" ] && $BWRAP $BASE --overlay-src "$OVL_LOWER" --tmp-overlay /data \
+       --chdir / -- /bin/sh -c 'cat /data/a.txt' >/dev/null 2>&1; then
     OVERLAY_OK=1
 else
     OVERLAY_OK=0
@@ -250,7 +258,20 @@ check "writable overlay merges" \
     --overlay-src "$OVL_LOWER" --overlay "$OVL_UPPER" "$OVL_WORK" /data \
     --chdir / -- /usr/bin/ls /data
 
-# the tmp-overlay's whole point: the host must be untouched afterwards.
+else
+    # One skip line, not four: the reason is the same for all of them, and a
+    # wall of repeated skips reads like something is wrong.
+    SKIP=$((SKIP+1))
+    printf '  skip  overlays (bwrap here cannot overlay; nothing to compare)\n'
+fi
+
+# The tmp-overlay's whole point: the host must be untouched afterwards.
+#
+# OUTSIDE the gate, deliberately. This one is not a differential -- it runs
+# claybin alone and then looks at the host filesystem -- so bwrap's
+# capabilities are irrelevant to it. Leaving it inside would have dropped the
+# single most security-relevant overlay assertion on exactly the hosts where
+# the rest already cannot run.
 $CLAY $BASE --overlay-src "$OVL_LOWER" --tmp-overlay /data --chdir / \
     -- /bin/sh -c 'echo leaked > /data/leaked.txt' >/dev/null 2>&1
 if [ -e "$OVL_LOWER/leaked.txt" ]; then
@@ -259,13 +280,6 @@ if [ -e "$OVL_LOWER/leaked.txt" ]; then
 else
     PASS=$((PASS+1))
     printf '  ok    tmp-overlay discards writes (host untouched)\n'
-fi
-
-else
-    # One skip line, not five: the reason is the same for all of them, and a
-    # wall of repeated skips reads like something is wrong.
-    SKIP=$((SKIP+1))
-    printf '  skip  overlays (this kernel will not mount one unprivileged)\n'
 fi
 
 rm -rf "$OVL_LOWER" "$OVL_LOWER2" "$OVL_UPPER" "$OVL_WORK"
