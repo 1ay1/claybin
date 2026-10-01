@@ -129,6 +129,21 @@ bool probe_no_new_privs() {
     return ::prctl(PR_GET_NO_NEW_PRIVS, 0, 0, 0, 0) >= 0;
 }
 
+bool probe_kvm() {
+    // OPEN it, do not stat it. /dev/kvm exists on hosts where the module is
+    // loaded but the device is root-only, which is the common case on desktop
+    // distributions -- and a capability that reads as present and fails on use
+    // is the failure mode this whole probe file exists to avoid (see
+    // probe_userns: the sysctls said yes and the uid_map write said no).
+    //
+    // O_RDWR because that is what a VMM needs; read-only access to /dev/kvm is
+    // not enough to create a VM.
+    const int fd = ::open("/dev/kvm", O_RDWR | O_CLOEXEC);
+    if (fd < 0) return false;
+    ::close(fd);
+    return true;
+}
+
 }  // namespace
 
 HostCapabilities probe_host() {
@@ -140,6 +155,7 @@ HostCapabilities probe_host() {
     h.uts_namespaces = path_exists("/proc/self/ns/uts");
     h.seccomp = probe_seccomp();
     h.seccomp_user_notif = h.seccomp && probe_user_notif();
+    h.kvm = probe_kvm();
 
     // cgroups need the full delegation probe, not a stat: whether we can
     // actually create a limited cgroup depends on how our caller was launched.

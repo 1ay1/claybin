@@ -45,6 +45,21 @@ struct HostCapabilities {
     std::uint32_t landlock_abi{0};  // 0 = absent
     bool no_new_privs{false};
 
+    // can this host back a microvm at all?
+    //
+    // NOT used by the process backend -- it is here so the gap between "we do
+    // not implement a microvm" and "this host could not run one anyway" is
+    // MEASURABLE rather than a matter of opinion. those are different answers
+    // to "why is host.kernel_isolation none", and a caller deciding whether to
+    // care deserves the real one.
+    //
+    // /dev/kvm being present and openable is the precondition every VMM shares
+    // (firecracker's getting-started names exactly this: the kvm module plus
+    // read-write access to the device). it is necessary, not sufficient -- a
+    // VMM binary still has to exist -- so a true here means "the hardware
+    // boundary is available", not "claybin can give it to you".
+    bool kvm{false};
+
     static HostCapabilities none() { return {}; }
 
     // a modern linux box in a delegated scope. the reference target.
@@ -58,6 +73,11 @@ struct HostCapabilities {
         h.cgroup_cpu = true;
         h.landlock_abi = 5;
         h.no_new_privs = true;
+        // deliberately FALSE in the reference host: kvm is orthogonal to
+        // everything else here, most CI runners lack it, and a reference that
+        // claimed it would make the one capability we cannot deliver look
+        // available in every test.
+        h.kvm = false;
         return h;
     }
 };

@@ -1079,7 +1079,24 @@ Result<Compiled> compile(const Policy<Sealed>& policy, const HostCapabilities& h
 
     // the process backend shares a kernel with the host. always say so: this is
     // the single most important line in the whole report.
-    report.record(CapId::host_kernel_isolation, Enforcement::none, "process-backend");
+    //
+    // the mechanism string distinguishes WHY, because "none" has two very
+    // different causes and a caller deciding whether to care deserves the real
+    // one:
+    //
+    //   process-backend, kvm available   we do not implement a microvm, but this
+    //                                    host could run one. the gap is ours.
+    //   process-backend, no kvm          the hardware boundary is not available
+    //                                    here at all, so no backend could give
+    //                                    it. the gap is the host's.
+    //
+    // that distinction is the whole reason HostCapabilities::kvm exists -- it
+    // is otherwise unused by this backend. reporting a flat "process-backend"
+    // invited the reader to assume the first case, which is wrong on most CI
+    // runners and on every container without /dev/kvm passed through.
+    report.record(CapId::host_kernel_isolation, Enforcement::none,
+                  host.kvm ? "process-backend, kvm available"
+                           : "process-backend, no kvm");
 
     // devices: with a tree we mount an explicit allowlist, so /dev/mem and
     // friends are ABSENT rather than denied. without one, the best we can do is
