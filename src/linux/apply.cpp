@@ -741,8 +741,8 @@ Status Plan::apply_range(Phase first, Phase last) const {
             case OpCode::mkdir_p: {
                 MkdirOp op{};
                 if (!decode(payload, op)) return die(Errc::invalid_policy, "mkdir", 0);
-                const char* p = cstr(op.path);
-                if (!p) return die(Errc::invalid_policy, "mkdir", 0);
+                const char* path = cstr(op.path);
+                if (!path) return die(Errc::invalid_policy, "mkdir", 0);
                 char scratch[4096];
 
                 // a mount's target directory comes through here, and it is a
@@ -766,11 +766,11 @@ Status Plan::apply_range(Phase first, Phase last) const {
                 // it, and that mkdir is what CREATES the directory everything
                 // else is confined to. it has no parent inside the tree, and it
                 // needs no confinement -- a fixed string of ours.
-                if (relative_to_guest_root(p) && !is_guest_root(p)) {
+                if (relative_to_guest_root(path) && !is_guest_root(path)) {
                     int dir = -1;
                     const char* leaf = nullptr;
                     int err = 0;
-                    if (resolve_parent_beneath(p, scratch, sizeof scratch, &dir, &leaf, &err)) {
+                    if (resolve_parent_beneath(path, scratch, sizeof scratch, &dir, &leaf, &err)) {
                         long rc = sys(SYS_mkdirat, dir, reinterpret_cast<long>(leaf),
                                       static_cast<long>(op.mode ? op.mode : 0755));
                         int merr = errno;
@@ -785,17 +785,17 @@ Status Plan::apply_range(Phase first, Phase last) const {
                     if (err != ENOSYS) return die(Errc::io_error, "mkdir (confined)", err);
                 }
 
-                if (!mkdir_p(p, op.mode, scratch, sizeof scratch))
+                if (!mkdir_p(path, op.mode, scratch, sizeof scratch))
                     return die(Errc::io_error, "mkdir", errno);
                 return true;
             }
             case OpCode::touch: {
                 MkdirOp op{};
                 if (!decode(payload, op)) return die(Errc::invalid_policy, "touch", 0);
-                const char* p = cstr(op.path);
-                if (!p) return die(Errc::invalid_policy, "touch", 0);
+                const char* path = cstr(op.path);
+                if (!path) return die(Errc::invalid_policy, "touch", 0);
                 char scratch[4096];
-                if (!touch_file(p, op.mode, scratch, sizeof scratch))
+                if (!touch_file(path, op.mode, scratch, sizeof scratch))
                     return die(Errc::io_error, "touch", errno);
                 return true;
             }
@@ -1238,9 +1238,9 @@ Status Plan::apply_range(Phase first, Phase last) const {
             case OpCode::chdir: {
                 ChdirOp op{};
                 if (!decode(payload, op)) return die(Errc::invalid_policy, "chdir", 0);
-                const char* p = cstr(op.path);
-                if (!p) return die(Errc::invalid_policy, "chdir", 0);
-                if (sys(SYS_chdir, reinterpret_cast<long>(p)) < 0)
+                const char* path = cstr(op.path);
+                if (!path) return die(Errc::invalid_policy, "chdir", 0);
+                if (sys(SYS_chdir, reinterpret_cast<long>(path)) < 0)
                     return die(Errc::io_error, "chdir", errno);
                 return true;
             }
@@ -1285,10 +1285,10 @@ Status Plan::apply_range(Phase first, Phase last) const {
                 LandlockRuleOp op{};
                 if (!decode(payload, op)) return die(Errc::invalid_policy, "landlock", 0);
                 if (ll_fd < 0) return die(Errc::invalid_policy, "landlock: rule before enforce", 0);
-                const char* p = cstr(op.path);
-                if (!p) return die(Errc::invalid_policy, "landlock", 0);
+                const char* path = cstr(op.path);
+                if (!path) return die(Errc::invalid_policy, "landlock", 0);
 
-                long fd = sys(SYS_openat, AT_FDCWD, reinterpret_cast<long>(p),
+                long fd = sys(SYS_openat, AT_FDCWD, reinterpret_cast<long>(path),
                               O_PATH | O_CLOEXEC, 0);
                 if (fd < 0) {
                     // a grant for a path that does not exist is not an escape

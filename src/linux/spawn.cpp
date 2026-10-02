@@ -214,7 +214,7 @@ Result<Spawned> spawn_in(const Plan& plan, const Command& cmd, const cgroup::Gro
             // we must keep allowed (compile() ensures that).
             pid_t helper = -1;
             if (st && brokering) {
-                struct clone_args {
+                struct clone_args_inner {
                     std::uint64_t flags, pidfd, child_tid, parent_tid, exit_signal, stack,
                         stack_size, tls, set_tid, set_tid_size, cgroup;
                 } ca{};
