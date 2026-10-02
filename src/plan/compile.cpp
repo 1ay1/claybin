@@ -182,12 +182,24 @@ Result<Compiled> compile(const Policy<Sealed>& policy, const HostCapabilities& h
     auto degrade = [&](CapId c) { out.degraded.push_back(c); };
 
     // -- phase: namespaces -------------------------------------------------
+    //
+    // EVERY flag here is gated on a probed capability, including ipc. none of
+    // these namespaces is unprivileged on its own: without CAP_SYS_ADMIN the
+    // kernel only grants them when they are created TOGETHER with a user
+    // namespace. so on a host that denies unprivileged userns, an unshare()
+    // carrying any of them fails EPERM and takes the whole spawn with it.
+    //
+    // ipc used to be unconditional, which meant unshare_flags was never empty
+    // and the op was emitted even when every other flag had been correctly
+    // dropped -- turning "degrade to landlock+seccomp" into
+    // "spawn failed: unshare (errno 1)" on exactly the locked-down hosts
+    // claybin exists to serve.
     std::uint64_t unshare_flags = 0;
     if (host.user_namespaces) unshare_flags |= kCloneNewuser;
     if (host.mount_namespaces) unshare_flags |= kCloneNewns;
     if (host.pid_namespaces) unshare_flags |= kCloneNewpid;
     if (host.uts_namespaces) unshare_flags |= kCloneNewuts;
-    unshare_flags |= kCloneNewipc;
+    if (host.ipc_namespaces) unshare_flags |= kCloneNewipc;
 
     // a policy with no network authority gets an empty network namespace, which
     // is a stronger and cheaper guarantee than filtering socket syscalls.

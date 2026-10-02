@@ -177,6 +177,74 @@ int main() {
         CHECK(c->plan.has(OpCode::seccomp_install));
     }
 
+    // -- a host that denies unprivileged userns emits NO unshare ---------
+    //
+    // regression: ipc used to be OR'd in unconditionally, so unshare_flags was
+    // never empty and the op shipped even when every other namespace had been
+    // correctly dropped. none of these namespaces is unprivileged on its own --
+    // without CAP_SYS_ADMIN the kernel only grants them alongside a user
+    // namespace -- so that op failed EPERM and killed the spawn with
+    // "unshare (errno 1)" on exactly the locked-down hosts (Ubuntu 24.04's
+    // AppArmor profile, hardened work laptops) that claybin exists to serve.
+    {
+        HostCapabilities locked_down;
+        locked_down.user_namespaces = false;  // the uid_map write is denied
+        locked_down.mount_namespaces = false;
+        locked_down.pid_namespaces = false;
+        locked_down.net_namespaces = false;
+        locked_down.uts_namespaces = false;
+        locked_down.ipc_namespaces = false;
+        locked_down.seccomp = true;  // but these are UNPRIVILEGED
+        locked_down.landlock_abi = 10;
+        locked_down.no_new_privs = true;
+
+        auto pol = Policy<Draft>{}
+                       .read("/usr")
+                       .syscall_profile(profiles::base())
+                       .seal();
+        auto c = compile(pol, locked_down);
+        CHECK(c.has_value());
+
+        // the whole point: no namespace op at all, rather than one that fails.
+        CHECK(!c->plan.has(OpCode::unshare));
+
+        // and the walls that DO work on such a host still went in.
+        CHECK(c->plan.has(OpCode::landlock_enforce));
+        CHECK(c->plan.has(OpCode::no_new_privs));
+        CHECK(c->plan.has(OpCode::seccomp_install));
+        CHECK(c->plan.well_ordered());
+    }
+
+    // -- every namespace flag is gated on its own capability --------------
+    // a kernel that allows userns but genuinely lacks one other namespace must
+    // not have that flag smuggled into the mask.
+    {
+        HostCapabilities no_ipc = HostCapabilities::modern_linux();
+        no_ipc.ipc_namespaces = false;
+
+        auto pol = Policy<Draft>{}
+                       .read("/usr")
+                       .syscall_profile(profiles::base())
+                       .seal();
+        auto c = compile(pol, no_ipc);
+        CHECK(c.has_value());
+        // userns is still there, so an unshare op is still correct...
+        CHECK(c->plan.has(OpCode::unshare));
+        // ...but it must not carry CLONE_NEWIPC.
+        constexpr std::uint64_t kNewIpc = 0x08000000;
+        bool checked = false;
+        c->plan.for_each([&](OpCode code, std::span<const std::byte> payload) {
+            if (code == OpCode::unshare) {
+                UnshareOp op{};
+                Plan::decode(payload, op);
+                CHECK((op.flags & kNewIpc) == 0);
+                checked = true;
+            }
+            return true;
+        });
+        CHECK(checked);
+    }
+
     // -- hardened refuses to downgrade ------------------------------------
     {
         HostCapabilities weak;

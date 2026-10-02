@@ -26,6 +26,7 @@ struct HostCapabilities {
     bool pid_namespaces{false};
     bool net_namespaces{false};
     bool uts_namespaces{false};
+    bool ipc_namespaces{false};
     bool seccomp{false};
     bool seccomp_user_notif{false};
 
@@ -66,7 +67,7 @@ struct HostCapabilities {
     static HostCapabilities modern_linux() {
         HostCapabilities h;
         h.user_namespaces = h.mount_namespaces = h.pid_namespaces = true;
-        h.net_namespaces = h.uts_namespaces = true;
+        h.net_namespaces = h.uts_namespaces = h.ipc_namespaces = true;
         h.seccomp = h.seccomp_user_notif = true;
         h.cgroups = cgroup::Availability::delegated;
         h.cgroup_memory = h.cgroup_pids = true;

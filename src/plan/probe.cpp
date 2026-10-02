@@ -149,10 +149,23 @@ bool probe_kvm() {
 HostCapabilities probe_host() {
     HostCapabilities h;
     h.user_namespaces = probe_userns();
-    h.mount_namespaces = path_exists("/proc/self/ns/mnt");
-    h.pid_namespaces = path_exists("/proc/self/ns/pid");
-    h.net_namespaces = path_exists("/proc/self/ns/net");
-    h.uts_namespaces = path_exists("/proc/self/ns/uts");
+
+    // the OTHER namespaces are reported as "can i create one", not "does this
+    // kernel know the concept". path_exists("/proc/self/ns/mnt") answers the
+    // second question and is true on literally every linux, including the ones
+    // that refuse the unshare -- which is how a denied-userns host ended up
+    // with a plan full of namespace flags it could not use.
+    //
+    // none of these is unprivileged by itself. with a user namespace available
+    // they come for free, because the kernel grants them inside the new userns.
+    // without one they need CAP_SYS_ADMIN, so the honest answer for an
+    // unprivileged process is no.
+    const bool ns_creatable = h.user_namespaces || ::geteuid() == 0;
+    h.mount_namespaces = ns_creatable && path_exists("/proc/self/ns/mnt");
+    h.pid_namespaces = ns_creatable && path_exists("/proc/self/ns/pid");
+    h.net_namespaces = ns_creatable && path_exists("/proc/self/ns/net");
+    h.uts_namespaces = ns_creatable && path_exists("/proc/self/ns/uts");
+    h.ipc_namespaces = ns_creatable && path_exists("/proc/self/ns/ipc");
     h.seccomp = probe_seccomp();
     h.seccomp_user_notif = h.seccomp && probe_user_notif();
     h.kvm = probe_kvm();
