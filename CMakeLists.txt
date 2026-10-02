@@ -36,6 +36,16 @@ add_library(claybin STATIC
   src/bpf/emit.cpp
   src/plan/compile.cpp
   src/windows/compile.cpp
+  src/macos/compile.cpp
+  # These two are NOT linux-only despite their paths: each already ends in an
+  # `#else` branch of portable stubs (cgroup::probe() reporting "linux-only",
+  # probe_host() returning none()). Those branches had never been COMPILED,
+  # because the files sat in the Linux-only list while src/plan/compile.cpp --
+  # which calls cgroup::probe() and Group::release() -- is unconditional. So
+  # every non-linux build of the library linked with undefined symbols, which
+  # only stayed hidden while nothing off linux linked a test against it.
+  src/plan/probe.cpp
+  src/linux/cgroup.cpp
 )
 # POSIX-only implementations.
 #
@@ -52,10 +62,21 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
   target_sources(claybin PRIVATE
     src/broker/notify.cpp
     src/core/fd.cpp
-    src/plan/probe.cpp
     src/linux/apply.cpp
-    src/linux/spawn.cpp
-    src/linux/cgroup.cpp)
+    src/linux/spawn.cpp)
+endif()
+
+# The macOS apply path. Same split as linux: macos/compile.cpp is pure and
+# builds everywhere (its tests run in CI on a linux runner), while this file
+# calls sandbox_init/fork/setrlimit and only exists on a mac.
+#
+# src/core/fd.cpp is POSIX, not linux: the macOS spawn path needs OwnedFd too,
+# and leaving it in the linux-only list meant the Apple build linked without
+# it and failed on OwnedFd::reset.
+if(APPLE)
+  target_sources(claybin PRIVATE
+    src/core/fd.cpp
+    src/macos/spawn.cpp)
 endif()
 target_include_directories(claybin PUBLIC include)
 # GNU-style flags are GNU-ONLY. MSVC takes `/W4` and treats `-Wextra` as a
@@ -122,6 +143,13 @@ if(CLAYBIN_TESTS)
   claybin_test(mount_algebra_test)
   claybin_test(shapes_test)
   claybin_test(windows_backend_test)
+  # the macOS backend's translation. runs on EVERY host, not just a mac --
+  # compile() is pure, so a mistranslation is caught by the linux CI runner
+  # rather than by a user on a laptop.
+  claybin_test(macos_backend_test)
+  # the apply path, which can only be meaningful on a mac: it enters a real
+  # seatbelt sandbox and asserts the walls hold. skips itself elsewhere.
+  claybin_test(macos_live_check)
   claybin_test(compile_fuzz_test)
 
   # the syscall tables get an extra translation unit: it compiles the aarch64

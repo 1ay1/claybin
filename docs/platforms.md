@@ -21,13 +21,17 @@ front end changes.
 
 seccomp has no equivalent anywhere else.
 
-- **macOS** has no syscall filter available to unprivileged processes.
+- **macOS** has no syscall filter available to unprivileged processes. seatbelt
+  can filter some *operations* by name (`process-fork`, `process-exec`,
+  `sysctl-read`), which is a fixed menu of MAC hooks -- not a programmable
+  filter over syscall numbers and argument registers. claybin sets the ones a
+  policy implies and reports `partial` at best, never `strong`.
 - **windows** has Process Mitigation Policies, which are a fixed menu of
   hardening switches (no dynamic code, no child processes, binary signature
   requirements), not arbitrary syscall filtering.
 
-so `SyscallPolicy` compiles to nothing off linux and the report says
-`syscall.filter: none`. that is not a gap to be papered over later; it is a real
+so `SyscallPolicy` compiles to a handful of coarse operations off linux and the
+report says so. that is not a gap to be papered over later; it is a real
 difference in what the OS will do for you.
 
 ### the filesystem model differs, not just the API
@@ -58,20 +62,22 @@ that the ranking is per-capability, not per-OS.
 ## the matrix
 
 what a policy compiles to, per capability, on a modern host. the linux column is
-measured on this machine (landlock abi 10, cgroup v2 delegated); the windows
-column is what `src/windows/compile.cpp` reports and is unit-tested, though the
-apply step is not written yet.
+measured on this machine (landlock abi 10, cgroup v2 delegated); the macOS
+column is measured on darwin 24 (`tests/macos_live_check.cpp` enters the
+profile and asserts the walls hold); the windows column is what
+`src/windows/compile.cpp` reports and is unit-tested, though the apply step is
+not written yet.
 
 | capability | linux | windows | macOS |
 |---|---|---|---|
-| filesystem read/write | **strong** (landlock + mount ns) | partial (AppContainer/DACL) | strong (seatbelt) |
-| filesystem exec | **strong** | partial | strong |
-| network isolation | **strong** (netns) | **strong** (no net capability) | partial (seatbelt) |
-| process isolation | **strong** (user+pid ns) | **strong** (AppContainer) | partial |
+| filesystem read/write | **strong** (landlock + mount ns) | partial (AppContainer/DACL) | **strong** (seatbelt) |
+| filesystem exec | **strong** | partial | **strong** (seatbelt) |
+| network isolation | **strong** (netns) | **strong** (no net capability) | **strong** *denying*, partial *allow-listing* |
+| process isolation | **strong** (user+pid ns) | **strong** (AppContainer) | partial (inherited profile, shared pid space) |
 | syscall filter | **strong** (seccomp) | partial (mitigations) | **none** |
 | memory limit | **strong** (cgroup2) | **strong** (job object) | partial (rlimit) |
-| pid limit | **strong** (cgroup2) | **strong** (job object) | partial (rlimit) |
-| cpu limit | strong *if the cpu controller is delegated* | **strong** (job cpu rate, win8+) | partial |
+| pid limit | **strong** (cgroup2) | **strong** (job object) | **advisory** (RLIMIT_NPROC is per-UID) |
+| cpu limit | strong *if the cpu controller is delegated* | **strong** (job cpu rate, win8+) | partial (rlimit) |
 | privilege drop | **strong** | **strong** (restricted token) | partial |
 | device isolation | **strong** (/dev allowlist) | partial (object namespace) | partial |
 | host kernel isolation | **none** | **none** | **none** |
@@ -79,7 +85,7 @@ apply step is not written yet.
 that last row is `none` everywhere for the process backend, by definition. only
 a microvm backend changes it.
 
-two entries deserve a note because they surprised me:
+four entries deserve a note because they surprised me:
 
 - **windows job objects are genuinely as strong as cgroup v2** for memory, pids
   and cpu. windows is the *better* platform on that axis, which is a good
@@ -88,6 +94,16 @@ two entries deserve a note because they surprised me:
   not delegate the `cpu` controller to user sessions even when they delegate
   `memory` and `pids`. claybin reports `none` with that exact reason rather than
   pretending a quota was applied.
+- **macOS network isolation is two different answers, not one.** `(deny
+  network*)` is a single rule the kernel enforces exactly, so denying the
+  network outright is genuinely `strong` -- equal to an empty netns in what the
+  guest can reach. an endpoint *allow-list* is `partial`, because seatbelt
+  matches on the address and the name-to-address step happens in userspace
+  where DNS can answer differently next time.
+- **macOS pid limits are `advisory`, not `partial`.** RLIMIT_NPROC counts
+  processes for the whole UID rather than for this process tree, so another
+  terminal window moves the limit. that is not a boundary, and calling it
+  `partial` would have overstated it.
 
 ## what "no syscall filter" costs
 
@@ -103,9 +119,10 @@ allow-list. so a program that needs "everything except these twelve syscalls"
 is simply not expressible there.
 
 the consequence for callers is concrete: `compile()` **refuses**
-`Isolation::hardened_process` on windows, because hardened means every wall and
-one of them does not exist. that refusal is the feature. a library that returned
-a weaker sandbox and let the caller find out later would be worse than useless.
+`Isolation::hardened_process` on both windows and macOS, because hardened means
+every wall and one of them does not exist. that refusal is the feature. a
+library that returned a weaker sandbox and let the caller find out later would
+be worse than useless.
 
 ## so is it "easily cross-platform"?
 
@@ -131,12 +148,78 @@ beyond that is a per-platform decision the caller has to make explicitly.
 ## order of work
 
 1. **linux first, properly.** it is the only platform where all the walls exist,
-   so it is the only place the design can be validated end to end.
+   so it is the only place the design can be validated end to end. *done.*
 2. **windows second.** job objects and AppContainer are well documented and the
    model is genuinely strong; the filesystem translation is the real work.
+   *compile step done and unit-tested; apply step not written.*
 3. **macOS third.** seatbelt is deprecated-but-universal (chrome still uses it),
    undocumented, and the App Sandbox alternative needs entitlements and code
-   signing, which rules out sandboxing arbitrary binaries.
+   signing, which rules out sandboxing arbitrary binaries. *done: compile step
+   in `src/macos/compile.cpp`, apply step in `src/macos/spawn.cpp`.*
 
 the backends are independent, so this order is a scheduling choice, not a
 dependency chain.
+
+## notes from writing the macOS backend
+
+things that cost real time, recorded so the next person does not pay twice.
+
+### SBPL is last-match-wins
+
+landlock rules only ever *subtract*: a ruleset is a ceiling and order is
+irrelevant. SBPL is the opposite -- rules are evaluated top to bottom and the
+LAST match decides. so `(deny file-write* (subpath "/etc"))` placed *before*
+`(allow file-write* (subpath "/"))` does nothing at all.
+
+`emit order` in `compile.cpp` is therefore fixed and commented: version,
+deny-default, prerequisites, grants shallow-to-deep, then denials. a grant that
+carves a hole inside a wider grant has to come after it or the hole is dead.
+
+### the root directory grant
+
+a profile that grants `/usr`, `/System` and `/bin` but not `/` itself makes
+every dynamically linked binary die with **SIGABRT before main()**, and the
+kernel's error message names a line in its own SBPL prelude:
+
+```
+syntax error: expecting ')'
+sbpl1:108:4: (defined? 'APFSIOC_GET_GRAFT_INFO)
+```
+
+which points at the profile's *syntax* and not at the missing grant, so it reads
+as "claybin emitted bad SBPL". it did not. dyld stats `/` during startup and the
+fix is one line:
+
+```
+(allow file-read* (literal "/"))
+```
+
+`literal`, emphatically not `subpath` -- `(subpath "/")` grants read on the
+entire filesystem and silently turns every profile into an open door.
+
+### the coarse file-write\*
+
+landlock has thirteen separate filesystem bits; seatbelt has one `file-write*`
+covering create, unlink, rename, truncate and chmod together. there is no way to
+say "may create files here but not delete them".
+
+the fold is therefore conservative in the one direction that matters: a coarse
+operation is emitted only when the policy granted EVERY fine-grained right it
+implies. a create-only grant degrades to read-only and the report says
+`fs_write: partial`, rather than quietly handing out `unlink`.
+
+### a unix socket is not "the network"
+
+`unix_sockets()` sets a blanket `NetOps` bit. reading any blanket bit as "allow
+all IP" would turn a policy asking for a local socket into one with full
+internet access. the backend splits them, and `macos_backend_test` has a case
+pinning it, because it is the most dangerous single mistranslation in the file.
+
+### descriptors go up before the wall does
+
+the fd shuffle happens *before* `sandbox_init`, which looks backwards. two
+reasons: doing it after requires the profile to permit `open("/dev/null")` and
+`dup2`, and -- more importantly -- the kernel writes its own rejection message
+to stderr when a profile is refused. with stderr not yet redirected, that
+message lands on the caller's terminal instead of in the pipe they supplied for
+exactly this purpose.
