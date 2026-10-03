@@ -421,13 +421,13 @@ Result<Compiled> compile(const Policy<Sealed>& policy, const HostCapabilities& h
                         // fork in a path that avoids snprintf for consistency
                         // with the rest of the compiler.
                         char digits[24];
-                        std::size_t d = 0;
+                        std::size_t nd = 0;
                         std::uint64_t v = m.size;
                         while (v) {
-                            digits[d++] = static_cast<char>('0' + (v % 10));
+                            digits[nd++] = static_cast<char>('0' + (v % 10));
                             v /= 10;
                         }
-                        while (d) opts[n++] = digits[--d];
+                        while (nd) opts[n++] = digits[--nd];
                         opts[n] = '\0';
                     }
                     b.op(OpCode::mount, MountOp{b.intern("tmpfs"), b.intern(dst),
@@ -650,7 +650,7 @@ Result<Compiled> compile(const Policy<Sealed>& policy, const HostCapabilities& h
                     b.op(OpCode::write_fd_content,
                          WriteFdContentOp{b.intern(dst),
                                           static_cast<std::int32_t>(m.content_fd),
-                                          m.perms ? m.perms : 0644u, flags});
+                                          m.perms ? m.perms : 0644u, flags, 0});
                     break;
                 }
 
@@ -1064,8 +1064,8 @@ Result<Compiled> compile(const Policy<Sealed>& policy, const HostCapabilities& h
         // does the policy delegate anything to a supervisor? if so the kernel
         // has to hand us a listener fd, which is a different install call.
         bool wants_notify = sys.default_action() == SysAction::notify;
-        for (const auto& r : sys.rules())
-            if (r.action == SysAction::notify) wants_notify = true;
+        for (const auto& rule : sys.rules())
+            if (rule.action == SysAction::notify) wants_notify = true;
 
         if (wants_notify && !host.seccomp_user_notif)
             return std::unexpected(Error{
