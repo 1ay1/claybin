@@ -46,7 +46,7 @@ int main() {
         // syscalls landlock setup needs.
         PlanBuilder b;
         b.op(OpCode::seccomp_install, SeccompInstallOp{Ref{0, 0}, 0, 0});
-        b.op(OpCode::landlock_enforce, LandlockEnforceOp{0, 0, 1, 0});
+        b.op(OpCode::landlock_enforce, LandlockEnforceOp{0, 0, 1, 0, 0});
         auto plan = std::move(b).build();
         CHECK(!plan.has_value());
         CHECK(plan.error().code == Errc::invalid_policy);
@@ -56,7 +56,7 @@ int main() {
         // subtle: landlock_restrict_self returns a bare EPERM when nnp is
         // unset, which surfaces much later as EACCES from execve.
         PlanBuilder b;
-        b.op(OpCode::landlock_enforce, LandlockEnforceOp{0, 0, 1, 0});
+        b.op(OpCode::landlock_enforce, LandlockEnforceOp{0, 0, 1, 0, 0});
         b.op(OpCode::no_new_privs, NoNewPrivsOp{0});
         auto plan = std::move(b).build();
         CHECK(!plan.has_value());
@@ -67,7 +67,7 @@ int main() {
         b.op(OpCode::unshare, UnshareOp{0});
         b.op(OpCode::chdir, ChdirOp{b.intern("/")});
         b.op(OpCode::no_new_privs, NoNewPrivsOp{0});
-        b.op(OpCode::landlock_enforce, LandlockEnforceOp{0, 0, 1, 0});
+        b.op(OpCode::landlock_enforce, LandlockEnforceOp{0, 0, 1, 0, 0});
         b.op(OpCode::seccomp_install, SeccompInstallOp{Ref{0, 0}, 0, 0});
         auto plan = std::move(b).build();
         CHECK(plan.has_value());

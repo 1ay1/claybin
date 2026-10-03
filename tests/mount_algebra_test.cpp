@@ -27,10 +27,18 @@ constexpr std::size_t kPathCount = sizeof(kPaths) / sizeof(kPaths[0]);
 
 // would the constructed TREE make `p` reachable at all? a path is visible only
 // if some mount covers it -- that is the mount model's whole claim.
+//
+// the switch names EVERY MountKind on purpose, with no default. this function
+// is the soundness oracle: a kind that falls through silently reads as "not
+// visible", so the oracle would quietly stop checking the very mount type
+// someone just added. -Wswitch turning that into a build error is the point.
+// (seven kinds were falling through before this -- mask, file, bind_data,
+// bind_data_ro and the three overlays -- all of which DO make a path visible.)
 bool visible_in_tree(const MountPlan& plan, std::string_view p) {
     std::string norm = path::normalize(p);
     for (const auto& m : plan.mounts()) {
         switch (m.kind) {
+            // content at `dest`: the guest can name it and read something.
             case MountKind::bind:
             case MountKind::bind_ro:
             case MountKind::bind_dev:
@@ -38,6 +46,21 @@ bool visible_in_tree(const MountPlan& plan, std::string_view p) {
             case MountKind::proc:
             case MountKind::devtmpfs:
             case MountKind::mqueue:
+            // data written from the plan itself, and overlays: all of these
+            // put a real, nameable object at `dest` too.
+            case MountKind::file:
+            case MountKind::bind_data:
+            case MountKind::bind_data_ro:
+            case MountKind::overlay:
+            case MountKind::ro_overlay:
+            case MountKind::tmp_overlay:
+            // mask is VISIBLE, and this is the subtle one. it does not deny the
+            // path -- landlock cannot express a deny under a grant at all -- it
+            // replaces it with an empty tmpfs or an empty file. so the guest can
+            // still name it and gets emptiness, which is reachable-but-useless,
+            // not unreachable. treating it as invisible would let the oracle
+            // pass a plan that leaks a path it believed was gone.
+            case MountKind::mask:
                 if (path::covers(path::normalize(m.dest), norm)) return true;
                 break;
             case MountKind::symlink:

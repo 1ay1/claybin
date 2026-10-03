@@ -158,8 +158,11 @@ int main(int argc, char** argv) {
     }
 
     // the flatpak-shaped invocation, as claybin spells it. compare:
-    //   bwrap --unshare-all --ro-bind /usr /usr --symlink usr/lib /lib \
+    //   bwrap --unshare-all --ro-bind /usr /usr --symlink usr/lib /lib
     //         --proc /proc --dev /dev --tmpfs /tmp --chdir / -- CMD
+    // (the trailing backslashes are gone on purpose: a `\` at the end of a
+    // // comment splices the next line into it, which -Wcomment flags and
+    // which would silently swallow a real line of code one edit from now.)
     //
     // note the test binary is bound at /app, NOT at its host path: binding it
     // at /home/.../build would recreate /home inside the sandbox and make the
@@ -276,7 +279,14 @@ int main(int argc, char** argv) {
 
             // the trap: a symlink inside the directory that gets bound in,
             // pointing back out at the victim.
-            char link[256];
+            //
+            // sized from `evil` + the longest suffix rather than a bare 256:
+            // snprintf into char[256] from a char[256] source cannot be proven
+            // non-truncating, and a SILENTLY truncated path here would make the
+            // escape attempt target the wrong file -- an attack test that
+            // passes because it stopped attacking is the worst failure mode
+            // this suite has.
+            char link[sizeof(evil) + 8];
             std::snprintf(link, sizeof link, "%s/out", evil);
             CHECK_EQ(::symlink(victim, link), 0);
 

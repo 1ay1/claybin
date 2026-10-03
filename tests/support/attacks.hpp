@@ -91,7 +91,11 @@ inline int proc_root_escape() {
     int result = kBlocked;
     while (struct dirent* e = ::readdir(d)) {
         if (e->d_name[0] < '1' || e->d_name[0] > '9') continue;
-        char path[256];
+        // sized so the format CANNOT truncate: d_name is up to 255 bytes and
+        // the literals add 22, so char[256] was provably too small. a silently
+        // truncated path would stat the wrong thing and report kBlocked -- an
+        // escape probe that passes because it stopped probing.
+        char path[sizeof(e->d_name) + 32];
         std::snprintf(path, sizeof path, "/proc/%s/root/etc/passwd", e->d_name);
         if (read_path(path) == kEscaped) {
             result = kEscaped;
