@@ -101,6 +101,38 @@ Result<Spawned> spawn_in(const Plan& plan, const Command& cmd, const cgroup::Gro
         // every path out of this block is an _exit(). returning would unwind
         // into the caller's stack frame with a half-built sandbox in place,
         // which is the one outcome worse than failing to start.
+
+        // FIRST: drop every signal handler the caller installed.
+        //
+        // fork copies them, and the shepherd below never execs -- it becomes
+        // pid 1 of the new pid namespace and sits in waitpid() for the
+        // guest's lifetime. So without this it runs the EMBEDDER's handlers:
+        // agentty installs a crash handler that writes a report, and a test
+        // binary installs one that prints "test case CRASHED". Both then fire
+        // from inside the sandbox, on a process the embedder does not know
+        // exists, and the report names the wrong process.
+        //
+        // It is worse than noise for pid 1 of a namespace. The kernel skips
+        // default-action signals for pid 1 but DELIVERS ones that have a
+        // handler, so an inherited handler turns "SIGTERM kills the shepherd"
+        // into "SIGTERM runs someone else's code and the shepherd survives".
+        // Found as an intermittent SIGTERM apparently crashing a test that
+        // had already passed.
+        //
+        // Async-signal-safe: sigaction/sigprocmask only, no allocation.
+        {
+            struct sigaction dfl{};
+            dfl.sa_handler = SIG_DFL;
+            sigemptyset(&dfl.sa_mask);
+            for (int s = 1; s < NSIG; ++s) {
+                if (s == SIGKILL || s == SIGSTOP) continue;   // cannot be set
+                ::sigaction(s, &dfl, nullptr);
+            }
+            sigset_t none;
+            sigemptyset(&none);
+            ::sigprocmask(SIG_SETMASK, &none, nullptr);   // and unblock them
+        }
+
         ::close(report[0]);
         if (use_cgroup) ::close(gate[1]);
 
