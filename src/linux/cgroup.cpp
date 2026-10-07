@@ -394,6 +394,23 @@ Status Group::attach(int pid) const {
     return {};
 }
 
+Status Group::kill() const {
+    if (fd_ < 0) return std::unexpected(Error{Errc::invalid_policy, "cgroup: no group"});
+    int fd = ::openat(fd_, "cgroup.kill", O_WRONLY | O_CLOEXEC);
+    if (fd < 0)
+        return std::unexpected(Error{Errc::unsupported, "cgroup: no cgroup.kill", errno});
+    ssize_t w = ::write(fd, "1", 1);
+    int err = errno;
+    ::close(fd);
+    if (w < 0) return std::unexpected(Error{Errc::io_error, "cgroup: kill", err});
+    return {};
+}
+
+bool Group::kill_supported() const {
+    if (fd_ < 0) return false;
+    return ::faccessat(fd_, "cgroup.kill", W_OK, 0) == 0;
+}
+
 void Group::release() {
     if (fd_ >= 0) {
         ::close(fd_);
@@ -423,6 +440,10 @@ Result<Group> create(const Probe& p, const ResourceLimits&, std::string_view) {
 Status Group::attach(int) const {
     return std::unexpected(Error{Errc::unsupported, "cgroups are linux-only"});
 }
+Status Group::kill() const {
+    return std::unexpected(Error{Errc::unsupported, "cgroups are linux-only"});
+}
+bool Group::kill_supported() const { return false; }
 void Group::release() {}
 }  // namespace clay::cgroup
 

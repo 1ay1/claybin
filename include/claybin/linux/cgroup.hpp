@@ -110,6 +110,21 @@ class Group {
     // keeps the post-fork child path free of sysfs work.
     Status attach(int pid) const;
 
+    // SIGKILL every process in this cgroup and all of its descendants, in one
+    // atomic kernel operation.
+    //
+    // this is the only reliable way to stop a sandboxed tree. killing the
+    // process GROUP misses anything that called setsid(), and walking
+    // cgroup.procs races a child that forks faster than the walk. cgroup.kill
+    // has neither problem -- the kernel freezes the subtree and kills all of
+    // it. needs linux 5.14+; on older kernels the file is absent and this
+    // fails, so the caller keeps its process-group fallback.
+    Status kill() const;
+
+    // whether kill() can work here, so a caller can choose its strategy once
+    // instead of discovering it mid-timeout.
+    bool kill_supported() const;
+
   private:
     void release();
     friend Result<Group> create(const Probe&, const ResourceLimits&, std::string_view);
