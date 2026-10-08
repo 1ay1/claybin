@@ -2,6 +2,7 @@
 
 #if defined(__linux__)
 
+#include <string_view>
 #include <cerrno>
 #include <csignal>
 #include <cstring>
@@ -25,6 +26,114 @@ namespace clay {
 Result<Spawned> spawn(const Plan& plan, const Command& cmd) {
     return spawn_in(plan, cmd, cgroup::Group{});
 }
+
+namespace {
+
+// Error::mechanism is a string_view onto a static string. A failure reported
+// by the child arrives as bytes in a buffer, so map it back to the literal it
+// was made from (every mechanism claybin names is one). Unknown bytes give a
+// generic name rather than a view into a buffer that is about to go away.
+std::string_view static_mechanism(const char* got) noexcept {
+    static constexpr std::string_view kNames[] = {
+        "bind_target",
+        "bind_target: mkdir",
+        "bind_target: mkdir (confined)",
+        "bind_target: touch",
+        "broker: NOTIF_ADDFD",
+        "broker: NOTIF_RECV",
+        "broker: NOTIF_SEND",
+        "broker: linux only",
+        "broker: no fd",
+        "broker: no fd to inject",
+        "broker: notification expired",
+        "cgroup: attach",
+        "cgroup: kill",
+        "cgroup: mkdir",
+        "cgroup: no cgroup.kill",
+        "cgroup: no group",
+        "cgroup: open",
+        "cgroup: open dir",
+        "cgroup: open procs",
+        "cgroup: write",
+        "cgroups are linux-only",
+        "chdir",
+        "close_range",
+        "die_with_parent",
+        "drop_caps",
+        "dup2",
+        "fork",
+        "hardened: landlock",
+        "hardened: seccomp",
+        "hardened: user namespaces",
+        "id_map",
+        "landlock",
+        "landlock: no ruleset",
+        "landlock: rule before enforce",
+        "landlock_add_rule",
+        "landlock_net",
+        "landlock_net: no ruleset",
+        "landlock_net_rule",
+        "landlock_restrict_self",
+        "macos-spawn",
+        "microvm backend not implemented",
+        "mkdir",
+        "mkdir (confined)",
+        "mount",
+        "no_new_privs",
+        "pipe2 gate",
+        "pipe2 relay",
+        "pivot2",
+        "pivot2: chdir /",
+        "pivot2: chdir newroot",
+        "pivot2: fchdir",
+        "pivot2: open /",
+        "pivot2: pivot_root",
+        "pivot2: umount oldroot",
+        "pivot_root",
+        "pivot_root: chdir",
+        "pivot_root: chdir /",
+        "plan::apply: linux only",
+        "remount_rec",
+        "seccomp",
+        "seccomp: arg rule too large",
+        "seccomp: empty program",
+        "seccomp: new_listener",
+        "seccomp: program too large",
+        "seccomp: unknown audit arch",
+        "setgid",
+        "sethostname",
+        "setids",
+        "setrlimit",
+        "setuid",
+        "socketpair",
+        "spawn: linux only",
+        "spawn: no program",
+        "spawn: plan not well ordered",
+        "symlink",
+        "symlink (confined)",
+        "touch",
+        "umount",
+        "unknown opcode",
+        "unshare",
+        "write_fd",
+        "write_fd: bind",
+        "write_fd: bind target",
+        "write_fd: open dest",
+        "write_fd: open dest (confined)",
+        "write_fd: read",
+        "write_fd: remount ro",
+        "write_fd: root",
+        "write_fd: touch",
+        "write_fd: write",
+        "write_file",
+    };
+    const std::string_view g{got};
+    for (auto n : kNames)
+        if (n == g) return n;
+    return "child setup";
+}
+
+}  // namespace
 
 Result<Spawned> spawn_in(const Plan& plan, const Command& cmd, const cgroup::Group& cg) {
     if (!cmd.program || !cmd.argv)
@@ -486,10 +595,9 @@ Result<Spawned> spawn_in(const Plan& plan, const Command& cmd, const cgroup::Gro
         ::waitpid(static_cast<pid_t>(pid), &status, 0);
         if (pidfd >= 0) ::close(pidfd);
         f.mech[sizeof(f.mech) - 1] = '\0';
-        static thread_local char mech_copy[32];
-        for (std::size_t i = 0; i < sizeof mech_copy; ++i) mech_copy[i] = f.mech[i];
         return std::unexpected(Error{f.stage == 0 ? static_cast<Errc>(f.code) : Errc::spawn_failed,
-                                     f.stage == 0 ? mech_copy : "execve", f.sys_errno});
+                                     f.stage == 0 ? static_mechanism(f.mech) : "execve",
+                                     f.sys_errno});
     }
 
     return Spawned{static_cast<int>(pid), pidfd, -1};
