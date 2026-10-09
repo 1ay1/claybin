@@ -34,41 +34,6 @@
 
 namespace clay {
 
-// which fd kReportFdSentinel stands for. a file-scope global rather than a
-// parameter because apply() is called from the post-fork path where we cannot
-// allocate and do not want to thread state through every op.
-static std::uint32_t g_report_fd = 0xffffffffu;
-
-void Plan::set_report_fd(int fd) { g_report_fd = static_cast<std::uint32_t>(fd); }
-
-// the broker relay pipe, spared by the same mechanism as the report socket.
-static std::uint32_t g_relay_fd = 0xffffffffu;
-void Plan::set_relay_fd(int fd) { g_relay_fd = static_cast<std::uint32_t>(fd); }
-static std::uint32_t g_relay_fd2 = 0xffffffffu;
-void Plan::set_relay_fd2(int fd) { g_relay_fd2 = static_cast<std::uint32_t>(fd); }
-
-// descriptors the caller asked to carry into the guest. same mechanism as the
-// pipes above, but a small array: the plan is compiled before the caller's fd
-// numbers exist, so the ops carry sentinels and these slots are filled in just
-// before apply() runs.
-static std::uint32_t g_preserved_fds[kMaxPreservedFds] = {
-    0xffffffffu, 0xffffffffu, 0xffffffffu, 0xffffffffu,
-    0xffffffffu, 0xffffffffu, 0xffffffffu, 0xffffffffu,
-};
-void Plan::set_preserved_fd(unsigned slot, int fd) {
-    if (slot < kMaxPreservedFds) g_preserved_fds[slot] = static_cast<std::uint32_t>(fd);
-}
-
-// the seccomp listener fd, when the policy asked for one. set by apply() in the
-// child and read by spawn(), which sends it to the supervisor over the report
-// pipe -- by the time seccomp is installed there is no other channel left open.
-static int g_notify_fd = -1;
-
-int Plan::take_notify_fd() {
-    int f = g_notify_fd;
-    g_notify_fd = -1;
-    return f;
-}
 
 namespace {
 
@@ -647,7 +612,7 @@ bool remount_tree(const char* target, std::uint64_t add, char* buf, std::size_t 
 
 }  // namespace
 
-Status Plan::apply_range(Phase first, Phase last) const {
+Status Plan::apply_range(Phase first, Phase last, ApplyFds& fds) const {
     // capture our identity BEFORE anything runs. once unshare(CLONE_NEWUSER)
     // succeeds we are in a namespace with no map yet, so getuid() returns the
     // overflow uid (65534) rather than who we actually are -- and writing that
@@ -968,9 +933,9 @@ Status Plan::apply_range(Phase first, Phase last) const {
                 const std::uint64_t add = op.add_flags & ~kOptional;
 
                 // a generous buffer: mountinfo on a desktop is a few KB, and we
-                // cannot allocate here. if it does not fit we are better off
-                // failing than silently locking down only the mounts we saw.
-                static char mi[64 * 1024];
+                // cannot allocate here, so it is on the stack. if it does not
+                // fit we fail rather than lock down only the mounts we saw.
+                char mi[64 * 1024];
                 if (!remount_tree(tgt, add, mi, sizeof mi)) {
                     if (!optional) return die(Errc::permission_denied, "remount_rec", errno);
                 }
@@ -1197,12 +1162,12 @@ Status Plan::apply_range(Phase first, Phase last) const {
                 if (ll_fd >= 0) keep[nkeep++] = static_cast<std::uint32_t>(ll_fd);
                 for (std::uint32_t k = 0; k < op.keep_count && nkeep < 32; ++k) {
                     std::uint32_t want = op.keep[k];
-                    if (want == kReportFdSentinel) want = g_report_fd;
-                    else if (want == kRelayFdSentinel) want = g_relay_fd;
-                    else if (want == kRelayFd2Sentinel) want = g_relay_fd2;
+                    if (want == kReportFdSentinel) want = fds.report;
+                    else if (want == kRelayFdSentinel) want = fds.relay;
+                    else if (want == kRelayFd2Sentinel) want = fds.relay2;
                     else if (want >= kPreservedFdSentinelBase &&
                              want < kPreservedFdSentinelBase + kMaxPreservedFds)
-                        want = g_preserved_fds[want - kPreservedFdSentinelBase];
+                        want = fds.preserved[want - kPreservedFdSentinelBase];
                     if (want != 0xffffffffu) keep[nkeep++] = want;
                 }
                 // insertion sort; nkeep is tiny and this needs no allocation.
@@ -1393,7 +1358,7 @@ Status Plan::apply_range(Phase first, Phase last) const {
                                    reinterpret_cast<long>(&prog));
                     if (lfd < 0)
                         return die(Errc::permission_denied, "seccomp: new_listener", errno);
-                    g_notify_fd = static_cast<int>(lfd);
+                    fds.notify_fd = static_cast<int>(lfd);
                     return true;
                 }
 
@@ -1421,7 +1386,7 @@ Status Plan::apply_range(Phase first, Phase last) const {
 
 namespace clay {
 
-Status Plan::apply_range(Phase, Phase) const {
+Status Plan::apply_range(Phase, Phase, ApplyFds&) const {
     return std::unexpected(Error{Errc::unsupported, "plan::apply: linux only"});
 }
 

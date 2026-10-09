@@ -6,6 +6,7 @@
 #include <cerrno>
 #include <csignal>
 #include <cstring>
+#include <utility>
 #include <fcntl.h>
 #include <sched.h>
 #include <sys/prctl.h>
@@ -248,11 +249,12 @@ Result<Spawned> spawn_in(const Plan& plan, const Command& cmd, const cgroup::Gro
         // tell the plan which fds to spare when it closes inherited descriptors.
         // without this the close takes our own failure channel with it, and every
         // later error reaches the parent as a bare exit code.
-        Plan::set_report_fd(report[1]);
+        ApplyFds afds;
+        afds.report = static_cast<std::uint32_t>(report[1]);
         // and the broker relay, which the guest writes its listener fd number to
         // AFTER the privdrop phase that does the closing.
-        if (brokering) Plan::set_relay_fd(relay[1]);
-        if (brokering) Plan::set_relay_fd2(relay[0]);
+        if (brokering) afds.relay  = static_cast<std::uint32_t>(relay[1]);
+        if (brokering) afds.relay2 = static_cast<std::uint32_t>(relay[0]);
         // and the caller's own descriptors -- the pipe an embedder is polling,
         // typically. these are registered as the PARENT-side numbers, because
         // that is what exists right now; the dup2 onto the child-side numbers
@@ -261,7 +263,7 @@ Result<Spawned> spawn_in(const Plan& plan, const Command& cmd, const cgroup::Gro
             unsigned slot = 0;
             auto reserve = [&](int fd) {
                 if (fd < 0 || slot >= kMaxPreservedFds) return;
-                Plan::set_preserved_fd(slot++, fd);
+                afds.preserved[slot++] = static_cast<std::uint32_t>(fd);
             };
             reserve(cmd.stdin_fd);
             reserve(cmd.stdout_fd);
@@ -296,7 +298,7 @@ Result<Spawned> spawn_in(const Plan& plan, const Command& cmd, const cgroup::Gro
         // apply_until() runs the namespace phase, we fork, then the grandchild
         // runs the rest -- mounts included -- as a real member of the new pid
         // namespace, and as its pid 1.
-        auto st = plan.apply_until(Phase::mounts);
+        auto st = plan.apply_until(Phase::mounts, afds);
         if (st) {
             pid_t inner = ::fork();
             if (inner < 0) {
@@ -334,7 +336,7 @@ Result<Spawned> spawn_in(const Plan& plan, const Command& cmd, const cgroup::Gro
             // i.e. the supervisor's existing authority over its own child, rather
             // than a new capability crossing a boundary. spawn() therefore
             // reports the fd NUMBER, and the parent pulls the descriptor across.
-            st = plan.apply_range(Phase::mounts, Phase::seccomp);
+            st = plan.apply_range(Phase::mounts, Phase::seccomp, afds);
 
             // BROKER HANDOFF, following the approach crun landed after hitting
             // this exact deadlock (scrivano.org/posts/2022-09-05-seccomp-listener).
@@ -397,10 +399,10 @@ Result<Spawned> spawn_in(const Plan& plan, const Command& cmd, const cgroup::Gro
 
             // NOW install the filter. the helper is already running and shares
             // our fd table, so whatever number we get is a number it can use.
-            if (st) st = plan.apply_from(Phase::seccomp);
+            if (st) st = plan.apply_from(Phase::seccomp, afds);
 
             if (brokering && helper > 0) {
-                int nfd = Plan::take_notify_fd();
+                int nfd = std::exchange(afds.notify_fd, -1);
                 ssize_t w = ::write(relay[1], &nfd, sizeof nfd);
                 (void)w;
                 // wait for the helper to finish sending, so the descriptor is in
@@ -413,7 +415,7 @@ Result<Spawned> spawn_in(const Plan& plan, const Command& cmd, const cgroup::Gro
             // pidfd_getfd. the descriptor itself cannot cross the boundary (see
             // the note above), but its number is just an integer.
             if (st) {
-                int nfd = Plan::take_notify_fd();
+                int nfd = std::exchange(afds.notify_fd, -1);
                 if (nfd >= 0) {
                     struct Handshake {
                         int stage;

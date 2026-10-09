@@ -301,6 +301,21 @@ inline constexpr std::uint32_t kRelayFd2Sentinel = 0xfffffffcu;
 // exec, which presents as a command that produces no output at all.
 inline constexpr std::uint32_t kPreservedFdSentinelBase = 0xfffffff0u;
 inline constexpr std::uint32_t kMaxPreservedFds = 8;
+
+// The descriptors a plan's sentinels stand for, filled in by spawn() in the
+// child just before apply(): the pipes do not exist when the plan is compiled.
+// apply() writes notify_fd back when the policy asked for a seccomp listener.
+struct ApplyFds {
+    std::uint32_t report = 0xffffffffu;   // kReportFdSentinel
+    std::uint32_t relay  = 0xffffffffu;   // kRelayFdSentinel
+    std::uint32_t relay2 = 0xffffffffu;   // kRelayFd2Sentinel
+    // slot N is kPreservedFdSentinelBase + N.
+    std::uint32_t preserved[kMaxPreservedFds] = {
+        0xffffffffu, 0xffffffffu, 0xffffffffu, 0xffffffffu,
+        0xffffffffu, 0xffffffffu, 0xffffffffu, 0xffffffffu,
+    };
+    int notify_fd = -1;
+};
 struct SetHostnameOp {
     Ref name;
 };
@@ -447,32 +462,20 @@ class Plan {
     // apply the plan in the current process. POST-FORK ONLY: async-signal-safe,
     // allocation-free, and it must not be called on a process you want to keep.
     // defined in src/linux/apply.cpp; other platforms get a stub that refuses.
-    Status apply() const { return apply_range(Phase::namespaces, Phase::count_); }
+    Status apply(ApplyFds& fds) const { return apply_range(Phase::namespaces, Phase::count_, fds); }
 
     // apply only the ops strictly before `stop`. needed because entering a pid
     // namespace requires a fork between the namespace phase and the mount
     // phase: unshare(CLONE_NEWPID) makes our CHILDREN members, not us, and
     // mounting procfs requires membership.
-    Status apply_until(Phase stop) const { return apply_range(Phase::namespaces, stop); }
+    Status apply_until(Phase stop, ApplyFds& fds) const {
+        return apply_range(Phase::namespaces, stop, fds);
+    }
 
     // apply the ops from `start` onward.
-    Status apply_from(Phase start) const { return apply_range(start, Phase::count_); }
+    Status apply_from(Phase start, ApplyFds& fds) const { return apply_range(start, Phase::count_, fds); }
 
-    Status apply_range(Phase first, Phase last) const;
-
-    // tell apply() which fd the kReportFdSentinel slot stands for. set by
-    // spawn() in the child, before apply, because the pipe does not exist when
-    // the plan is compiled.
-    static void set_report_fd(int fd);
-    static void set_relay_fd(int fd);
-    static void set_relay_fd2(int fd);
-    // slot N corresponds to kPreservedFdSentinelBase + N in the plan. set by
-    // spawn() from Command's fd list before apply() runs.
-    static void set_preserved_fd(unsigned slot, int fd);
-
-    // take the seccomp listener fd, if the policy asked for one. valid only in
-    // the child, immediately after apply(); spawn() passes it to the supervisor.
-    static int take_notify_fd();
+    Status apply_range(Phase first, Phase last, ApplyFds& fds) const;
 
   private:
     friend class PlanBuilder;
