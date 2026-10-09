@@ -71,6 +71,8 @@ constexpr Named kExpected[] = {
     {"uname", SYS_uname},
     {"fcntl", SYS_fcntl},
     {"getcwd", SYS_getcwd},
+    {"chdir", SYS_chdir},
+    {"fchdir", SYS_fchdir},
     {"readlink", SYS_readlink},
     {"gettimeofday", SYS_gettimeofday},
     {"getrlimit", SYS_getrlimit},

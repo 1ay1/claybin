@@ -92,6 +92,11 @@ inline SyscallPolicy base() {
         63,   // uname
         72,   // fcntl
         79,   // getcwd
+        // the working directory is per-process state, and landlock and the
+        // mount tree still decide what a path reaches. without these `cd`
+        // fails EPERM, which breaks every shell script and `git -C`.
+        80,   // chdir
+        81,   // fchdir
         89,   // readlink
         96,   // gettimeofday
         97,   // getrlimit
@@ -530,6 +535,8 @@ inline SyscallPolicy base() {
         160,  // uname
         25,   // fcntl
         17,   // getcwd
+        49,   // chdir   -- see the x86_64 table
+        50,   // fchdir
         169,  // gettimeofday
         165,  // getrusage
         174,  // getuid
