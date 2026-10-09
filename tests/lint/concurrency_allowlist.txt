@@ -1,8 +1,0 @@
-# claybin — concurrency allowlist (checked by agentty's concurrency_banlist_claybin).
-#
-# claybin runs nothing in the background. const_cast is for the C APIs
-# (execve's argv/envp, landlock attrs) that take non-const pointers.
-
-src/linux/apply.cpp: const_cast
-src/linux/spawn.cpp: const_cast
-src/macos/spawn.cpp: const_cast
