@@ -6,9 +6,12 @@
 #include "harness.hpp"
 
 #include <cstring>
+#include <string>
 
 #if defined(__linux__)
+#include <cerrno>
 #include <cstdlib>
+#include <sys/stat.h>
 #include <sys/wait.h>
 #include <unistd.h>
 #endif
@@ -56,6 +59,17 @@ int fork_bomb(int target) {
     return 0;  // we made them all: the limit did NOT hold
 }
 
+// first line of a cgroup interface file, newline stripped. empty on failure.
+std::string read_line(const std::string& path) {
+    char buf[64] = "";
+    std::FILE* f = std::fopen(path.c_str(), "r");
+    if (!f) return {};
+    if (!std::fgets(buf, sizeof buf, f)) buf[0] = '\0';
+    std::fclose(f);
+    buf[std::strcspn(buf, "\n")] = '\0';
+    return buf;
+}
+
 }  // namespace
 #endif
 
@@ -82,6 +96,48 @@ int main(int argc, char** argv) {
     if (char* s = std::strrchr(dir, '/')) *s = '\0';
 
     auto host = probe_host();
+
+    // -- create() never adopts a cgroup that is already there --------------
+    //
+    // names are clay-<hint>-<pid>, so a second create() from the same process
+    // -- a supervisor with two sandboxes -- used to hit EEXIST, shrug, and hand
+    // back the SAME cgroup: one pool for both guests, the second policy's limits
+    // over the first's. a leftover from a dead process with our pid was adopted
+    // the same way, limits and tenants included.
+    {
+        const std::string& parent =
+            probe.delegating_path.empty() ? probe.own_path : probe.delegating_path;
+        char squat[64];
+        std::snprintf(squat, sizeof squat, "/clay-adopt-%d", static_cast<int>(::getpid()));
+        const std::string squatted = parent + squat;
+        // stands in for the cgroup a dead process with our pid left behind.
+        // EEXIST is fine -- that IS such a leftover, from a run that died here
+        // -- but only a directory this run made is ours to remove.
+        const bool made = ::mkdir(squatted.c_str(), 0755) == 0;
+        CHECK(made || errno == EEXIST);
+
+        ResourceLimits mem;
+        mem.memory = 64_MB;
+        ResourceLimits pids_only;
+        pids_only.pids = Count{8};
+        {
+            auto a = cgroup::create(probe, mem, "adopt");
+            auto b = cgroup::create(probe, pids_only, "adopt");
+            CHECK(a.has_value());
+            CHECK(b.has_value());
+            if (a && b) {
+                CHECK(a->path() != squatted);
+                CHECK(b->path() != squatted);
+                CHECK(a->path() != b->path());
+                if (probe.memory) {
+                    CHECK(read_line(a->path() + "/memory.max") == "67108864");
+                    // b asked for no memory cap, so it must not be wearing a's
+                    CHECK(read_line(b->path() + "/memory.max") == "max");
+                }
+            }
+        }
+        if (made) ::rmdir(squatted.c_str());
+    }
 
     // -- the report must only claim strong when we really got a cgroup -----
     {

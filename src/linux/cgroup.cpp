@@ -292,11 +292,8 @@ Result<Group> create(const Probe& pr, const ResourceLimits& limits,
     if (pr.availability != Availability::delegated)
         return std::unexpected(Error{Errc::unsupported, pr.reason});
 
-    // a unique name, so concurrent sandboxes do not collide.
-    char name[128];
-    std::snprintf(name, sizeof name, "clay-%.*s-%d",
-                  static_cast<int>(name_hint.size() > 32 ? 32 : name_hint.size()),
-                  name_hint.data(), static_cast<int>(::getpid()));
+    const int hint_len = static_cast<int>(name_hint.size() > 32 ? 32 : name_hint.size());
+    const int self_pid = static_cast<int>(::getpid());
 
     Group g;
     // the sandbox cgroup goes beside us, not beneath us.
@@ -309,17 +306,65 @@ Result<Group> create(const Probe& pr, const ResourceLimits& limits,
     //
     // pr.delegating_path is that parent when the probe had to relocate us, and
     // own_path otherwise, so this is correct in both shapes.
-    g.path_ = (pr.delegating_path.empty() ? pr.own_path : pr.delegating_path) + "/" + name;
+    const std::string& parent = pr.delegating_path.empty() ? pr.own_path : pr.delegating_path;
 
-    if (::mkdir(g.path_.c_str(), 0755) < 0 && errno != EEXIST)
-        return std::unexpected(Error{Errc::io_error, "cgroup: mkdir", errno});
+    // a FRESH directory, every time. EEXIST is a collision, never a reuse.
+    //
+    // this used to tolerate EEXIST and carry on with whatever was there, and the
+    // name was unique per PROCESS, not per call. so:
+    //
+    //   - a process holding two groups at once -- a supervisor running two
+    //     sandboxes -- got the SAME cgroup twice. the guests shared one memory
+    //     pool, the second policy's limits overwrote the first's,
+    //     Group::kill() on one killed both, and if the first Group died while
+    //     the second was compiled but not yet spawned, its rmdir removed the
+    //     second's cgroup and the second attach failed.
+    //   - a directory that already had our name -- left by a dead process that
+    //     had our pid (a claybin-run killed by a signal never runs ~Group), or
+    //     made by a claybin in another pid namespace, where the same pid can be
+    //     live -- was adopted with its old limits still in it. we only write
+    //     the limits the policy sets, so a pids-only policy inherited a stale
+    //     memory.max, and the guest could land beside processes still living
+    //     in that cgroup.
+    //
+    // clay-<hint>-<pid> first, so `ls` still says which process owns a sandbox;
+    // clay-<hint>-<pid>-<n> when that is taken. mkdir is the atomic
+    // test-and-set: no counter, no lock, no state in the library, and correct
+    // across threads and processes alike. the bound only caps the work if the
+    // parent is somehow full of our names; then we fail, we do not spin.
+    constexpr int kMaxNameAttempts = 1024;
+    std::string fresh;
+    for (int attempt = 0; attempt < kMaxNameAttempts && fresh.empty(); ++attempt) {
+        char name[128];
+        if (attempt == 0)
+            std::snprintf(name, sizeof name, "clay-%.*s-%d", hint_len, name_hint.data(),
+                          self_pid);
+        else
+            std::snprintf(name, sizeof name, "clay-%.*s-%d-%d", hint_len, name_hint.data(),
+                          self_pid, attempt);
+        std::string candidate = parent + "/" + name;
+        if (::mkdir(candidate.c_str(), 0755) == 0)
+            fresh = std::move(candidate);
+        else if (errno != EEXIST)
+            return std::unexpected(Error{Errc::io_error, "cgroup: mkdir", errno});
+    }
+    if (fresh.empty())
+        return std::unexpected(Error{Errc::io_error, "cgroup: mkdir", EEXIST});
+
+    // only now does g own a path, so no failure above can hand release() a
+    // directory to rmdir -- least of all one that belongs to someone else. from
+    // here on, every failure return leaves the rmdir to release(), once.
+    g.path_ = std::move(fresh);
 
     // hold a directory fd: after a pivot_root the path is gone, but an fd on it
     // still works, and it also means the attach cannot be redirected by a
     // symlink swap between create and attach.
     g.fd_ = ::open(g.path_.c_str(), O_DIRECTORY | O_CLOEXEC);
     if (g.fd_ < 0) {
-        ::rmdir(g.path_.c_str());
+        // no rmdir here: returning destroys g, and its release() removes the
+        // directory. a second rmdir by name could only hit a cgroup another
+        // create() had made under that name in between, and it used to run
+        // before errno was read, so its failure replaced open's.
         return std::unexpected(Error{Errc::io_error, "cgroup: open dir", errno});
     }
 

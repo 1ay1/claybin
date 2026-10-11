@@ -137,6 +137,10 @@ class Group {
 //
 // fails rather than silently skipping: a caller who asked for a 512 MB cap and
 // got no cgroup needs to know, and `Compiled::guarantees` is how they find out.
+//
+// always a directory this call just made: an existing one is never adopted, so
+// two groups are two cgroups even when one process creates both, and a leftover
+// from a dead process never lends us its limits or its tenants.
 Result<Group> create(const Probe& probe, const ResourceLimits& limits,
                      std::string_view name_hint);
 
