@@ -98,9 +98,7 @@ Outcome run_in_sandbox(const Policy<Sealed>& pol, const char* attack, const char
     auto c = compile(pol, probe_host());
     if (!c) return o;
 
-    char arg0[512];
-    std::snprintf(arg0, sizeof arg0, "%s", self);
-    const char* argv[] = {arg0, "attack", attack, nullptr};
+    const char* argv[] = {self, "attack", attack, nullptr};
 
     char home_env[512];
     const char* home = ::getenv("HOME");
