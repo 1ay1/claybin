@@ -538,36 +538,79 @@ if [ -x "$CLAY" ]; then
     # a cap the guest can live under must actually appear, at the right size.
     want=$((2 * 1024 * 1024 * 1024))
     got=""
-    MEMMAX_OUT=$(mktemp)
+    lost=0
+    why="could not observe the sandbox cgroup"
+    # does claybin itself claim a cgroup memory cap on this host? if it does, a
+    # guest outside any sandbox cgroup is a broken promise, not a host that
+    # cannot be observed -- so it fails instead of skipping.
+    case "$(audit_of $BASE --memory 2G --chdir / | grep 'resource.memory')" in
+        *" strong "*) claims_cgroup=1 ;;
+        *) claims_cgroup=0 ;;
+    esac
     if [ -d /sys/fs/cgroup ]; then
-        parent=$(cut -d: -f3 /proc/self/cgroup | head -1)
-        base="/sys/fs/cgroup${parent%/*}"
-        (
-            n=0
-            while [ $n -lt 60 ]; do
-                d=$(ls -d "$base"/clay-box-* 2>/dev/null | head -1)
-                if [ -n "$d" ] && [ -r "$d/memory.max" ]; then
-                    cat "$d/memory.max" > "$MEMMAX_OUT" 2>/dev/null
-                    break
-                fi
-                n=$((n+1))
-                sleep 0.05
-            done
-        ) &
-        watcher=$!
-        "$CLAY" $BASE --memory 2G --chdir / -- /bin/sh -c 'sleep 1.2' \
-            >/dev/null 2>&1
+        # find the sandbox's cgroup THROUGH THE GUEST'S PID, never by globbing.
+        #
+        # this used to read whichever clay-box-* `ls | head -1` listed first
+        # under our parent cgroup. but every process using claybin makes its
+        # clay-box-<pid> cgroups in that same delegating parent, and so does any
+        # sandbox whose cleanup never ran (a claybin-run killed by a signal never
+        # reaches ~Group). a pids-only one has memory.max=max -- so this reported
+        # "--memory 2G wrote memory.max=max" on hosts where the guest's own cap
+        # was exactly right, because the glob found a stranger's cgroup first.
+        #
+        # --info-fd hands us the child pid, and by the time it is written the
+        # cgroup exists, its limits are in, and the child is attached: spawn_in
+        # gates the child until the attach succeeds. /proc/PID/cgroup is then
+        # the kernel's own answer to "which cgroup is the guest in".
+        INFO_OUT=$(mktemp)
+        "$CLAY" $BASE --memory 2G --info-fd 3 --chdir / -- /bin/sh -c 'sleep 1.2' \
+            3>"$INFO_OUT" >/dev/null 2>&1 &
+        clay_pid=$!
+        n=0
+        while [ $n -lt 60 ]; do
+            # only parse a COMPLETE record: a read that races the write could
+            # see "child-pid": 12 out of 12345 and look up a stranger.
+            cpid=""
+            if grep -q '}' "$INFO_OUT"; then
+                cpid=$(sed -n 's/.*"child-pid": *\([0-9][0-9]*\).*/\1/p' "$INFO_OUT")
+            fi
+            if [ -n "$cpid" ]; then
+                # the "0::" line is the unified hierarchy, which is what claybin
+                # uses. on a hybrid host it is not the first line, and a path
+                # may itself contain ':', so neither head -1 nor cut -f3.
+                cg=$(sed -n 's/^0:://p' "/proc/$cpid/cgroup" 2>/dev/null)
+                case "$cg" in
+                    */clay-box-*)
+                        got=$(cat "/sys/fs/cgroup$cg/memory.max" 2>/dev/null) ;;
+                    "")
+                        # unreadable, or the guest is already gone: nothing
+                        # was observed, so nothing can be claimed either way
+                        why="could not read /proc/$cpid/cgroup" ;;
+                    *)
+                        why="the guest got no sandbox cgroup (it is in $cg)"
+                        lost=$claims_cgroup ;;
+                esac
+                break
+            fi
+            # no early exit when claybin-run dies first: kill -0 still succeeds
+            # on it as an unreaped zombie. the loop just runs out, and wait's
+            # exit code below reports the failure.
+            n=$((n+1))
+            sleep 0.05
+        done
+        wait "$clay_pid"
         rc=$?
-        wait "$watcher" 2>/dev/null
-        got=$(cat "$MEMMAX_OUT" 2>/dev/null)
-        rm -f "$MEMMAX_OUT"
+        rm -f "$INFO_OUT"
 
         if [ "$rc" -ne 0 ]; then
             FAIL=$((FAIL+1))
             printf '  FAIL  --memory 2G killed the guest (rc=%s)\n' "$rc"
+        elif [ "$lost" -eq 1 ]; then
+            FAIL=$((FAIL+1))
+            printf '  FAIL  --audit claims a cgroup memory cap, but %s\n' "$why"
         elif [ -z "$got" ]; then
             SKIP=$((SKIP+1))
-            printf '  skip  could not observe the sandbox cgroup\n'
+            printf '  skip  %s\n' "$why"
         elif [ "$got" = "$want" ]; then
             PASS=$((PASS+1))
             printf '  ok    --memory 2G reaches memory.max as %s bytes\n' "$want"
