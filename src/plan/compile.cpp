@@ -412,9 +412,18 @@ Result<Compiled> compile(const Policy<Sealed>& policy, const HostCapabilities& h
                     // unbounded tmpfs, so a filled /tmp was host memory pressure
                     // rather than a contained ENOSPC. a resource limit that is
                     // quietly ignored is worse than one that is refused.
-                    char opts[64] = "mode=0755";
+                    //
+                    // the mode is the caller's when they gave one (bwrap's
+                    // `--perms MODE --tmpfs DST`), 0755 otherwise. always four
+                    // octal digits, so "mode=NNNN" has a fixed length.
+                    const std::uint32_t mode = (m.perms ? m.perms : 0755u) & 07777u;
+                    char opts[64] = "mode=0000";
+                    opts[5] = static_cast<char>('0' + ((mode >> 9) & 7));
+                    opts[6] = static_cast<char>('0' + ((mode >> 6) & 7));
+                    opts[7] = static_cast<char>('0' + ((mode >> 3) & 7));
+                    opts[8] = static_cast<char>('0' + (mode & 7));
                     if (m.size != 0) {
-                        std::size_t n = 9;  // strlen("mode=0755")
+                        std::size_t n = 9;  // strlen("mode=NNNN")
                         const char* tail = ",size=";
                         for (std::size_t i = 0; tail[i]; ++i) opts[n++] = tail[i];
                         // decimal bytes, written by hand: this runs before the

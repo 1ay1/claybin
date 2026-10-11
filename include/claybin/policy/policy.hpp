@@ -254,8 +254,11 @@ class Policy<Draft> {
         data_.mounts.bind_try(std::move(src), std::move(dst), ro);
         return std::move(*this);
     }
-    Policy&& tmpfs(std::string dst, Bytes size = Bytes::unlimited()) && {
-        data_.mounts.tmpfs(std::move(dst), size.is_unlimited() ? 0 : size.value());
+    // perms: the tmpfs root's mode, as bwrap's `--perms MODE --tmpfs DST`.
+    // 0 keeps the default, 0755.
+    Policy&& tmpfs(std::string dst, Bytes size = Bytes::unlimited(),
+                   std::uint32_t perms = 0) && {
+        data_.mounts.tmpfs(std::move(dst), size.is_unlimited() ? 0 : size.value(), perms);
         return std::move(*this);
     }
     Policy&& proc_fs(std::string dst = "/proc") && {

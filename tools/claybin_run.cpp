@@ -423,9 +423,12 @@ int main(int argc, char** argv) {
                 std::fprintf(stderr, "claybin-run: %s: invalid fd '%s'\n", a, eargv[i + 1]);
                 return 1;
             }
+            // 0600 by default, as in bwrap. this was 0666, which the umask
+            // used to mask down to 0644; with the mode now applied exactly it
+            // would have made the bound file world-writable.
             policy = std::move(policy).bind_data(BorrowedFd{static_cast<int>(fd)}, eargv[i + 2],
                                                  std::strcmp(a, "--ro-bind-data") == 0,
-                                                 next_perms ? next_perms : 0666u);
+                                                 next_perms ? next_perms : 0600u);
             next_perms = 0;
             i += 2;
         } else if (std::strcmp(a, "--uid") == 0) {
