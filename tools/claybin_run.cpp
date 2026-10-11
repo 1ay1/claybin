@@ -12,6 +12,7 @@
 //     --not-a-security-boundary is the opposite default)
 #include <cstdio>
 #include <cstring>
+#include <list>
 #include <string>
 #include <vector>
 
@@ -61,7 +62,12 @@ bool strcasecmp_eq(const char* a, const char* b) {
 // Overflow is checked rather than wrapped: `--memory 99999999999999999999G`
 // must not become a small number.
 bool parse_size(const char* s, std::uint64_t& out) {
-    if (!s || !*s) return false;
+    // a digit first. strtoull skips leading space and ACCEPTS a minus sign,
+    // negating the result: "--memory -1" parsed as 18446744073709551615 with
+    // errno untouched. that is UINT64_MAX -- Bytes' own "unlimited" sentinel
+    // -- so it sailed past the 1M floor and the sandbox ran with NO memory cap
+    // at all, silently, and --audit did not even list one.
+    if (!s || *s < '0' || *s > '9') return false;
     char* end = nullptr;
     errno = 0;
     const unsigned long long raw = std::strtoull(s, &end, 10);
@@ -83,6 +89,73 @@ bool parse_size(const char* s, std::uint64_t& out) {
 
     if (mult > 1 && raw > (UINT64_MAX / mult)) return false;   // would overflow
     out = static_cast<std::uint64_t>(raw) * mult;
+    // the same sentinel, spelled out in digits (18446744073709551615), must
+    // not mean "unlimited" either. no real size is that large.
+    if (out == UINT64_MAX) return false;
+    return true;
+}
+
+// An unsigned integer in `base`, no larger than `max`, with NOTHING else in the
+// string. The same rule as parse_size, for every other number on the command
+// line.
+//
+// These used to be bare strtol/strtoul calls, and each failure mode was its
+// own small disaster:
+//
+//   --uid abc          -> 0, so the guest ran as ROOT in its namespace
+//   --uid 4294967295   -> kUnsetId, so an explicit id silently meant "default"
+//   --chmod abc PATH   -> mode 000, applied to a HOST path before the sandbox
+//   --chmod 4755 PATH  -> setuid bit, on a HOST path
+//   --allow-port 65979 -> truncated to uint16 443: a grant nobody typed
+//   --info-fd x        -> fd 0, so the status JSON went into our own stdin
+//   --args -1          -> read(-1) fails, close(-1), and the args are empty
+//
+// strtoul also accepts a leading '-' and negates, so "-1" parses as ULONG_MAX;
+// a leading sign or space is therefore rejected outright.
+bool parse_uint(const char* s, int base, unsigned long long max, unsigned long long& out) {
+    if (!s || *s < '0' || *s > '9') return false;   // no sign, no space, not empty
+    char* end = nullptr;
+    errno = 0;
+    const unsigned long long v = std::strtoull(s, &end, base);
+    if (end == s || *end != '\0' || errno == ERANGE || v > max) return false;
+    out = v;
+    return true;
+}
+
+// A descriptor number. INT_MAX is the ceiling of the type, not a real limit;
+// whether the fd is actually open is checked where it is used.
+bool parse_fd(const char* s, int& out) {
+    unsigned long long v = 0;
+    if (!parse_uint(s, 10, 2147483647ull, v)) return false;
+    out = static_cast<int>(v);
+    return true;
+}
+
+// A mode for --chmod/--perms. bwrap caps these at 07777 and so do we -- the
+// setuid/setgid/sticky bits are representable -- but the value must be octal
+// digits and nothing else, so a typo cannot become 000 or a stray setuid bit.
+bool parse_mode(const char* s, std::uint32_t& out) {
+    unsigned long long v = 0;
+    if (!parse_uint(s, 8, 07777ull, v)) return false;
+    out = static_cast<std::uint32_t>(v);
+    return true;
+}
+
+// "no --perms pending". not 0: `--perms 0` is a real request (mode 000), and
+// using 0 as the sentinel quietly turned it into the default 0666.
+constexpr std::uint32_t kNoPerms = 0xffffffffu;
+
+// the whole buffer, or false. a status record is read by another program; a
+// short or failed write leaves it parsing half a record or waiting forever,
+// so like bwrap we treat it as fatal rather than discarding the result.
+bool write_all(int fd, const char* buf, std::size_t len) {
+    while (len > 0) {
+        ssize_t w = ::write(fd, buf, len);
+        if (w < 0 && errno == EINTR) continue;
+        if (w <= 0) return false;
+        buf += w;
+        len -= static_cast<std::size_t>(w);
+    }
     return true;
 }
 
@@ -152,38 +225,26 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    // --args reads NUL-separated arguments from an fd, and they have to be
-    // parsed as if they had been on the command line. rather than splice mid-loop
-    // (which would mean mutating what we are iterating), do a pre-pass: expand
-    // every --args into a flat vector, then parse THAT.
-    std::vector<std::string> argstore;
-    std::vector<const char*> args;
-    args.push_back(argv[0]);
-    for (int k = 1; k < argc; ++k) {
-        if (std::strcmp(argv[k], "--args") == 0 && k + 1 < argc) {
-            int fd = static_cast<int>(std::strtol(argv[k + 1], nullptr, 10));
-            std::string blob;
-            char rb[4096];
-            for (;;) {
-                ssize_t n = ::read(fd, rb, sizeof rb);
-                if (n <= 0) break;
-                blob.append(rb, static_cast<std::size_t>(n));
-            }
-            ::close(fd);
-            for (std::size_t p = 0; p < blob.size();) {
-                std::size_t e = blob.find('\0', p);
-                if (e == std::string::npos) e = blob.size();
-                if (e > p) argstore.push_back(blob.substr(p, e - p));
-                p = e + 1;
-            }
-            ++k;  // skip the fd number
-            continue;
-        }
-        argstore.emplace_back(argv[k]);
-    }
-    for (const auto& s : argstore) args.push_back(s.c_str());
-    const int eargc = static_cast<int>(args.size());
+    // the words being parsed. --args splices more in, in place, from INSIDE the
+    // parse loop below -- not in a pre-pass.
+    //
+    // a pre-pass used to expand every "--args FD" anywhere in argv, including
+    // after the command: `claybin-run ... -- tool --args 3` had fd 3 read and
+    // closed in OUR process and its contents spliced into the GUEST's argv.
+    // only the parse loop knows where the options end (values are consumed by
+    // need(), so a value of "--" or "--args" is data, not syntax), so that is
+    // the only place an --args can be recognised correctly.
+    //
+    // the spliced strings live in a std::list because the loop keeps raw
+    // pointers into them (profile_name, argv0_override, ...): list nodes never
+    // move, so those pointers survive later splices. `args` is re-pointed after
+    // each splice; eargv/eargc follow it.
+    std::vector<const char*> args(argv, argv + argc);
+    std::list<std::string> args_from_files;
+    int eargc = argc;
     const char* const* eargv = args.data();
+    // words at indices below this came out of an --args file
+    int args_file_end = 0;
 
     auto policy = Policy<Draft>{};
     bool share_net = false;
@@ -196,26 +257,32 @@ int main(int argc, char** argv) {
     std::vector<std::string> overlay_srcs;
     std::vector<std::string> remount_ro;
     const char* argv0_override = nullptr;
-    std::uint32_t next_perms = 0;
+    std::uint32_t next_perms = kNoPerms;
     bool new_session = false;
     bool die_with_parent = false;
-    std::vector<std::string> lock_files;
-    std::vector<std::pair<std::uint32_t, std::string>> chmods;
     int info_fd = -1;
     int json_fd = -1;
     int sync_fd = -1;
     int block_fd = -1;
-    int userns_block_fd = -1;
-    int args_fd = -1;
-    std::vector<std::string> extra_args;
     bool disable_nested_userns = false;
     bool clear_env = false;
     bool inherit_env = true;  // bwrap inherits unless --clearenv
 
     int i = 1;
+    // bounds against the words actually being parsed. this checked argc, the
+    // ORIGINAL count, while every option reads eargv -- and --args makes the
+    // two differ, so a short argument list could be read past its end.
     auto need = [&](int n, const char* what) -> bool {
-        if (i + n >= argc) {
+        if (i + n >= eargc) {
             std::fprintf(stderr, "claybin-run: %s needs %d argument(s)\n", what, n);
+            return false;
+        }
+        // an option inside an --args file takes its values from the file.
+        // bwrap parses the file on its own, so an option there cannot borrow
+        // the next word of the real command line; neither may ours.
+        if (i < args_file_end && i + n >= args_file_end) {
+            std::fprintf(stderr, "claybin-run: %s in an --args file needs %d argument(s) "
+                                 "from that file\n", what, n);
             return false;
         }
         return true;
@@ -223,6 +290,43 @@ int main(int argc, char** argv) {
 
     for (; i < eargc; ++i) {
         const char* a = eargv[i];
+        // a modifier cannot carry over from an --args file to the real command
+        // line: bwrap parses the file as its own list and refuses a --perms or
+        // --size left pending at its end.
+        if (i == args_file_end && args_file_end > 0 &&
+            (next_perms != kNoPerms || next_size != 0)) {
+            std::fprintf(stderr, "claybin-run: --perms/--size at the end of an --args "
+                                 "file has nothing to modify\n");
+            return 1;
+        }
+        // --perms modifies the NEXT option only, which must create a file or
+        // directory -- bwrap's rule. without this, `--perms 0700 --bind a b
+        // --dir d` applied 0700 to d, two options away, or was dropped.
+        if (next_perms != kNoPerms && std::strcmp(a, "--perms") != 0 &&
+            std::strcmp(a, "--size") != 0 && std::strcmp(a, "--tmpfs") != 0 &&
+            std::strcmp(a, "--dir") != 0 && std::strcmp(a, "--file") != 0 &&
+            std::strcmp(a, "--bind-data") != 0 && std::strcmp(a, "--ro-bind-data") != 0) {
+            std::fprintf(stderr, "claybin-run: --perms must be followed by --tmpfs, --dir, "
+                                 "--file, --bind-data or --ro-bind-data\n");
+            return 1;
+        }
+        // same rule for --size, which only --tmpfs consumes. a stray one used
+        // to wait silently and size whichever --tmpfs came next, however far on.
+        // (--perms may sit between them: `--size 1M --perms 0700 --tmpfs /t`.)
+        if (next_size != 0 && std::strcmp(a, "--size") != 0 &&
+            std::strcmp(a, "--perms") != 0 && std::strcmp(a, "--tmpfs") != 0) {
+            std::fprintf(stderr, "claybin-run: --size must be followed by --tmpfs\n");
+            return 1;
+        }
+        // an --args file holds OPTIONS. a "--" or a command inside one used to
+        // end the option list right there, so every flag after `--args FD` on
+        // the real command line -- a --deny, a --memory -- silently became an
+        // argument to the file's command instead of a restriction.
+        if (i < args_file_end && (std::strcmp(a, "--") == 0 || a[0] != '-')) {
+            std::fprintf(stderr, "claybin-run: an --args file may contain only options, "
+                                 "not '%s'\n", a);
+            return 1;
+        }
         if (std::strcmp(a, "--") == 0) {
             ++i;
             break;
@@ -266,16 +370,27 @@ int main(int argc, char** argv) {
             i += 1;
         } else if (std::strcmp(a, "--tmpfs") == 0) {
             if (!need(1, a)) return 1;
+            // bwrap honours --perms here too (its tmpfs mode), so we do.
             policy = std::move(policy).tmpfs(eargv[i + 1],
-                                             next_size ? Bytes{next_size} : Bytes::unlimited());
+                                             next_size ? Bytes{next_size} : Bytes::unlimited(),
+                                             next_perms != kNoPerms ? next_perms : 0u);
             next_size = 0;
+            next_perms = kNoPerms;
             i += 1;
         } else if (std::strcmp(a, "--size") == 0) {
             if (!need(1, a)) return 1;
-            if (!parse_size(eargv[i + 1], next_size)) {
+            if (next_size != 0) {
+                std::fprintf(stderr, "claybin-run: --size given twice for the same --tmpfs\n");
+                return 1;
+            }
+            if (!parse_size(eargv[i + 1], next_size) || next_size == 0) {
+                // 0 is refused as bwrap does; here it would also be read
+                // as "no --size pending" and give the tmpfs no limit at all.
+                next_size = 0;
                 std::fprintf(stderr,
                              "claybin-run: --size: bad byte count '%s' "
-                             "(want digits with an optional K/M/G/T suffix)\n",
+                             "(want a non-zero count, digits with an optional "
+                             "K/M/G/T suffix)\n",
                              eargv[i + 1]);
                 return 1;
             }
@@ -301,7 +416,7 @@ int main(int argc, char** argv) {
                              "claybin-run: --memory %s is %llu bytes; a cap "
                              "under 1M kills the guest before it can run. "
                              "Did you mean %sM or %sG?\n",
-                             eargv[i + 1], (unsigned long long)bytes,
+                             eargv[i + 1], static_cast<unsigned long long>(bytes),
                              eargv[i + 1], eargv[i + 1]);
                 return 1;
             }
@@ -313,12 +428,11 @@ int main(int argc, char** argv) {
             // likely a typo than a request for 4096 workers, and a pids cap
             // is small by nature.
             {
-                char* pend = nullptr;
-                errno = 0;
-                const unsigned long long n =
-                    std::strtoull(eargv[i + 1], &pend, 10);
-                if (pend == eargv[i + 1] || *pend != '\0' || errno == ERANGE
-                    || n == 0) {
+                // parse_uint, not strtoull: strtoull accepts "-5" and negates
+                // it into a huge count, and UINT64_MAX is Count's own
+                // "unlimited" sentinel -- both silently meant no cap at all.
+                unsigned long long n = 0;
+                if (!parse_uint(eargv[i + 1], 10, 0xffffffffull, n) || n == 0) {
                     std::fprintf(stderr,
                                  "claybin-run: --processes: want a positive "
                                  "count, got '%s'\n", eargv[i + 1]);
@@ -332,12 +446,27 @@ int main(int argc, char** argv) {
             // it, so `resource.cpu` read `none` on every audit -- which looked
             // like a missing capability rather than a missing flag.
             if (!need(1, a)) return 1;
-            policy = std::move(policy).cpu_percent(
-                static_cast<std::uint32_t>(std::strtoul(eargv[i + 1], nullptr, 10)));
+            {
+                // "abc" used to become 0, which compile() turned into a 1%
+                // quota -- a cap far tighter than anything typed. 100 is one
+                // core; the library clamps anything beyond the machine.
+                unsigned long long pct = 0;
+                if (!parse_uint(eargv[i + 1], 10, 0xffffffffull, pct) || pct == 0) {
+                    std::fprintf(stderr,
+                                 "claybin-run: --cpu-percent: want a positive "
+                                 "percentage, got '%s'\n", eargv[i + 1]);
+                    return 1;
+                }
+                policy = std::move(policy).cpu_percent(pct);
+            }
             i += 1;
         } else if (std::strcmp(a, "--dir") == 0) {
             if (!need(1, a)) return 1;
-            policy = std::move(policy).mkdir(eargv[i + 1]);
+            // --perms applies here as it does in bwrap. it used to be ignored,
+            // so `--perms 0700 --dir /secret` made a world-readable 0755 dir.
+            policy = std::move(policy).mkdir(eargv[i + 1],
+                                             next_perms != kNoPerms ? next_perms : 0755u);
+            next_perms = kNoPerms;
             i += 1;
         } else if (std::strcmp(a, "--symlink") == 0) {
             if (!need(2, a)) return 1;
@@ -365,15 +494,41 @@ int main(int argc, char** argv) {
             i += 1;
         } else if (std::strcmp(a, "--perms") == 0) {
             if (!need(1, a)) return 1;
-            next_perms = static_cast<std::uint32_t>(std::strtoul(eargv[i + 1], nullptr, 8));
+            // bwrap's rules: octal, <= 07777, and only once per action.
+            if (next_perms != kNoPerms) {
+                std::fprintf(stderr, "claybin-run: --perms given twice for the same "
+                                     "action\n");
+                return 1;
+            }
+            if (!parse_mode(eargv[i + 1], next_perms)) {
+                std::fprintf(stderr, "claybin-run: --perms takes an octal mode <= 07777, "
+                                     "got '%s'\n", eargv[i + 1]);
+                return 1;
+            }
+            // the plan reads mode 0 as "use the default" (0755 for a dir, 0644
+            // for a file), so 0 cannot be expressed. refuse it rather than hand
+            // the guest a readable file the caller asked to lock down.
+            if (next_perms == 0) {
+                std::fprintf(stderr, "claybin-run: --perms 0 is not supported\n");
+                return 1;
+            }
             i += 1;
         } else if (std::strcmp(a, "--version") == 0) {
             std::printf("claybin-run (claybin) 0.1.0\n");
             return 0;
-        } else if (std::strcmp(a, "--level-prefix") == 0 ||
+        } else if (std::strcmp(a, "--level-prefix") == 0) {
+            // accepted and ignored: it only changes bwrap's own diagnostics.
+        } else if (std::strcmp(a, "--disable-userns") == 0 ||
                    std::strcmp(a, "--assert-userns-disabled") == 0) {
-            // accepted and ignored: these change bwrap's own diagnostics or
-            // assert a host property we already report through --audit.
+            // every profile already makes new user namespaces impossible:
+            // unshare and setns are killed, clone3 is ENOSYS, and clone with
+            // any CLONE_NEW* bit is EPERM. but that is a property of the
+            // FILTER, and these flags used to be swallowed without checking
+            // that a filter would actually be installed -- on a host without
+            // seccomp the guest could make a user namespace while the caller
+            // believed it could not. so they are now a hard requirement on
+            // the syscall filter, checked after compile.
+            disable_nested_userns = true;
         } else if (std::strcmp(a, "--mqueue") == 0) {
             if (!need(1, a)) return 1;
             policy = std::move(policy).mqueue(eargv[i + 1]);
@@ -392,54 +547,55 @@ int main(int argc, char** argv) {
         } else if (std::strcmp(a, "--bind-fd") == 0 ||
                    std::strcmp(a, "--ro-bind-fd") == 0) {
             if (!need(2, a)) return 1;
-            char* end = nullptr;
-            long fd = std::strtol(eargv[i + 1], &end, 10);
-            if (end == eargv[i + 1] || fd < 0) {
+            int fd = -1;
+            if (!parse_fd(eargv[i + 1], fd)) {
                 std::fprintf(stderr, "claybin-run: %s: invalid fd '%s'\n", a, eargv[i + 1]);
                 return 1;
             }
-            policy = std::move(policy).bind_fd(BorrowedFd{static_cast<int>(fd)}, eargv[i + 2],
+            policy = std::move(policy).bind_fd(BorrowedFd{fd}, eargv[i + 2],
                                                std::strcmp(a, "--ro-bind-fd") == 0);
             i += 2;
         } else if (std::strcmp(a, "--file") == 0) {
             if (!need(2, a)) return 1;
-            char* end = nullptr;
-            long fd = std::strtol(eargv[i + 1], &end, 10);
-            if (end == eargv[i + 1] || fd < 0) {
+            int fd = -1;
+            if (!parse_fd(eargv[i + 1], fd)) {
                 std::fprintf(stderr, "claybin-run: --file: invalid fd '%s'\n", eargv[i + 1]);
                 return 1;
             }
-            policy = std::move(policy).file_from_fd(BorrowedFd{static_cast<int>(fd)},
-                                                    eargv[i + 2],
-                                                    next_perms ? next_perms : 0666u);
-            next_perms = 0;
+            policy = std::move(policy).file_from_fd(BorrowedFd{fd}, eargv[i + 2],
+                                                    next_perms != kNoPerms ? next_perms
+                                                                           : 0666u);
+            next_perms = kNoPerms;
             i += 2;
         } else if (std::strcmp(a, "--bind-data") == 0 ||
                    std::strcmp(a, "--ro-bind-data") == 0) {
             if (!need(2, a)) return 1;
-            char* end = nullptr;
-            long fd = std::strtol(eargv[i + 1], &end, 10);
-            if (end == eargv[i + 1] || fd < 0) {
+            int fd = -1;
+            if (!parse_fd(eargv[i + 1], fd)) {
                 std::fprintf(stderr, "claybin-run: %s: invalid fd '%s'\n", a, eargv[i + 1]);
                 return 1;
             }
             // 0600 by default, as in bwrap. this was 0666, which the umask
             // used to mask down to 0644; with the mode now applied exactly it
             // would have made the bound file world-writable.
-            policy = std::move(policy).bind_data(BorrowedFd{static_cast<int>(fd)}, eargv[i + 2],
+            policy = std::move(policy).bind_data(BorrowedFd{fd}, eargv[i + 2],
                                                  std::strcmp(a, "--ro-bind-data") == 0,
-                                                 next_perms ? next_perms : 0600u);
-            next_perms = 0;
+                                                 next_perms != kNoPerms ? next_perms : 0600u);
+            next_perms = kNoPerms;
             i += 2;
-        } else if (std::strcmp(a, "--uid") == 0) {
+        } else if (std::strcmp(a, "--uid") == 0 || std::strcmp(a, "--gid") == 0) {
             if (!need(1, a)) return 1;
-            policy = std::move(policy).uid(
-                static_cast<std::uint32_t>(std::strtoul(eargv[i + 1], nullptr, 10)));
-            i += 1;
-        } else if (std::strcmp(a, "--gid") == 0) {
-            if (!need(1, a)) return 1;
-            policy = std::move(policy).gid(
-                static_cast<std::uint32_t>(std::strtoul(eargv[i + 1], nullptr, 10)));
+            // a bad id must not become 0 -- root in the namespace -- and
+            // 4294967295 is kUnsetId, (uid_t)-1, which no real id may be.
+            unsigned long long id = 0;
+            if (!parse_uint(eargv[i + 1], 10, kUnsetId - 1ull, id)) {
+                std::fprintf(stderr, "claybin-run: %s: invalid id '%s'\n", a, eargv[i + 1]);
+                return 1;
+            }
+            if (a[2] == 'u')
+                policy = std::move(policy).uid(static_cast<std::uint32_t>(id));
+            else
+                policy = std::move(policy).gid(static_cast<std::uint32_t>(id));
             i += 1;
         } else if (std::strcmp(a, "--cap-add") == 0) {
             if (!need(1, a)) return 1;
@@ -489,32 +645,65 @@ int main(int argc, char** argv) {
             i += 1;
         } else if (std::strcmp(a, "--chmod") == 0) {
             if (!need(2, a)) return 1;
-            chmods.emplace_back(static_cast<std::uint32_t>(std::strtoul(eargv[i + 1], nullptr, 8)),
-                                eargv[i + 2]);
-            i += 2;
+            // bwrap applies --chmod to DEST *inside the new root*, after the
+            // binds: openat_in_root("/newroot", dest, O_PATH|O_NOFOLLOW). this
+            // applied it to the same path on the HOST, before the sandbox
+            // existed, with the caller's full privileges -- so an ordinary bwrap
+            // line like `--bind "$APP" /app --chmod 0755 /app/bin` chmodded
+            // the host's /app/bin (or the host /etc/..., or anything) instead.
+            // a sandbox flag that mutates the host is the opposite of a sandbox.
+            //
+            // the plan has no in-tree chmod yet, and adding one belongs in the
+            // apply() IR with its own escape tests, so until then: refuse. the
+            // mode is still validated, so a typo is reported as a typo.
+            std::uint32_t mode = 0;
+            if (!parse_mode(eargv[i + 1], mode)) {
+                std::fprintf(stderr, "claybin-run: --chmod takes an octal mode <= 07777, "
+                                     "got '%s'\n", eargv[i + 1]);
+                return 1;
+            }
+            std::fprintf(stderr, "claybin-run: --chmod is not supported yet. bwrap applies "
+                                 "it inside the sandbox; claybin will not chmod the host.\n");
+            return 1;
         } else if (std::strcmp(a, "--lock-file") == 0) {
             if (!need(1, a)) return 1;
-            lock_files.push_back(eargv[i + 1]);
-            i += 1;
-        } else if (std::strcmp(a, "--info-fd") == 0) {
-            if (!need(1, a)) return 1;
-            info_fd = static_cast<int>(std::strtol(eargv[i + 1], nullptr, 10));
-            i += 1;
-        } else if (std::strcmp(a, "--json-status-fd") == 0) {
-            if (!need(1, a)) return 1;
-            json_fd = static_cast<int>(std::strtol(eargv[i + 1], nullptr, 10));
-            i += 1;
-        } else if (std::strcmp(a, "--sync-fd") == 0) {
-            if (!need(1, a)) return 1;
-            sync_fd = static_cast<int>(std::strtol(eargv[i + 1], nullptr, 10));
-            i += 1;
-        } else if (std::strcmp(a, "--block-fd") == 0) {
-            if (!need(1, a)) return 1;
-            block_fd = static_cast<int>(std::strtol(eargv[i + 1], nullptr, 10));
-            i += 1;
+            // bwrap's DEST is a path INSIDE the sandbox: its pid 1 opens it
+            // O_RDONLY, without creating it, after pivot_root, and holds an
+            // F_RDLCK on it. this opened the same string on the HOST, with
+            // O_CREAT, before the sandbox existed -- so `--lock-file /app/x`
+            // created /app/x on the host (following any symlink there) and
+            // locked a file the sandbox never saw, while the real one stayed
+            // unlocked. the in-sandbox open needs a plan op; until then, refuse.
+            std::fprintf(stderr, "claybin-run: --lock-file is not supported yet. bwrap "
+                                 "locks a path inside the sandbox; claybin will not open "
+                                 "or create the host path of the same name.\n");
+            return 1;
         } else if (std::strcmp(a, "--userns-block-fd") == 0) {
             if (!need(1, a)) return 1;
-            userns_block_fd = static_cast<int>(std::strtol(eargv[i + 1], nullptr, 10));
+            // bwrap pauses AFTER writing --info-fd and before the guest runs,
+            // so a supervisor can adjust the new user namespace (write uid maps,
+            // place the pid in a cgroup) first. claybin's guest is already
+            // running by the time --info-fd is written, so it cannot offer that
+            // pause -- and this used to be parsed and ignored, which let the
+            // guest run before the setup the caller was waiting to do. refuse.
+            std::fprintf(stderr, "claybin-run: --userns-block-fd is not supported: the guest "
+                                 "would start before the caller's setup. use --block-fd.\n");
+            return 1;
+        } else if (std::strcmp(a, "--info-fd") == 0 || std::strcmp(a, "--json-status-fd") == 0 ||
+                   std::strcmp(a, "--sync-fd") == 0 || std::strcmp(a, "--block-fd") == 0) {
+            if (!need(1, a)) return 1;
+            // "x" used to become fd 0 -- our own stdin -- so the status JSON
+            // was written to, or the block read from, the wrong descriptor.
+            int fd = -1;
+            if (!parse_fd(eargv[i + 1], fd)) {
+                std::fprintf(stderr, "claybin-run: %s: invalid fd '%s'\n", a, eargv[i + 1]);
+                return 1;
+            }
+            int* slot = std::strcmp(a, "--info-fd") == 0          ? &info_fd
+                        : std::strcmp(a, "--json-status-fd") == 0 ? &json_fd
+                        : std::strcmp(a, "--sync-fd") == 0        ? &sync_fd
+                                                                  : &block_fd;
+            *slot = fd;
             i += 1;
         } else if (std::strcmp(a, "--userns") == 0 || std::strcmp(a, "--userns2") == 0 ||
                    std::strcmp(a, "--pidns") == 0) {
@@ -527,31 +716,59 @@ int main(int argc, char** argv) {
                          "so it can report what they actually enforce; joining one it did not "
                          "build would make the guarantee report a guess.\n", a);
             return 1;
-        } else if (std::strcmp(a, "--disable-userns") == 0) {
-            disable_nested_userns = true;
         } else if (std::strcmp(a, "--args") == 0) {
             if (!need(1, a)) return 1;
             // NUL-separated arguments from an fd. flatpak uses this to avoid
             // ARG_MAX and to keep paths with spaces intact. read the whole fd
-            // and splice the results in at this position, so later command-line
+            // and splice the words in at this position, so later command-line
             // flags still override earlier file ones.
-            int fd = static_cast<int>(std::strtol(eargv[i + 1], nullptr, 10));
+            //
+            // like bwrap: a bad fd is an error, a failed read is an error, and
+            // an --args file may not itself contain --args.
+            if (i < args_file_end) {
+                std::fprintf(stderr, "claybin-run: --args is not supported inside an "
+                                     "--args file\n");
+                return 1;
+            }
+            int fd = -1;
+            if (!parse_fd(eargv[i + 1], fd)) {
+                std::fprintf(stderr, "claybin-run: --args: invalid fd '%s'\n", eargv[i + 1]);
+                return 1;
+            }
             std::string blob;
             char rb[4096];
             for (;;) {
                 ssize_t n = ::read(fd, rb, sizeof rb);
-                if (n <= 0) break;
+                if (n < 0 && errno == EINTR) continue;
+                if (n < 0) {
+                    std::fprintf(stderr, "claybin-run: --args %d: %s\n", fd,
+                                 std::strerror(errno));
+                    return 1;
+                }
+                if (n == 0) break;
                 blob.append(rb, static_cast<std::size_t>(n));
             }
             ::close(fd);
+            // every NUL ends an argument. empty strings are real arguments --
+            // `--setenv X ""` -- and dropping them, as this used to, shifts
+            // every later word into the wrong slot.
+            std::vector<const char*> words;
             for (std::size_t p = 0; p < blob.size();) {
                 std::size_t e = blob.find('\0', p);
                 if (e == std::string::npos) e = blob.size();
-                if (e > p) extra_args.push_back(blob.substr(p, e - p));
+                args_from_files.push_back(blob.substr(p, e - p));
+                words.push_back(args_from_files.back().c_str());
                 p = e + 1;
             }
-            args_fd = fd;
-            i += 1;
+            // replace "--args FD" with the words, then re-point everything
+            // that walks the vector. the loop's ++i lands on the first of them.
+            auto at = args.begin() + i;
+            at = args.erase(at, at + 2);
+            args.insert(at, words.begin(), words.end());
+            eargc = static_cast<int>(args.size());
+            eargv = args.data();
+            args_file_end = i + static_cast<int>(words.size());
+            i -= 1;
         } else if (std::strcmp(a, "--allow-port") == 0) {
             if (!need(1, a)) return 1;
             // a claybin addition with no bubblewrap equivalent: grant TCP connect
@@ -559,23 +776,37 @@ int main(int argc, char** argv) {
             // all-or-nothing because a network namespace is all-or-nothing;
             // landlock (abi 4+) mediates per port, so this is a genuinely finer
             // boundary than the mount-namespace model can express.
-            auto port = static_cast<std::uint16_t>(std::strtoul(eargv[i + 1], nullptr, 10));
+            //
+            // parsed in full and range-checked BEFORE narrowing: the cast to
+            // uint16 used to happen first, so 65979 became 443 and 65536
+            // became 0 -- a grant on a port nobody typed.
+            unsigned long long port = 0;
+            if (!parse_uint(eargv[i + 1], 10, 65535ull, port)) {
+                std::fprintf(stderr, "claybin-run: --allow-port: invalid port '%s'\n",
+                             eargv[i + 1]);
+                return 1;
+            }
             if (port == 0) {
                 std::fprintf(stderr,
                              "claybin-run: --allow-port 0 means 'any port', which landlock "
                              "cannot enforce. use --share-net if that is what you want.\n");
                 return 1;
             }
-            policy = std::move(policy).connect("", port);
+            policy = std::move(policy).connect("", static_cast<std::uint16_t>(port));
             i += 1;
         } else if (std::strcmp(a, "--allow-bind-port") == 0) {
             if (!need(1, a)) return 1;
-            auto port = static_cast<std::uint16_t>(std::strtoul(eargv[i + 1], nullptr, 10));
+            unsigned long long port = 0;
+            if (!parse_uint(eargv[i + 1], 10, 65535ull, port)) {
+                std::fprintf(stderr, "claybin-run: --allow-bind-port: invalid port '%s'\n",
+                             eargv[i + 1]);
+                return 1;
+            }
             if (port == 0) {
                 std::fprintf(stderr, "claybin-run: --allow-bind-port 0 is not enforceable\n");
                 return 1;
             }
-            policy = std::move(policy).bind_port(port);
+            policy = std::move(policy).bind_port(static_cast<std::uint16_t>(port));
             i += 1;
         } else if (std::strcmp(a, "--setenv") == 0) {
             if (!need(2, a)) return 1;
@@ -647,9 +878,20 @@ int main(int argc, char** argv) {
         } else if (std::strcmp(a, "--require") == 0) {
             if (!need(1, a)) return 1;
             const char* l = eargv[i + 1];
-            require_level = std::strcmp(l, "strong") == 0    ? Enforcement::strong
-                            : std::strcmp(l, "partial") == 0 ? Enforcement::partial
-                                                             : Enforcement::advisory;
+            // an unknown level is an error. it used to fall through to
+            // `advisory` -- the weakest level there is -- so `--require stong`
+            // passed on every host and the check the caller asked for never ran.
+            if (std::strcmp(l, "strong") == 0)
+                require_level = Enforcement::strong;
+            else if (std::strcmp(l, "partial") == 0)
+                require_level = Enforcement::partial;
+            else if (std::strcmp(l, "advisory") == 0)
+                require_level = Enforcement::advisory;
+            else {
+                std::fprintf(stderr, "claybin-run: --require: unknown level '%s' "
+                                     "(want strong, partial or advisory)\n", l);
+                return 1;
+            }
             i += 1;
         } else if (std::strcmp(a, "--not-a-security-boundary") == 0) {
             std::fprintf(stderr,
@@ -666,14 +908,39 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "claybin-run: no command given\n");
         return 1;
     }
+    // a --perms (or --size) that nothing consumed is a mistake, not a no-op.
+    if (next_perms != kNoPerms) {
+        std::fprintf(stderr, "claybin-run: --perms must be followed by --tmpfs, --dir, "
+                             "--file, --bind-data or --ro-bind-data\n");
+        return 1;
+    }
+    if (next_size != 0) {
+        std::fprintf(stderr, "claybin-run: --size must be followed by --tmpfs\n");
+        return 1;
+    }
 
-    SyscallPolicy sys = std::strcmp(profile_name, "base") == 0   ? profiles::base()
-                        : std::strcmp(profile_name, "proc") == 0 ? profiles::with_processes()
-                        : std::strcmp(profile_name, "fs") == 0   ? profiles::with_filesystem()
-                        : std::strcmp(profile_name, "net") == 0  ? profiles::with_network()
-                        : std::strcmp(profile_name, "compiler-net") == 0
-                            ? profiles::compiler_with_network()
-                            : profiles::compiler();
+    // an unknown name is an error, not `compiler`. `--profile bsae` silently
+    // ran the guest under the far broader compiler profile (fork, exec,
+    // threads) when the caller had asked for the tightest one.
+    SyscallPolicy sys;
+    if (std::strcmp(profile_name, "base") == 0)
+        sys = profiles::base();
+    else if (std::strcmp(profile_name, "proc") == 0)
+        sys = profiles::with_processes();
+    else if (std::strcmp(profile_name, "fs") == 0)
+        sys = profiles::with_filesystem();
+    else if (std::strcmp(profile_name, "net") == 0)
+        sys = profiles::with_network();
+    else if (std::strcmp(profile_name, "compiler") == 0)
+        sys = profiles::compiler();
+    else if (std::strcmp(profile_name, "compiler-net") == 0)
+        sys = profiles::compiler_with_network();
+    else {
+        std::fprintf(stderr, "claybin-run: --profile: unknown profile '%s' "
+                             "(want base, proc, fs, net, compiler or compiler-net)\n",
+                     profile_name);
+        return 1;
+    }
     policy = std::move(policy).syscall_profile(sys);
     for (const auto& d : denies) policy = std::move(policy).deny(d);
     for (const auto& p : remount_ro) {
@@ -704,10 +971,33 @@ int main(int argc, char** argv) {
         return 1;
     }
 
+    if (disable_nested_userns &&
+        compiled->guarantees.strength(CapId::syscall_filter) < Enforcement::strong) {
+        std::fprintf(stderr, "claybin-run: --disable-userns needs a seccomp filter to "
+                             "enforce it, and this host cannot install one\n");
+        return 1;
+    }
+
     if (require_level != Enforcement::none) {
-        auto ok = compiled->require(require_level,
-                                    {CapId::fs_read, CapId::fs_write, CapId::syscall_filter,
-                                     CapId::proc_isolation, CapId::privilege_drop});
+        // the walls every sandbox has, plus every resource limit the caller
+        // actually asked for. the docs promise --require "fails on a host that
+        // cannot enforce every wall", but this list never included the limits:
+        // `--memory 2G --require strong` ran happily with an rlimit-only cap
+        // (reported `partial`) on a host with no delegated cgroup.
+        std::vector<CapId> need_caps = {CapId::fs_read, CapId::fs_write,
+                                        CapId::syscall_filter, CapId::proc_isolation,
+                                        CapId::privilege_drop};
+        const auto& res = sealed.data().resources;
+        if (!res.memory.is_unlimited()) need_caps.push_back(CapId::mem_limit);
+        if (!res.pids.is_unlimited()) need_caps.push_back(CapId::pid_limit);
+        if (!res.cpu_quota_percent.is_unlimited()) need_caps.push_back(CapId::cpu_limit);
+        Status ok{};
+        for (CapId c : need_caps) {
+            if (compiled->guarantees.strength(c) < require_level) {
+                ok = std::unexpected(Error{Errc::unsupported, cap_name(c)});
+                break;
+            }
+        }
         if (!ok) {
             std::fprintf(stderr, "claybin-run: host cannot enforce %.*s at %s\n",
                          static_cast<int>(ok.error().mechanism.size()),
@@ -733,39 +1023,6 @@ int main(int argc, char** argv) {
         return 0;
     }
 
-    // --lock-file: hold a shared flock for the sandbox's lifetime, so a caller
-    // can tell whether any sandbox is still using a shared tree. taken BEFORE
-    // the spawn and held by us, since the guest must not be able to release it.
-    std::vector<int> held_locks;
-    for (const auto& lf : lock_files) {
-        int fd = ::open(lf.c_str(), O_RDONLY | O_CREAT | O_CLOEXEC, 0666);
-        if (fd < 0) {
-            std::fprintf(stderr, "claybin-run: --lock-file %s: %s\n", lf.c_str(),
-                         std::strerror(errno));
-            return 1;
-        }
-        struct flock fl{};
-        fl.l_type = F_RDLCK;
-        fl.l_whence = SEEK_SET;
-        if (::fcntl(fd, F_SETLKW, &fl) < 0) {
-            std::fprintf(stderr, "claybin-run: --lock-file %s: %s\n", lf.c_str(),
-                         std::strerror(errno));
-            return 1;
-        }
-        held_locks.push_back(fd);
-    }
-
-    // --chmod: applied to HOST paths before the sandbox exists, which is what
-    // bwrap does. it mutates state outside the sandbox, so it is worth being
-    // loud about rather than quiet.
-    for (const auto& c : chmods) {
-        if (::chmod(c.second.c_str(), static_cast<mode_t>(c.first)) < 0) {
-            std::fprintf(stderr, "claybin-run: --chmod %o %s: %s\n", c.first,
-                         c.second.c_str(), std::strerror(errno));
-            return 1;
-        }
-    }
-
     // --block-fd: wait for the caller to say go. this is how a supervisor gets
     // to finish its own setup (cgroup placement, a seccomp notify listener)
     // before the guest runs.
@@ -784,7 +1041,6 @@ int main(int argc, char** argv) {
     // which binary we exec. shells and busybox-style multitools branch on it.
     const char* program = child_argv[0];
     if (argv0_override) child_argv[0] = argv0_override;
-    (void)next_perms;
 
     // the environment is authority: PATH decides what gets executed and
     // LD_PRELOAD decides what code runs inside the guest. so the policy's env
@@ -856,8 +1112,9 @@ int main(int argc, char** argv) {
                                     "{\n    \"child-pid\": %d,\n    \"mnt-namespace\": %llu\n}\n",
                                     sp->pid, mnt_ns)
                     : std::snprintf(buf, sizeof buf, "{\n    \"child-pid\": %d\n}\n", sp->pid);
-        ssize_t w = ::write(info_fd, buf, static_cast<std::size_t>(n));
-        (void)w;
+        if (!write_all(info_fd, buf, static_cast<std::size_t>(n)))
+            std::fprintf(stderr, "claybin-run: --info-fd %d: %s\n", info_fd,
+                         std::strerror(errno));
         ::close(info_fd);
     }
     if (json_fd >= 0) {
@@ -866,34 +1123,39 @@ int main(int argc, char** argv) {
                                        "{ \"child-pid\": %d, \"mnt-namespace\": %llu }\n",
                                        sp->pid, mnt_ns)
                        : std::snprintf(buf, sizeof buf, "{ \"child-pid\": %d }\n", sp->pid);
-        ssize_t w = ::write(json_fd, buf, static_cast<std::size_t>(n));
-        (void)w;
+        if (!write_all(json_fd, buf, static_cast<std::size_t>(n)))
+            std::fprintf(stderr, "claybin-run: --json-status-fd %d: %s\n", json_fd,
+                         std::strerror(errno));
     }
 
     // --sync-fd: held open for the sandbox's lifetime and closed when it exits,
     // so a caller watching it for EOF learns the sandbox is gone without
     // needing to be our parent.
     (void)sync_fd;
-    (void)userns_block_fd;
-    (void)args_fd;
-    (void)disable_nested_userns;
 
     int status = 0;
-    ::waitpid(sp->pid, &status, 0);
+    // retry on EINTR and check the result. claybin-run installs no signal
+    // handlers today, so this is defensive -- but an unchecked -1 here would
+    // report exit 0, success, for a guest that is still running.
+    pid_t waited;
+    do {
+        waited = ::waitpid(sp->pid, &status, 0);
+    } while (waited < 0 && errno == EINTR);
+    if (waited < 0) {
+        std::fprintf(stderr, "claybin-run: waitpid: %s\n", std::strerror(errno));
+        return 1;
+    }
     if (sp->pidfd >= 0) ::close(sp->pidfd);
 
     if (json_fd >= 0) {
         char buf[256];
         int code = WIFEXITED(status) ? WEXITSTATUS(status) : 128 + WTERMSIG(status);
         int n = std::snprintf(buf, sizeof buf, "{ \"exit-code\": %d }\n", code);
-        ssize_t w = ::write(json_fd, buf, static_cast<std::size_t>(n));
-        (void)w;
+        if (!write_all(json_fd, buf, static_cast<std::size_t>(n)))
+            std::fprintf(stderr, "claybin-run: --json-status-fd %d: %s\n", json_fd,
+                         std::strerror(errno));
         ::close(json_fd);
     }
-    // releasing the locks here rather than leaking them makes the lifetime
-    // exactly "while the sandbox runs", which is what a caller polling the lock
-    // is asking about.
-    for (int fd : held_locks) ::close(fd);
     if (sync_fd >= 0) ::close(sync_fd);
 
     if (WIFSIGNALED(status)) return 128 + WTERMSIG(status);
