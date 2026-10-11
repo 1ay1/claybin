@@ -158,13 +158,23 @@ Result<Spawned> spawn_in(const Plan& plan, const Command& cmd, const cgroup::Gro
     int relay[2] = {-1, -1};
     if (brokering && ::pipe2(relay, O_CLOEXEC) < 0)
         return std::unexpected(Error{Errc::spawn_failed, "pipe2 relay", errno});
+    // every early return below must give these back. they used to leak on
+    // each failure path after this point -- a supervisor that retries a
+    // failing spawn burned two descriptors per attempt until EMFILE.
+    auto close_relay = [&] {
+        if (relay[0] >= 0) ::close(relay[0]);
+        if (relay[1] >= 0) ::close(relay[1]);
+    };
 
     // a CLOEXEC socketpair, not a pipe: the child may need to send the seccomp
     // listener fd back, and SCM_RIGHTS needs a socket. on a successful exec the
     // write end closes and the parent reads EOF, exactly as with a pipe.
     int report[2] = {-1, -1};
-    if (::socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, report) < 0)
-        return std::unexpected(Error{Errc::spawn_failed, "socketpair", errno});
+    if (::socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, report) < 0) {
+        const int err = errno;
+        close_relay();
+        return std::unexpected(Error{Errc::spawn_failed, "socketpair", err});
+    }
 
     // a second pipe, the other direction: the child blocks on it until the
     // parent has put it in the cgroup. without this gate the child could exec
@@ -173,9 +183,11 @@ Result<Spawned> spawn_in(const Plan& plan, const Command& cmd, const cgroup::Gro
     int gate[2] = {-1, -1};
     const bool use_cgroup = cg.valid();
     if (use_cgroup && ::pipe2(gate, O_CLOEXEC) < 0) {
+        const int err = errno;
         ::close(report[0]);
         ::close(report[1]);
-        return std::unexpected(Error{Errc::spawn_failed, "pipe2 gate", errno});
+        close_relay();
+        return std::unexpected(Error{Errc::spawn_failed, "pipe2 gate", err});
     }
 
     // CLONE_PIDFD gives us a race-free handle on the child. without it, a pid
@@ -195,13 +207,15 @@ Result<Spawned> spawn_in(const Plan& plan, const Command& cmd, const cgroup::Gro
         pidfd = -1;
         pid = ::fork();
         if (pid < 0) {
+            const int err = errno;
             ::close(report[0]);
             ::close(report[1]);
             if (use_cgroup) {
                 ::close(gate[0]);
                 ::close(gate[1]);
             }
-            return std::unexpected(Error{Errc::spawn_failed, "fork", errno});
+            close_relay();
+            return std::unexpected(Error{Errc::spawn_failed, "fork", err});
         }
     }
 
