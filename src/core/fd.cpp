@@ -2,7 +2,7 @@
 
 #include <cstdio>
 
-#if defined(__linux__)
+#if !defined(_WIN32)
 #include <unistd.h>
 #endif
 
@@ -10,9 +10,11 @@ namespace clay {
 
 void OwnedFd::reset() {
     if (fd_ < 0) return;
-#if defined(__linux__)
+#if !defined(_WIN32)
     // no error check: a failing close on an fd we are discarding tells us
     // nothing actionable, and retrying it is the classic double-close bug.
+    // every POSIX host, not just linux: the macOS backend owns fds too, and
+    // skipping the close there leaks one per reset.
     ::close(fd_);
 #endif
     fd_ = -1;
