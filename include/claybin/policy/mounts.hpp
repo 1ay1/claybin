@@ -168,7 +168,7 @@ struct Mount {
     std::string source;  // host path, or symlink target; empty for tmpfs/proc
     std::string dest;    // path inside the sandbox
     std::uint64_t size{0};      // tmpfs size limit, 0 = default
-    std::uint32_t perms{0};     // octal mode for dir/symlink, 0 = default
+    std::uint32_t perms{0};     // octal mode for dir/tmpfs/file, 0 = default
     bool optional{false};       // --bind-try: skip if source is missing
 
     // overlay only. `lowers` are the read-only layers, HIGHEST priority first
@@ -214,8 +214,9 @@ class MountPlan {
         mounts_.push_back({MountKind::bind_dev, std::move(src), std::move(dst), 0, 0, false, {}, {}});
         return *this;
     }
-    MountPlan& tmpfs(std::string dst, std::uint64_t size = 0) {
-        mounts_.push_back({MountKind::tmpfs, {}, std::move(dst), size, 0, false, {}, {}});
+    // perms 0 means the default, 0755 -- bwrap's historical tmpfs mode.
+    MountPlan& tmpfs(std::string dst, std::uint64_t size = 0, std::uint32_t perms = 0) {
+        mounts_.push_back({MountKind::tmpfs, {}, std::move(dst), size, perms, false, {}, {}});
         return *this;
     }
     MountPlan& proc(std::string dst = "/proc") {

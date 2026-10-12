@@ -157,11 +157,16 @@ Probe probe() {
     // delegation was already in place one level up.
     if (already_leaf && !parent_path.empty()) {
         char pctl[512] = "";
+        // whole words, as everywhere else in this file. a bare strstr found
+        // "cpu" inside "cpuset", so a parent delegating only cpuset reported
+        // the cpu controller, and the guarantee report then claimed a STRONG
+        // cpu.max quota that create() could never write.
         if (read_file((parent_path + "/cgroup.subtree_control").c_str(), pctl, sizeof pctl) > 0 &&
-            (std::strstr(pctl, "memory") || std::strstr(pctl, "pids"))) {
-            pr.memory = std::strstr(pctl, "memory") != nullptr;
-            pr.pids = std::strstr(pctl, "pids") != nullptr;
-            pr.cpu = std::strstr(pctl, "cpu") != nullptr;
+            (has_word(pctl, "memory") || has_word(pctl, "pids"))) {
+            pr.memory = has_word(pctl, "memory");
+            pr.pids = has_word(pctl, "pids");
+            pr.cpu = has_word(pctl, "cpu");
+            pr.io = has_word(pctl, "io");
             pr.delegating_path = parent_path;
             pr.availability = Availability::delegated;
             return pr;
@@ -398,13 +403,18 @@ Result<Group> create(const Probe& pr, const ResourceLimits& limits,
             return std::unexpected(st.error());
     }
 
+    // the cpu writes are fatal like the others, and for the same reason: the
+    // caller reports cpu_limit as `strong` exactly when this returns a group.
+    // these were discarded with (void), so a refused cpu.max -- an EINVAL,
+    // the controller vanishing from subtree_control -- still produced a
+    // report claiming a hard quota the kernel never held.
     if (pr.cpu && !limits.cpu_weight.is_unlimited()) {
         // cpu.weight is 1-10000; clamp rather than reject so a caller passing
         // a share count gets something sensible.
         std::uint64_t w = limits.cpu_weight.value();
         if (w == 0) w = 1;
         if (w > 10000) w = 10000;
-        (void)set("cpu.weight", w);
+        if (auto st = set("cpu.weight", w); !st) return std::unexpected(st.error());
     }
 
     // cpu.max is a HARD quota: "$MAX $PERIOD" microseconds of cpu per period.
@@ -414,13 +424,20 @@ Result<Group> create(const Probe& pr, const ResourceLimits& limits,
     if (pr.cpu && !limits.cpu_quota_percent.is_unlimited()) {
         std::uint64_t pct = limits.cpu_quota_percent.value();
         if (pct == 0) pct = 1;
+        // a quota above the machine's whole capacity is not a cap at all, and
+        // left unbounded kPeriod * pct wraps for a large enough pct -- into a
+        // SMALL quota the caller never asked for. 1024 cores is far beyond any
+        // host this runs on and keeps the product well inside 64 bits.
+        constexpr std::uint64_t kMaxPct = 1024 * 100;
+        if (pct > kMaxPct) pct = kMaxPct;
         constexpr std::uint64_t kPeriod = 100000;  // 100ms, the kernel default
         std::uint64_t quota = (kPeriod * pct) / 100;
         if (quota == 0) quota = 1000;
         char q[64];
         std::snprintf(q, sizeof q, "%llu %llu", static_cast<unsigned long long>(quota),
                       static_cast<unsigned long long>(kPeriod));
-        (void)write_file(g.path_ + "/cpu.max", q);
+        if (auto st = write_file(g.path_ + "/cpu.max", q); !st)
+            return std::unexpected(st.error());
     }
 
     return g;

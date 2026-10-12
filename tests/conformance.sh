@@ -359,6 +359,45 @@ check_fd "args from fd" "$ARGS_BIN" \
     --args 9 --symlink usr/lib /lib --symlink usr/lib64 /lib64 --chdir / -- /usr/bin/true
 rm -f "$ARGS_BIN"
 
+# an empty string in an --args file is an ARGUMENT, not nothing. this used to
+# be dropped, shifting every later word: here `--setenv X "" --chdir /` became
+# `--setenv X --chdir` followed by a bare "/", i.e. the command "/".
+ARGS_BIN=$(mktemp)
+printf '%s\0%s\0%s\0' "--setenv" "X" "" > "$ARGS_BIN"
+check_fd "args from fd keeps empty strings" "$ARGS_BIN" \
+    $BASE --args 9 --chdir / -- /bin/sh -c 'echo "[${X-unset}]"'
+rm -f "$ARGS_BIN"
+
+# "--args" AFTER the command belongs to the guest. it used to be expanded by
+# claybin -- fd 9 read and closed in claybin's process, its contents spliced
+# into the guest's argv.
+ARGS_BIN=$(mktemp)
+printf '%s\0' "--should-not-appear" > "$ARGS_BIN"
+check_fd "guest's own --args is left alone" "$ARGS_BIN" \
+    $BASE --chdir / -- /bin/sh -c 'echo "$*"' sh --args 9
+rm -f "$ARGS_BIN"
+
+# --perms reaches --dir and --tmpfs, as in bwrap. it used to be ignored there,
+# so `--perms 0700 --dir /secret` made a 0755 directory.
+check "--perms 0700 --dir" \
+    $BASE --perms 0700 --dir /secret --chdir / -- /usr/bin/stat -c %a /secret
+check "--perms 0700 --tmpfs" \
+    $BASE --perms 0700 --tmpfs /secret --chdir / -- /usr/bin/stat -c %a /secret
+# (plain bytes: bwrap's --size takes no K/M/G suffix, so "1M" would make bwrap
+# fail for a reason unrelated to what these cases test.)
+check "--size then --perms then --tmpfs" \
+    $BASE --size 1048576 --perms 0750 --tmpfs /t --chdir / -- /usr/bin/stat -c %a /t
+
+# malformed numbers and modifiers that consume nothing are errors in bwrap,
+# and must be in claybin too: only the exit status is compared, both fail.
+check "--perms not octal" $BASE --perms 0999 --dir /d --chdir / -- /usr/bin/true
+check "--perms then a non-creating option" \
+    $BASE --perms 0700 --bind /tmp /x --chdir / -- /usr/bin/true
+check "--size then not --tmpfs" $BASE --size 1048576 --dir /d --chdir / -- /usr/bin/true
+check "--uid not a number" $BASE --uid abc --chdir / -- /usr/bin/id -u
+check "--info-fd not a number" $BASE --info-fd x --chdir / -- /usr/bin/true
+check "--args fd not a number" --args x $BASE --chdir / -- /usr/bin/true
+
 # the JSON status shape has to match field-for-field, since a supervisor parses
 # it. the ids themselves differ per run, so compare with numbers normalized.
 b_json=$($BWRAP $BASE --json-status-fd 3 --chdir / -- /bin/sh -c 'exit 7' \
@@ -625,8 +664,10 @@ if [ -x "$CLAY" ]; then
     fi
 
     # and a size we cannot honour must be REFUSED, not truncated. these are
-    # the shapes that used to slip through to a lethal cgroup.
-    for bad in 16 0 16Gi 16X sixteen; do
+    # the shapes that used to slip through to a lethal cgroup -- and "-1",
+    # which strtoull negates to UINT64_MAX, the "unlimited" sentinel: the
+    # sandbox ran with no memory cap at all.
+    for bad in 16 0 16Gi 16X sixteen -1 " 2G" +2G 18446744073709551615; do
         if "$CLAY" $BASE --memory "$bad" --chdir / -- /bin/true >/dev/null 2>&1
         then
             FAIL=$((FAIL+1))
@@ -636,6 +677,74 @@ if [ -x "$CLAY" ]; then
             printf '  ok    --memory %s is refused up front\n' "$bad"
         fi
     done
+
+    # claybin-only refusals. none of these has a bwrap baseline to diff
+    # against: each is a flag that used to be accepted and then did something
+    # other than what it says. a refusal is checked by exit status alone.
+    refuse() {
+        desc="$1"; shift
+        if "$CLAY" "$@" >/dev/null 2>&1; then
+            FAIL=$((FAIL+1))
+            printf '  FAIL  %s was accepted\n' "$desc"
+        else
+            PASS=$((PASS+1))
+            printf '  ok    %s is refused\n' "$desc"
+        fi
+    }
+    refuse "--allow-port 65979 (was truncated to 443)" \
+        $BASE --allow-port 65979 --chdir / -- /bin/true
+    refuse "--allow-port 65536 (was truncated to 0)" \
+        $BASE --allow-port 65536 --chdir / -- /bin/true
+    refuse "--uid 4294967295 (is the unset sentinel)" \
+        $BASE --uid 4294967295 --chdir / -- /bin/true
+    refuse "--cpu-percent abc (was a 1% quota)" \
+        $BASE --cpu-percent abc --chdir / -- /bin/true
+    refuse "--processes -5 (was unlimited)" \
+        $BASE --processes -5 --chdir / -- /bin/true
+    refuse "--profile with a typo (was the compiler profile)" \
+        $BASE --profile bsae --chdir / -- /bin/true
+    refuse "--require with a typo (was advisory)" \
+        $BASE --require stong --chdir / -- /bin/true
+    refuse "--perms 0 (would become the default mode)" \
+        $BASE --perms 0 --dir /d --chdir / -- /bin/true
+
+    # --chmod and --lock-file used to act on the HOST path of the same name.
+    # the refusal must leave that path exactly as it was.
+    HOSTF=$(mktemp)
+    chmod 0600 "$HOSTF"
+    refuse "--chmod (was applied to the host path)" \
+        $BASE --chmod 0777 "$HOSTF" --chdir / -- /bin/true
+    if [ "$(stat -c %a "$HOSTF")" = 600 ]; then
+        PASS=$((PASS+1))
+        printf '  ok    --chmod left the host file alone\n'
+    else
+        FAIL=$((FAIL+1))
+        printf '  FAIL  --chmod changed the HOST file to %s\n' "$(stat -c %a "$HOSTF")"
+    fi
+    rm -f "$HOSTF"
+    HOSTD=$(mktemp -d)
+    refuse "--lock-file (was opened with O_CREAT on the host)" \
+        $BASE --lock-file "$HOSTD/lock" --chdir / -- /bin/true
+    if [ ! -e "$HOSTD/lock" ]; then
+        PASS=$((PASS+1))
+        printf '  ok    --lock-file created nothing on the host\n'
+    else
+        FAIL=$((FAIL+1))
+        printf '  FAIL  --lock-file created %s on the HOST\n' "$HOSTD/lock"
+    fi
+    rm -rf "$HOSTD"
+
+    # an --args file holds options. a command inside one used to end option
+    # parsing early, turning every later command-line flag -- here a --memory
+    # cap -- into an argument to the file's command.
+    ARGS_BIN=$(mktemp)
+    printf '%s\0%s\0' "--" "/bin/true" > "$ARGS_BIN"
+    refuse "an --args file containing a command" \
+        $BASE --args 9 --memory 64M 9<"$ARGS_BIN"
+    printf '%s\0%s\0' "--args" "9" > "$ARGS_BIN"
+    refuse "--args inside an --args file" \
+        $BASE --args 9 --chdir / -- /bin/true 9<"$ARGS_BIN"
+    rm -f "$ARGS_BIN"
 else
     SKIP=$((SKIP+1))
     printf '  skip  claybin-run not built\n'

@@ -144,10 +144,10 @@ and fails in practice.
 59 explicitly and the 8 `--unshare-*` variants by prefix (an unknown flag still
 errors, so the prefix match does not swallow typos). conformance is **51/51**.
 
-what differs is behaviour in five places, and all five are claybin being
-stricter on purpose. every one *refuses* rather than silently doing something
-else, because a sandbox that quietly gives you less than you asked for is worse
-than one that fails:
+what differs is behaviour in a handful of places, and all of them are claybin
+being stricter on purpose. every one *refuses* rather than silently doing
+something else, because a sandbox that quietly gives you less than you asked for
+is worse than one that fails:
 
 | flag | claybin | why |
 |---|---|---|
@@ -156,20 +156,28 @@ than one that fails:
 | `--cap-add ALL` | refused | same, wholesale |
 | `--seccomp FD` / `--add-seccomp-fd` | refused | claybin compiles its own filter; accepting the flag while running a *different* filter than the caller supplied is the worst available outcome. use `--profile`. |
 | `--userns` / `--userns2` / `--pidns` | refused | joining a namespace claybin did not build makes the guarantee report a guess |
+| `--userns-block-fd` | refused | claybin's guest is already running when `--info-fd` is written, so it cannot pause where bwrap does. it used to be accepted and ignored, letting the guest run before the caller's setup. use `--block-fd` |
+| `--chmod` | refused | see below: it used to chmod the **host** |
+| `--lock-file` | refused | bwrap opens DEST inside the sandbox without creating it; claybin opened the **host** path with `O_CREAT` and locked a file the guest never saw. returns with an in-tree plan op |
+| `--disable-userns` / `--assert-userns-disabled` | needs a syscall filter | every profile already blocks new user namespaces; the flag now fails on a host that cannot install the filter, instead of being ignored |
+| unknown `--profile` / `--require` value | refused | they used to fall back to `compiler` and `advisory`, so a typo widened the filter or switched the check off |
 
-that last one is the interesting refusal. the others are about privilege; this
-one is about honesty. the whole value of `Compiled::guarantees` is that it
+the `--userns` refusal is the interesting one. the others are about privilege;
+that one is about honesty. the whole value of `Compiled::guarantees` is that it
 describes walls claybin actually installed — if it inherits a namespace someone
 else made, it has no idea what that namespace enforces, and every line of the
 report becomes speculation.
 
-two more are accepted but weaker than bwrap's version, and say so:
+two more are accepted but weaker than bwrap's version, and say so, and one is
+refused because the old behaviour was wrong:
 
 - `--exec-label` / `--file-label` are parsed and stored, but SELinux transitions
   are not applied. the report does not claim them.
-- `--chmod` mutates a **host** path, like bwrap's. claybin does it because
-  conformance demands it, but it is the one place a claybin policy has an effect
-  outside the sandbox, which is worth knowing.
+- `--chmod` is **refused** for now. bubblewrap applies it inside the new root
+  (`get_newroot_path(dest)`), after the binds. claybin used to apply it to the
+  same path on the **host** before the sandbox existed, so an ordinary
+  `--bind "$APP" /app --chmod 0755 /app/bin` changed the host's `/app/bin`.
+  it comes back once the plan has an in-tree chmod op.
 
 and one place claybin is genuinely better: `--mqueue` works. bubblewrap mounts it
 before building `/dev` and fails with `EPERM` on an unprivileged user namespace;
@@ -217,4 +225,6 @@ claybin-run \
 
 `--deny` adds a landlock hole that has no bwrap equivalent. `--require strong`
 makes the command fail on a host that cannot enforce every wall, instead of
-running with fewer than you asked for.
+running with fewer than you asked for. the walls are the filesystem, syscall
+filter, process isolation and privilege drop, plus every resource limit you
+asked for (`--memory`, `--processes`, `--cpu-percent`).

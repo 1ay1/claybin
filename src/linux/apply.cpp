@@ -736,9 +736,37 @@ Status Plan::apply_range(Phase first, Phase last, ApplyFds& fds) const {
                     const char* leaf = nullptr;
                     int err = 0;
                     if (resolve_parent_beneath(path, scratch, sizeof scratch, &dir, &leaf, &err)) {
+                        const long mode = static_cast<long>(op.mode ? op.mode : 0755);
+                        // created owner-only first, so the open below always
+                        // succeeds -- a requested mode without owner read
+                        // (--perms 0311) would make O_RDONLY fail -- and so
+                        // the directory is never briefly MORE open than asked.
                         long rc = sys(SYS_mkdirat, dir, reinterpret_cast<long>(leaf),
-                                      static_cast<long>(op.mode ? op.mode : 0755));
+                                      op.mode ? 0700L : mode);
                         int merr = errno;
+                        // mkdirat's mode is masked by the umask, so a caller's
+                        // `--perms 0775 --dir d` became 0755 under the usual
+                        // 022 (bwrap sets umask(0) for exactly this). and the
+                        // setuid/setgid/sticky bits are never taken from mkdir.
+                        // so when WE just made the directory and a mode was
+                        // asked for, set it exactly.
+                        //
+                        // through an fd, not fchmodat: the fchmodat syscall has
+                        // no flags argument and FOLLOWS a symlink at the leaf,
+                        // and the guest tree can be shared with other writers
+                        // between our mkdir and our chmod. O_NOFOLLOW|O_DIRECTORY
+                        // on the parent fd refuses anything but the directory.
+                        if (rc == 0 && op.mode != 0) {
+                            long lfd = sys(SYS_openat, dir, reinterpret_cast<long>(leaf),
+                                           O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC, 0);
+                            long crc = lfd < 0 ? -1 : sys(SYS_fchmod, lfd, mode);
+                            int cerr = errno;
+                            if (lfd >= 0) sys(SYS_close, lfd);
+                            if (lfd < 0 || crc < 0) {
+                                sys(SYS_close, dir);
+                                return die(Errc::io_error, "mkdir: chmod", cerr);
+                            }
+                        }
                         sys(SYS_close, dir);
                         if (rc < 0 && merr != EEXIST) return die(Errc::io_error, "mkdir", merr);
                         return true;
@@ -1007,6 +1035,17 @@ Status Plan::apply_range(Phase first, Phase last, ApplyFds& fds) const {
                               O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC,
                               static_cast<long>(op.perms));
                 if (out < 0) return die(Errc::io_error, "write_fd: open dest", errno);
+
+                // the exact mode, set on the fd we hold. O_CREAT's mode is
+                // masked by the umask (and is ignored when touch_file already
+                // made the file), so `--perms 0640 --file` gave 0644 or worse.
+                // bwrap fchmods for the same reason. on the fd, so no path is
+                // re-resolved and nothing can be swapped in between.
+                if (sys(SYS_fchmod, out, static_cast<long>(op.perms)) < 0) {
+                    int err = errno;
+                    sys(SYS_close, out);
+                    return die(Errc::io_error, "write_fd: chmod", err);
+                }
 
                 // copy. a fixed stack buffer, no allocation: this runs post-fork.
                 char buf[65536];
