@@ -86,12 +86,19 @@ class Group {
     Group() = default;
     Group(const Group&) = delete;
     Group& operator=(const Group&) = delete;
-    Group(Group&& o) noexcept : path_(std::move(o.path_)), fd_(o.fd_) { o.fd_ = -1; }
+    // a moved-from group must own NO path, or its destructor would rmdir the
+    // cgroup it just handed over. a moved-from std::string is only "valid but
+    // unspecified", so it is cleared explicitly rather than trusted to be empty.
+    Group(Group&& o) noexcept : path_(std::move(o.path_)), fd_(o.fd_) {
+        o.path_.clear();
+        o.fd_ = -1;
+    }
     Group& operator=(Group&& o) noexcept {
         if (this != &o) {
             release();
             path_ = std::move(o.path_);
             fd_ = o.fd_;
+            o.path_.clear();
             o.fd_ = -1;
         }
         return *this;
@@ -137,6 +144,10 @@ class Group {
 //
 // fails rather than silently skipping: a caller who asked for a 512 MB cap and
 // got no cgroup needs to know, and `Compiled::guarantees` is how they find out.
+//
+// always a directory this call just made: an existing one is never adopted, so
+// two groups are two cgroups even when one process creates both, and a leftover
+// from a dead process never lends us its limits or its tenants.
 Result<Group> create(const Probe& probe, const ResourceLimits& limits,
                      std::string_view name_hint);
 
