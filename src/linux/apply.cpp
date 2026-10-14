@@ -529,6 +529,31 @@ void unescape_inplace(char* s) {
 // returns false only on a failure that matters. a submount we cannot read is
 // one the guest cannot reach either, so EACCES is ignored -- that is
 // bubblewrap's reasoning and it is sound.
+// the same thing in one syscall (5.12+): mount_setattr with AT_RECURSIVE sets
+// attr_set on every mount in the subtree and keeps what each already had, so
+// an existing noexec survives just as in the walk below. the walk rereads
+// mountinfo per bind, which is O(binds x mounts) and took seconds on a
+// workspace with a few thousand protected paths. false means "use the walk".
+bool remount_tree_fast(const char* target, std::uint64_t add) {
+#ifndef SYS_mount_setattr
+    (void)target; (void)add;
+    return false;
+#else
+    struct MountAttr {
+        std::uint64_t attr_set, attr_clr, propagation, userns_fd;
+    } attr{};
+    // MS_* to MOUNT_ATTR_*, only the bits remount_recursive adds.
+    if (add & 1) attr.attr_set |= 0x1;   // MS_RDONLY -> MOUNT_ATTR_RDONLY
+    if (add & 2) attr.attr_set |= 0x2;   // MS_NOSUID -> MOUNT_ATTR_NOSUID
+    if (add & 4) attr.attr_set |= 0x4;   // MS_NODEV  -> MOUNT_ATTR_NODEV
+    if (add & 8) attr.attr_set |= 0x8;   // MS_NOEXEC -> MOUNT_ATTR_NOEXEC
+    if (add & ~std::uint64_t{0xf}) return false;   // anything else: the walk
+    constexpr long kAtRecursive = 0x8000;
+    return sys(SYS_mount_setattr, AT_FDCWD, reinterpret_cast<long>(target), kAtRecursive,
+               reinterpret_cast<long>(&attr), static_cast<long>(sizeof attr)) == 0;
+#endif
+}
+
 bool remount_tree(const char* target, std::uint64_t add, char* buf, std::size_t cap) {
     int fd = static_cast<int>(sys(SYS_openat, AT_FDCWD,
                                  reinterpret_cast<long>("/proc/self/mountinfo"),
@@ -964,7 +989,7 @@ Status Plan::apply_range(Phase first, Phase last, ApplyFds& fds) const {
                 // cannot allocate here, so it is on the stack. if it does not
                 // fit we fail rather than lock down only the mounts we saw.
                 char mi[64 * 1024];
-                if (!remount_tree(tgt, add, mi, sizeof mi)) {
+                if (!remount_tree_fast(tgt, add) && !remount_tree(tgt, add, mi, sizeof mi)) {
                     if (!optional) return die(Errc::permission_denied, "remount_rec", errno);
                 }
                 return true;

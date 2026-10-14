@@ -289,5 +289,70 @@ int main() {
         CHECK(p.fidelity() == Fidelity::impossible);
     }
 
+    // -- the batched implied_authority matches the in-order fold ----------
+    // implied_authority and normalize were rewritten to stop being quadratic
+    // (a few thousand binds cost seconds per spawn). this is the old
+    // algorithm verbatim, folded one mount at a time, and the two must agree
+    // grant for grant on random plans that mix masks, re-grants after a mask,
+    // and nested paths.
+    {
+        auto reference = [](const MountPlan& plan) {
+            FsAuthority fs;
+            for (const auto& m : plan.mounts()) {
+                switch (m.kind) {
+                    case MountKind::bind_ro: fs.grant(m.dest, FileRights::exec()); break;
+                    case MountKind::bind:
+                    case MountKind::bind_dev: fs.grant(m.dest, FileRights::all()); break;
+                    case MountKind::tmpfs:
+                    case MountKind::proc:
+                    case MountKind::devtmpfs:
+                    case MountKind::mqueue: fs.grant(m.dest, FileRights::write()); break;
+                    case MountKind::symlink:
+                    case MountKind::dir: fs.grant(m.dest, FileRights::read()); break;
+                    case MountKind::mask: fs.deny(m.dest); break;
+                    default: break;   // not generated below
+                }
+            }
+            // the old quadratic normalize
+            std::vector<FsGrant> g = fs.grants();
+            std::vector<FsGrant> kept;
+            for (const auto& x : g) {
+                FileRights inherited = FileRights::nothing();
+                std::size_t best = 0;
+                bool found = false;
+                for (const auto& a : kept) {
+                    if (a.path == x.path || !path::covers(a.path, x.path)) continue;
+                    std::size_t len = a.path == "/" ? 0 : a.path.size();
+                    if (!found || len >= best) { inherited = a.rights; best = len; found = true; }
+                }
+                if (found && inherited == x.rights) continue;
+                kept.push_back(x);
+            }
+            return kept;
+        };
+        static const char* const kNested[] = {"/", "/a", "/a/b", "/a/b/c", "/a/bx",
+                                              "/a/b/c/d", "/e", "/e/f", "/a/./b", "/a/b/"};
+        Rng r{0xD1FFull};
+        int mismatches = 0;
+        for (int i = 0; i < 5000; ++i) {
+            MountPlan p;
+            const std::uint32_t n = 1 + r.below(12);
+            for (std::uint32_t k = 0; k < n; ++k) {
+                const char* d = kNested[r.below(std::size(kNested))];
+                switch (r.below(7)) {
+                    case 0: p.bind_ro(d, d); break;
+                    case 1: p.bind(d, d); break;
+                    case 2: p.tmpfs(d); break;
+                    case 3: p.mask(d); break;
+                    case 4: p.dir(d); break;
+                    case 5: p.symlink("/x", d); break;
+                    default: p.proc(d); break;
+                }
+            }
+            if (p.implied_authority().grants() != reference(p)) ++mismatches;
+        }
+        CHECK(mismatches == 0);
+    }
+
     return finish("mount_algebra_test");
 }

@@ -16,6 +16,8 @@
 #pragma once
 
 #include <algorithm>
+#include <iterator>
+#include <unordered_map>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -203,6 +205,27 @@ class FsAuthority {
 
     FsAuthority& deny(std::string_view p) { return restrict_to(p, FileRights::nothing()); }
 
+    // many grants at once, the same as calling grant() for each. one sort
+    // instead of an insert per grant, which is quadratic for a big mount plan.
+    FsAuthority& grant_all(std::vector<FsGrant> more) {
+        for (auto& g : more) g.path = path::normalize(g.path);
+        grants_.insert(grants_.end(), std::make_move_iterator(more.begin()),
+                       std::make_move_iterator(more.end()));
+        std::stable_sort(grants_.begin(), grants_.end(), [](const FsGrant& x, const FsGrant& y) {
+            return less_(x.path, y.path);
+        });
+        std::vector<FsGrant> out;
+        out.reserve(grants_.size());
+        for (auto& g : grants_) {
+            if (!out.empty() && out.back().path == g.path)
+                out.back().rights = FileRights{out.back().rights.unsafe_join(g.rights)};
+            else
+                out.push_back(std::move(g));
+        }
+        grants_ = std::move(out);
+        return *this;
+    }
+
     // what the subtree at `p` is actually allowed to do: the rights of the most
     // specific grant covering it.
     FileRights effective(std::string_view p) const {
@@ -280,23 +303,24 @@ class FsAuthority {
     // the per-spawn setup cost.
     void normalize() {
         sort_();
+        // each grant's nearest kept ancestor, found by walking up its own path
+        // ("/a/b/c" -> "/a/b" -> "/a" -> "/") through an index of the kept
+        // set. it used to scan every kept grant per grant, which is quadratic
+        // and cost seconds per spawn with a few thousand binds.
         std::vector<FsGrant> kept;
         kept.reserve(grants_.size());
-        for (const auto& g : grants_) {
-            FileRights inherited = FileRights::nothing();
-            std::size_t best_len = 0;
-            bool found = false;
-            for (const auto& a : kept) {
-                if (a.path == g.path) continue;
-                if (!path::covers(a.path, g.path)) continue;
-                std::size_t len = a.path == "/" ? 0 : a.path.size();
-                if (!found || len >= best_len) {
-                    inherited = a.rights;
-                    best_len = len;
-                    found = true;
-                }
+        std::unordered_map<std::string, FileRights> kept_at;
+        kept_at.reserve(grants_.size());
+        for (auto& g : grants_) {
+            const FileRights* inherited = nullptr;
+            std::string_view up = g.path;
+            while (!inherited && up != "/") {
+                const auto slash = up.rfind('/');
+                up = slash == 0 ? std::string_view{"/"} : up.substr(0, slash);
+                if (auto it = kept_at.find(std::string{up}); it != kept_at.end())
+                    inherited = &it->second;
             }
-            if (found && inherited == g.rights) continue;   // redundant
+            if (inherited && *inherited == g.rights) continue;   // redundant
             // a denial with no EXPLICIT ancestor grant used to be dropped here
             // as a no-op. it is not: compile() intersects this authority with
             // the one the MOUNTS imply, and that happens after normalize(), so
@@ -310,9 +334,9 @@ class FsAuthority {
             // reads correct.
             //
             // so a denial is only redundant against an ancestor that is ALSO a
-            // denial, which the `inherited == g.rights` line above already
-            // covers.
-            kept.push_back(g);
+            // denial, which the redundancy check above already covers.
+            kept_at.emplace(g.path, g.rights);
+            kept.push_back(std::move(g));
         }
         grants_ = std::move(kept);
     }

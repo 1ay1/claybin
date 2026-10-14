@@ -15,8 +15,10 @@
 // an attacker needs to beat both.
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 #include "claybin/core/fd.hpp"
@@ -490,29 +492,38 @@ class MountPlan {
     // gets nothing -- which is the property tests/mount_algebra_test.cpp
     // checks against random plans.
     FsAuthority implied_authority() const {
-        FsAuthority fs;
-        for (const auto& m : mounts_) {
+        // grants join, so their order doesn't matter and they go in as one
+        // batch (an insert each was quadratic for a big plan). a mask REPLACES
+        // whatever was granted at its path, so the masks are applied after,
+        // each only if no later mount grants that exact path again --
+        // the same result the in-order loop gave.
+        std::vector<FsGrant> grants;
+        grants.reserve(mounts_.size());
+        std::vector<std::size_t> masks;
+        auto grant = [&](const std::string& p, FileRights r) { grants.push_back({p, r}); };
+        for (std::size_t i = 0; i < mounts_.size(); ++i) {
+            const auto& m = mounts_[i];
             switch (m.kind) {
                 case MountKind::bind_ro:
-                    fs.grant(m.dest, FileRights::exec());  // read + execute
+                    grant(m.dest, FileRights::exec());  // read + execute
                     break;
                 case MountKind::bind:
                 case MountKind::bind_dev:
-                    fs.grant(m.dest, FileRights::all());
+                    grant(m.dest, FileRights::all());
                     break;
                 case MountKind::tmpfs:
-                    fs.grant(m.dest, FileRights::write());
+                    grant(m.dest, FileRights::write());
                     break;
                 case MountKind::proc:
                 case MountKind::devtmpfs:
                 case MountKind::mqueue:
-                    fs.grant(m.dest, FileRights::write());
+                    grant(m.dest, FileRights::write());
                     break;
                 case MountKind::symlink:
                     // a symlink IS content from the guest's point of view: it has
                     // to be readable or `ls -l` on it fails with EPERM, which
                     // looks like a broken sandbox rather than a missing grant.
-                    fs.grant(m.dest, FileRights::read());
+                    grant(m.dest, FileRights::read());
                     break;
                 case MountKind::mask:
                     // the one mount kind that REMOVES authority. an empty thing
@@ -522,33 +533,53 @@ class MountPlan {
                     // path the mount just emptied. harmless either way (there is
                     // nothing left to read) but the report would overstate what
                     // the guest can reach, and the report is the product.
-                    fs.deny(m.dest);
+                    masks.push_back(i);
                     break;
                 case MountKind::dir:
                     // a directory we created for the guest should be usable.
                     // read-only: a caller who wants to write there binds or
                     // tmpfs-mounts it instead.
-                    fs.grant(m.dest, FileRights::read());
+                    grant(m.dest, FileRights::read());
                     break;
 
                 case MountKind::overlay:
                 case MountKind::tmp_overlay:
                     // the merged view is writable, because the upper layer is.
-                    fs.grant(m.dest, FileRights::all());
+                    grant(m.dest, FileRights::all());
                     break;
                 case MountKind::ro_overlay:
                     // no upper layer, so the merge cannot be written at all.
-                    fs.grant(m.dest, FileRights::exec());  // read + execute
+                    grant(m.dest, FileRights::exec());  // read + execute
                     break;
 
                 case MountKind::file:
                 case MountKind::bind_data:
-                    fs.grant(m.dest, FileRights::write());
+                    grant(m.dest, FileRights::write());
                     break;
                 case MountKind::bind_data_ro:
-                    fs.grant(m.dest, FileRights::read());
+                    grant(m.dest, FileRights::read());
                     break;
             }
+        }
+        FsAuthority fs;
+        if (masks.empty()) {
+            fs.grant_all(std::move(grants));
+        } else {
+            // a grant at a mask's path that comes AFTER the mask re-joins onto
+            // the denial, so it has to be applied after it too.
+            std::unordered_map<std::string, std::size_t> last_mask;
+            for (auto i : masks) last_mask[path::normalize(mounts_[i].dest)] = i;
+            std::vector<FsGrant> early, late;
+            std::size_t gi = 0;
+            for (std::size_t i = 0; i < mounts_.size(); ++i) {
+                if (mounts_[i].kind == MountKind::mask) continue;
+                auto& g = grants[gi++];
+                auto it = last_mask.find(path::normalize(g.path));
+                (it != last_mask.end() && i > it->second ? late : early).push_back(std::move(g));
+            }
+            fs.grant_all(std::move(early));
+            for (auto& [p, _] : last_mask) fs.deny(p);
+            for (auto& g : late) fs.grant(g.path, g.rights);
         }
         fs.normalize();
         return fs;
