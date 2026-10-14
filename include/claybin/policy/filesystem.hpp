@@ -180,28 +180,24 @@ class FsAuthority {
     // is not part of the composition api.
     FsAuthority& grant(std::string_view p, FileRights r) {
         std::string norm = path::normalize(p);
-        for (auto& g : grants_) {
-            if (g.path == norm) {
-                g.rights = FileRights{g.rights.unsafe_join(r)};
-                return *this;
-            }
+        auto it = find_slot_(norm);
+        if (it != grants_.end() && it->path == norm) {
+            it->rights = FileRights{it->rights.unsafe_join(r)};
+            return *this;
         }
-        grants_.push_back({std::move(norm), r});
-        sort_();
+        grants_.insert(it, {std::move(norm), r});
         return *this;
     }
 
     // punch a hole: an explicit sub-grant with fewer rights than its ancestor.
     FsAuthority& restrict_to(std::string_view p, FileRights r) {
         std::string norm = path::normalize(p);
-        for (auto& g : grants_) {
-            if (g.path == norm) {
-                g.rights = r;
-                return *this;
-            }
+        auto it = find_slot_(norm);
+        if (it != grants_.end() && it->path == norm) {
+            it->rights = r;
+            return *this;
         }
-        grants_.push_back({std::move(norm), r});
-        sort_();
+        grants_.insert(it, {std::move(norm), r});
         return *this;
     }
 
@@ -338,9 +334,19 @@ class FsAuthority {
     void sort_() {
         // shallow-to-deep, so ancestors are visited before descendants.
         std::sort(grants_.begin(), grants_.end(), [](const FsGrant& x, const FsGrant& y) {
-            if (x.path.size() != y.path.size()) return x.path.size() < y.path.size();
-            return x.path < y.path;
+            return less_(x.path, y.path);
         });
+    }
+
+    static bool less_(std::string_view x, std::string_view y) {
+        if (x.size() != y.size()) return x.size() < y.size();
+        return x < y;
+    }
+
+    // grants_ is kept in sort_() order, so a lookup is a binary search.
+    std::vector<FsGrant>::iterator find_slot_(std::string_view p) {
+        return std::lower_bound(grants_.begin(), grants_.end(), p,
+                                [](const FsGrant& g, std::string_view k) { return less_(g.path, k); });
     }
 
     std::vector<FsGrant> grants_;

@@ -21,6 +21,7 @@
 #include <span>
 #include <string>
 #include <string_view>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -494,13 +495,12 @@ class PlanBuilder {
     // intern a string with a trailing nul so the post-fork path can pass it
     // straight to a syscall. identical strings are shared.
     Ref intern(std::string_view s) {
-        for (const auto& e : interned_)
-            if (e.first == s) return e.second;
+        if (auto it = interned_.find(s); it != interned_.end()) return it->second;
         Ref r{static_cast<std::uint32_t>(strings_.size()), static_cast<std::uint32_t>(s.size())};
         strings_.insert(strings_.end(), reinterpret_cast<const std::byte*>(s.data()),
                         reinterpret_cast<const std::byte*>(s.data()) + s.size());
         strings_.push_back(std::byte{0});
-        interned_.emplace_back(std::string(s), r);
+        interned_.emplace(std::string(s), r);
         return r;
     }
 
@@ -554,7 +554,14 @@ class PlanBuilder {
 
     std::vector<std::byte> strings_;
     std::vector<std::byte> ops_;
-    std::vector<std::pair<std::string, Ref>> interned_;
+    // transparent hash so intern() can look up a string_view without copying.
+    struct SvHash {
+        using is_transparent = void;
+        std::size_t operator()(std::string_view s) const noexcept {
+            return std::hash<std::string_view>{}(s);
+        }
+    };
+    std::unordered_map<std::string, Ref, SvHash, std::equal_to<>> interned_;
     Phase last_phase_{Phase::namespaces};
     bool ordering_broken_{false};
 };
