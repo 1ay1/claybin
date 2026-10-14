@@ -9,6 +9,7 @@
 #include <utility>
 #include <fcntl.h>
 #include <sched.h>
+#include <poll.h>
 #include <sys/prctl.h>
 #include <sys/socket.h>
 #include <sys/syscall.h>
@@ -329,7 +330,8 @@ Result<Spawned> spawn_in(const Plan& plan, const Command& cmd, const cgroup::Gro
                 // waitpid() still means what they expect.
                 ::close(report[1]);
                 int wst = 0;
-                ::waitpid(inner, &wst, 0);
+                while (::waitpid(inner, &wst, 0) < 0 && errno == EINTR) {
+                }
                 if (WIFSIGNALED(wst)) ::_exit(128 + WTERMSIG(wst));
                 ::_exit(WIFEXITED(wst) ? WEXITSTATUS(wst) : 1);
             }
@@ -574,6 +576,27 @@ Result<Spawned> spawn_in(const Plan& plan, const Command& cmd, const cgroup::Gro
 
     // recvmsg, because the shepherd may relay the seccomp listener as ancillary
     // data. a plain failure report arrives the same way.
+    //
+    // bounded: setup takes well under a second, but a guest that blocks in it
+    // (a bind or stat on a dead FUSE/NFS mount) would otherwise hold this
+    // call forever, and the caller's timeouts only start once we return.
+    {
+        constexpr int kSetupTimeoutMs = 30'000;
+        struct pollfd pfd{report[0], POLLIN, 0};
+        int pr;
+        do pr = ::poll(&pfd, 1, kSetupTimeoutMs); while (pr < 0 && errno == EINTR);
+        if (pr == 0) {
+            // the shepherd is pid 1 of the guest's pid namespace, so killing
+            // it takes the rest; the cgroup covers a host with no pidns.
+            if (use_cgroup && cg.kill_supported()) (void)cg.kill();
+            ::kill(static_cast<pid_t>(pid), SIGKILL);
+            int st = 0;
+            ::waitpid(static_cast<pid_t>(pid), &st, 0);
+            ::close(report[0]);
+            if (pidfd >= 0) ::close(pidfd);
+            return std::unexpected(Error{Errc::spawn_failed, "setup timed out", ETIMEDOUT});
+        }
+    }
     int received_fd = -1;
     ssize_t n;
     {
@@ -589,7 +612,7 @@ Result<Spawned> spawn_in(const Plan& plan, const Command& cmd, const cgroup::Gro
         msg.msg_iovlen = 1;
         msg.msg_control = u.buf;
         msg.msg_controllen = sizeof u.buf;
-        n = ::recvmsg(report[0], &msg, 0);
+        do n = ::recvmsg(report[0], &msg, 0); while (n < 0 && errno == EINTR);
         if (n > 0)
             for (struct cmsghdr* cm = CMSG_FIRSTHDR(&msg); cm; cm = CMSG_NXTHDR(&msg, cm))
                 if (cm->cmsg_level == SOL_SOCKET && cm->cmsg_type == SCM_RIGHTS)
