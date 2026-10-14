@@ -244,18 +244,23 @@ Result<Spawned> spawn_in(const Plan& plan, const Command& cmd, const cgroup::Gro
         // Found as an intermittent SIGTERM apparently crashing a test that
         // had already passed.
         //
-        // Async-signal-safe: sigaction/sigprocmask only, no allocation.
+        // Async-signal-safe: raw rt_sigaction/rt_sigprocmask, NOT glibc's
+        // sigaction. Since glibc 2.41 sigaction(SIGABRT) takes glibc's abort
+        // lock, and posix_spawn/fork on another thread hold it for reading.
+        // We came here through a raw clone3, so if one was mid-spawn at that
+        // instant the child's copy of the lock is held forever and the first
+        // sigaction(SIGABRT) waits on it. Seen as spawns stuck in futex_wait
+        // until the 30s setup timeout.
         {
-            struct sigaction dfl{};
-            dfl.sa_handler = SIG_DFL;
-            sigemptyset(&dfl.sa_mask);
-            for (int s = 1; s < NSIG; ++s) {
+            // all-zero kernel sigaction == SIG_DFL, no flags, empty mask.
+            const std::uint64_t dfl[4] = {0, 0, 0, 0};
+            constexpr long kSigsetBytes = 8;   // _NSIG / 8 on Linux
+            for (int s = 1; s < 65; ++s) {
                 if (s == SIGKILL || s == SIGSTOP) continue;   // cannot be set
-                ::sigaction(s, &dfl, nullptr);
+                ::syscall(SYS_rt_sigaction, s, dfl, nullptr, kSigsetBytes);
             }
-            sigset_t none;
-            sigemptyset(&none);
-            ::sigprocmask(SIG_SETMASK, &none, nullptr);   // and unblock them
+            const std::uint64_t none = 0;
+            ::syscall(SYS_rt_sigprocmask, SIG_SETMASK, &none, nullptr, kSigsetBytes);   // unblock
         }
 
         ::close(report[0]);
@@ -315,7 +320,17 @@ Result<Spawned> spawn_in(const Plan& plan, const Command& cmd, const cgroup::Gro
         // namespace, and as its pid 1.
         auto st = plan.apply_until(Phase::mounts, afds);
         if (st) {
-            pid_t inner = ::fork();
+            // a raw clone, NOT glibc's fork(). we got here through a raw
+            // clone3 of a threaded process, which skips glibc's fork handling,
+            // so glibc's internal locks are in whatever state other threads
+            // had them at that instant. fork() takes several of them (the
+            // abort lock since 2.41, malloc's arenas) and can wait forever.
+            struct clone_args_fork {
+                std::uint64_t flags, pidfd, child_tid, parent_tid, exit_signal, stack,
+                    stack_size, tls, set_tid, set_tid_size, cgroup;
+            } fa{};
+            fa.exit_signal = SIGCHLD;
+            pid_t inner = static_cast<pid_t>(::syscall(SYS_clone3, &fa, sizeof fa));
             if (inner < 0) {
                 f.stage = 0;
                 f.sys_errno = errno;
