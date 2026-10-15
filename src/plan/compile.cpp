@@ -1159,6 +1159,7 @@ Result<Compiled> compile(const Policy<Sealed>& policy, const HostCapabilities& h
     if (!plan) return std::unexpected(plan.error());
 
     out.plan = std::move(*plan);
+    out.plan.set_guest_is_pid_1(d.as_pid_1);
     out.guarantees = std::move(report).build();
     return out;
 }

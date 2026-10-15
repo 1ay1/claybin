@@ -193,6 +193,17 @@ check "unshare-net kills connectivity" \
     $BASE --unshare-net --chdir / -- /bin/sh -c 'ls /sys/class/net 2>/dev/null | wc -l'
 check "unshare-pid gives us a fresh pid space" \
     $BASE --unshare-pid --proc /proc --chdir / -- /bin/sh -c 'ls /proc | grep -c "^1$"'
+# the guest is NOT pid 1: a shepherd holds that slot, so the guest keeps normal
+# signal semantics. pid 1 ignores signals it has no handler for, so a guest
+# that was pid 1 survived `kill -9 $$` and reported success.
+check "unshare-pid: the guest is pid 2, not 1" \
+    $BASE --unshare-pid --proc /proc --chdir / -- /bin/sh -c 'echo $$'
+check "unshare-pid: a guest can kill itself" \
+    $BASE --unshare-pid --proc /proc --chdir / -- /bin/sh -c 'kill -9 $$; echo survived'
+check "unshare-pid: a guest signal death keeps its exit code" \
+    $BASE --unshare-pid --proc /proc --chdir / -- /bin/sh -c 'kill -TERM $$'
+check "as-pid-1 keeps the guest at pid 1" \
+    $BASE --unshare-pid --as-pid-1 --proc /proc --chdir / -- /bin/sh -c 'echo $$'
 
 # ---- overlays ----------------------------------------------------------------
 # these need scratch directories, so they are set up and torn down here rather

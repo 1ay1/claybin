@@ -478,10 +478,16 @@ class Plan {
 
     Status apply_range(Phase first, Phase last, ApplyFds& fds) const;
 
+    // the guest asked to BE pid 1 of its pid namespace (Policy::as_pid_1), so
+    // spawn() runs it directly instead of behind an in-namespace shepherd.
+    bool guest_is_pid_1() const { return guest_is_pid_1_; }
+    void set_guest_is_pid_1(bool v) { guest_is_pid_1_ = v; }
+
   private:
     friend class PlanBuilder;
     std::vector<std::byte> arena_;
     std::uint32_t ops_off_{0};  // strings are interned below this point
+    bool guest_is_pid_1_{false};
 };
 
 // ---------------------------------------------------------------------------

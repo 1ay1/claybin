@@ -1283,9 +1283,10 @@ Status Plan::apply_range(Phase first, Phase last, ApplyFds& fds) const {
             case OpCode::die_with_parent: {
                 // PR_SET_PDEATHSIG fires when our PARENT dies, so it has to be
                 // set in the process that is actually the supervisor's child.
-                // spawn() forks a shepherd for the pid namespace, so this is set
-                // in the grandchild and tracks the shepherd -- which is what we
-                // want: if the shepherd goes, nothing is watching the sandbox.
+                // spawn() forks twice for the pid namespace, so this is set in
+                // the guest and tracks the in-namespace shepherd (pid 1), which
+                // itself tracks the outer child: if either goes, the sandbox
+                // goes with it.
                 if (::prctl(PR_SET_PDEATHSIG, SIGKILL, 0, 0, 0) < 0)
                     return die(Errc::io_error, "die_with_parent", errno);
                 return true;

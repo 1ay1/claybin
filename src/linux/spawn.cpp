@@ -317,7 +317,8 @@ Result<Spawned> spawn_in(const Plan& plan, const Command& cmd, const cgroup::Gro
         //
         // apply_until() runs the namespace phase, we fork, then the grandchild
         // runs the rest -- mounts included -- as a real member of the new pid
-        // namespace, and as its pid 1.
+        // namespace. it is pid 1 there, and forks once more below so the guest
+        // is not (see the shepherd).
         auto st = plan.apply_until(Phase::mounts, afds);
         if (st) {
             // a raw clone, NOT glibc's fork(). we got here through a raw
@@ -340,15 +341,72 @@ Result<Spawned> spawn_in(const Plan& plan, const Command& cmd, const cgroup::Gro
                 ::_exit(kExitPlanFailed);
             }
             if (inner > 0) {
-                // the outer child is the shepherd: it holds pid 1 of the new pid
-                // namespace and mirrors the guest's exit status, so the caller's
-                // waitpid() still means what they expect.
+                // the outer child is outside the new pid namespace (unshare only
+                // moves our CHILDREN in), so it just mirrors the exit status.
                 ::close(report[1]);
                 int wst = 0;
                 while (::waitpid(inner, &wst, 0) < 0 && errno == EINTR) {
                 }
                 if (WIFSIGNALED(wst)) ::_exit(128 + WTERMSIG(wst));
                 ::_exit(WIFEXITED(wst) ? WEXITSTATUS(wst) : 1);
+            }
+            // `inner` is the first process in the namespace, so it is pid 1.
+            // pid 1 ignores every signal it has no handler for, including
+            // SIGKILL from inside the namespace, so a guest running here could
+            // not `kill $$` or be killed by its own children, and a script that
+            // signals itself reported success. one more fork keeps pid 1 for a
+            // shepherd that only waits, and the guest runs as pid 2 with normal
+            // signal semantics. `kill -9 $$` then dies with 137, as on the host.
+            // a policy that asked for as_pid_1 skips this and keeps pid 1.
+            //
+            // the shepherd stays in the setup child's fd table only until the
+            // fork, then closes the report socket so the parent's EOF still
+            // means "guest exec'd". signals from outside (the runner's SIGTERM
+            // and SIGKILL) reach pid 1, and when pid 1 dies the kernel kills
+            // everything else in the namespace, so stop/timeout still work.
+            if (!plan.guest_is_pid_1()) {
+                pid_t guest = static_cast<pid_t>(::syscall(SYS_clone3, &fa, sizeof fa));
+                if (guest < 0) {
+                    f.stage = 0;
+                    f.sys_errno = errno;
+                    for (int k = 0; k < 8; ++k) f.mech[k] = "pid-fork"[k];
+                    ssize_t ig = ::write(report[1], &f, sizeof f);
+                    (void)ig;
+                    ::_exit(kExitPlanFailed);
+                }
+                if (guest > 0) {
+                    ::close(report[1]);
+                    // when the outer process dies (the runner's SIGKILL on a
+                    // timeout), die too: pid 1 going takes the whole namespace
+                    // with it, so nothing the guest started can outlive the
+                    // stop. without this the guest's setsid() put it outside the
+                    // group the runner signals, and a timed-out command's
+                    // children kept running.
+                    ::prctl(PR_SET_PDEATHSIG, SIGKILL, 0, 0, 0);
+                    // pass on what the runner sends pid 1, so a graceful SIGTERM
+                    // still reaches the guest instead of being ignored. like
+                    // tini: block the stop signals and collect them while we
+                    // wait, so no handler (and no sigaction restorer) is needed.
+                    // the guest unblocks them below, before it execs.
+                    constexpr long kSigsetBytes = 8;
+                    std::uint64_t stop_set = 0;
+                    for (int sig : {SIGTERM, SIGINT, SIGHUP, SIGQUIT, SIGCHLD})
+                        stop_set |= 1ull << (sig - 1);
+                    ::syscall(SYS_rt_sigprocmask, SIG_BLOCK, &stop_set, nullptr, kSigsetBytes);
+                    for (;;) {
+                        int wst = 0;
+                        const pid_t r = ::waitpid(guest, &wst, WNOHANG);
+                        if (r == guest) {
+                            if (WIFSIGNALED(wst)) ::_exit(128 + WTERMSIG(wst));
+                            ::_exit(WIFEXITED(wst) ? WEXITSTATUS(wst) : 1);
+                        }
+                        if (r < 0 && errno != EINTR) ::_exit(1);
+                        struct timespec tick{0, 200'000'000};
+                        const long sig = ::syscall(SYS_rt_sigtimedwait, &stop_set, nullptr,
+                                                   &tick, kSigsetBytes);
+                        if (sig > 0 && sig != SIGCHLD) ::syscall(SYS_kill, guest, sig);
+                    }
+                }
             }
             // grandchild: finish the plan.
             //
@@ -601,8 +659,9 @@ Result<Spawned> spawn_in(const Plan& plan, const Command& cmd, const cgroup::Gro
         int pr;
         do pr = ::poll(&pfd, 1, kSetupTimeoutMs); while (pr < 0 && errno == EINTR);
         if (pr == 0) {
-            // the shepherd is pid 1 of the guest's pid namespace, so killing
-            // it takes the rest; the cgroup covers a host with no pidns.
+            // the in-namespace shepherd is pid 1 there, so killing the outer
+            // child (whose death it tracks) takes the rest; the cgroup covers a
+            // host with no pidns.
             if (use_cgroup && cg.kill_supported()) (void)cg.kill();
             ::kill(static_cast<pid_t>(pid), SIGKILL);
             int st = 0;
