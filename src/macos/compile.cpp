@@ -191,8 +191,12 @@ void emit_prerequisites(std::string& p) {
     p += "(allow mach-lookup)\n";
     p += "(allow file-read* file-write* (literal \"/dev/null\"))\n";
     p += "(allow file-read* (literal \"/dev/random\") (literal \"/dev/urandom\"))\n";
-    // a process that cannot signal itself cannot abort() or run a timer.
-    p += "(allow signal (target self))\n";
+    // a process that cannot signal itself cannot abort() or run a timer, and
+    // one that cannot signal its own children cannot run `timeout`, a build
+    // that cancels jobs, or a shell that reaps a `&` job with kill.
+    // same-sandbox covers both (self is in the sandbox) while still denying
+    // signals to anything outside it -- the host, the supervisor, other users.
+    p += "(allow signal (target same-sandbox))\n";
 }
 
 }  // namespace

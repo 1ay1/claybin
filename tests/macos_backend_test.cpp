@@ -367,6 +367,20 @@ int main() {
         }
     }
 
+    // -- signals are scoped to the sandbox, not to the single process -------
+    // `self` alone breaks every guest that kills its own child (timeout, make
+    // -j cancelling, a shell's `kill %1`); an unscoped allow would let the
+    // guest signal the supervisor. same-sandbox is the one correct scope.
+    {
+        auto c = macos::compile(shapes::system_ro().seal(), mac);
+        CHECK(c.has_value());
+        if (c) {
+            CHECK(contains(c->profile, "(allow signal (target same-sandbox))"));
+            CHECK(!contains(c->profile, "(allow signal)"));
+            CHECK(!contains(c->profile, "(target others)"));
+        }
+    }
+
     // -- prerequisites can be turned off -----------------------------------
     // an implicit grant nobody can disable is one nobody audits.
     {
@@ -375,6 +389,7 @@ int main() {
         auto c = macos::compile(shapes::system_ro().seal(), mac, opts);
         CHECK(c.has_value());
         if (c) CHECK(!contains(c->profile, "(allow mach-lookup)"));
+        if (c) CHECK(!contains(c->profile, "(allow signal"));
     }
 
     return finish("macos_backend_test");

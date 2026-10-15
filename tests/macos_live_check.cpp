@@ -14,6 +14,8 @@
 #if defined(__APPLE__)
 #include <sys/wait.h>
 #include <unistd.h>
+
+#include <cstdio>
 #endif
 
 using namespace clay;
@@ -101,6 +103,19 @@ int main() {
         auto rc = macos::compile(ro, host);
         CHECK(rc.has_value());
         if (rc) CHECK(run_in(*rc, "ls ~ > /dev/null 2>&1") != 0);
+    }
+
+    // -- the signal wall: own children yes, the host no --------------------
+    // a guest that cannot signal a process it spawned cannot run `timeout`,
+    // a job-cancelling build, or `kill %1`. a guest that CAN signal outside
+    // its sandbox can kill the supervisor. both halves are the contract.
+    CHECK_EQ(run_in(*c, "sleep 5 & kill $! && wait $!; test $? -eq 143"), 0);
+    {
+        // a host process the guest did not start: our own pid. kill -0 only
+        // probes, so even a wrongly-permitted signal changes nothing here.
+        char cmd[64];
+        std::snprintf(cmd, sizeof cmd, "kill -0 %d", static_cast<int>(::getpid()));
+        CHECK(run_in(*c, cmd) != 0);
     }
 
     // -- a failed sandbox must never run the program -----------------------
