@@ -5,6 +5,8 @@
 #include <string_view>
 #include <cerrno>
 #include <csignal>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <utility>
 #include <fcntl.h>
@@ -195,6 +197,27 @@ Result<Spawned> spawn_in(const Plan& plan, const Command& cmd, const cgroup::Gro
     // can be reused between exit and wait, and we would be signalling a
     // stranger. fall back only if the kernel refuses.
     int pidfd = -1;
+    // where this process's argv strings live. the in-namespace shepherd is a
+    // fork of us that never execs, so the guest could read the supervisor's
+    // command line from /proc/1/cmdline; the shepherd blanks this range. read
+    // here, before the fork, where allocating is still allowed.
+    std::uintptr_t arg_start = 0, arg_end = 0;
+    if (FILE* sf = std::fopen("/proc/self/stat", "re")) {
+        char buf[2048];
+        const std::size_t n = std::fread(buf, 1, sizeof buf - 1, sf);
+        std::fclose(sf);
+        buf[n] = '\0';
+        // fields 48/49; count from the ')' that ends comm, which may hold spaces
+        if (char* p = std::strrchr(buf, ')')) {
+            int field = 2;
+            char* save = nullptr;
+            for (char* tok = ::strtok_r(p + 1, " ", &save); tok; tok = ::strtok_r(nullptr, " ", &save)) {
+                ++field;
+                if (field == 48) arg_start = std::strtoull(tok, nullptr, 10);
+                if (field == 49) { arg_end = std::strtoull(tok, nullptr, 10); break; }
+            }
+        }
+    }
     struct clone_args {
         std::uint64_t flags, pidfd, child_tid, parent_tid, exit_signal, stack, stack_size, tls;
         std::uint64_t set_tid, set_tid_size, cgroup;
@@ -376,6 +399,14 @@ Result<Spawned> spawn_in(const Plan& plan, const Command& cmd, const cgroup::Gro
                 }
                 if (guest > 0) {
                     ::close(report[1]);
+                    // blank the argv we inherited, so /proc/1/cmdline inside the
+                    // sandbox reads empty instead of the supervisor's command
+                    // line. plain stores, no libc: we are post-fork.
+                    if (arg_start != 0 && arg_end > arg_start && arg_end - arg_start < (1u << 20)) {
+                        auto* p = reinterpret_cast<volatile char*>(arg_start);
+                        for (std::uintptr_t k = 0; k < arg_end - arg_start; ++k) p[k] = 0;
+                    }
+                    ::prctl(PR_SET_DUMPABLE, 0, 0, 0, 0);   // and no ptrace into it
                     // when the outer process dies (the runner's SIGKILL on a
                     // timeout), die too: pid 1 going takes the whole namespace
                     // with it, so nothing the guest started can outlive the

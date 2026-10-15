@@ -430,8 +430,18 @@ inline int sysrq_trigger() { return write_path("/proc/sysrq-trigger"); }
 
 inline int read_host_cmdline() {
     // another process's command line. inside a pid namespace with its own
-    // procfs there should be nothing to read.
-    return read_path("/proc/1/cmdline") == kEscaped && ::getpid() != 1 ? kEscaped : kBlocked;
+    // procfs, pid 1 is the sandbox's own shepherd (or the guest itself), whose
+    // inherited argv is blanked. an escape is a non-empty command line there,
+    // i.e. text that came from outside the sandbox.
+    if (::getpid() == 1) return kBlocked;
+    const int fd = ::open("/proc/1/cmdline", O_RDONLY);
+    if (fd < 0) return kBlocked;
+    char b[256];
+    const ssize_t n = ::read(fd, b, sizeof b);
+    ::close(fd);
+    for (ssize_t k = 0; k < n; ++k)
+        if (b[k] != '\0') return kEscaped;
+    return kBlocked;
 }
 
 inline int read_kallsyms() {
