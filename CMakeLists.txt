@@ -58,7 +58,8 @@ add_library(claybin STATIC
 # Grouped with the linux/ sources rather than given their own guard: the
 # question "does this file need a POSIX host" has one answer and should have
 # one list.
-if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+# Android reports CMAKE_SYSTEM_NAME "Android" but runs the same kernel API.
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux" OR CMAKE_SYSTEM_NAME STREQUAL "Android")
   target_sources(claybin PRIVATE
     src/broker/notify.cpp
     src/core/fd.cpp
