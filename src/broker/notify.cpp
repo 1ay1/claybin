@@ -64,6 +64,23 @@ constexpr unsigned long kNotifAddfd =
     (1ul << 30) | (static_cast<unsigned long>('!') << 8) | 3u |
     (static_cast<unsigned long>(sizeof(NotifAddfd)) << 16);
 
+// ioctl's request parameter is `unsigned long` in glibc but `int` in musl
+// (POSIX says int). RECV and SEND have bit 31 set, so passing them as-is
+// sign-converts on musl. The kernel reads only the low 32 bits, so convert
+// to whatever this libc declares, explicitly and in one place: the bit
+// pattern the kernel decodes is the same either way.
+template <class R> struct ioctl_request;
+template <class Req> struct ioctl_request<int (*)(int, Req, ...)> { using type = Req; };
+template <class Req> struct ioctl_request<int (*)(int, Req, ...) noexcept> { using type = Req; };
+using ioctl_req_t = typename ioctl_request<decltype(&::ioctl)>::type;
+
+template <class Arg>
+int notif_ioctl(int fd, unsigned long request, Arg* arg) {
+    static_assert(sizeof(ioctl_req_t) >= sizeof(std::uint32_t),
+                  "the ioctl request must hold the 32-bit encoding");
+    return ::ioctl(fd, static_cast<ioctl_req_t>(request), arg);
+}
+
 // SECCOMP_ADDFD_FLAG_SEND: install the fd AND use it as the syscall's return
 // value, in one atomic step. without this the supervisor would have to install
 // the fd and then separately respond with its number, and the guest could see an
@@ -79,7 +96,7 @@ Result<Request> Listener::next() {
     // the kernel requires the struct be zeroed: it rejects a request with
     // unrecognised bits set, which is how it stays forward-compatible.
     std::memset(&n, 0, sizeof n);
-    if (::ioctl(fd_.get(), kNotifRecv, &n) < 0)
+    if (notif_ioctl(fd_.get(), kNotifRecv, &n) < 0)
         return std::unexpected(Error{Errc::io_error, "broker: NOTIF_RECV", errno});
 
     Request r;
@@ -96,7 +113,7 @@ bool Listener::still_valid(const Request& req) const {
     // ID_VALID returns 0 when the notification is live, -ENOENT when the guest
     // thread has died. this is the ONLY way to know that the thing we inspected
     // is the thing we are about to answer.
-    return ::ioctl(fd_.get(), kNotifIdValid, &id) == 0;
+    return notif_ioctl(fd_.get(), kNotifIdValid, &id) == 0;
 }
 
 Status Listener::respond(const Request& req, const Decision& d) {
@@ -120,7 +137,7 @@ Status Listener::respond(const Request& req, const Decision& d) {
         add.srcfd = static_cast<std::uint32_t>(d.injected_fd);
         add.newfd = 0;
         add.newfd_flags = 0;
-        if (::ioctl(fd_.get(), kNotifAddfd, &add) < 0)
+        if (notif_ioctl(fd_.get(), kNotifAddfd, &add) < 0)
             return std::unexpected(Error{Errc::io_error, "broker: NOTIF_ADDFD", errno});
         return {};
     }
@@ -147,7 +164,7 @@ Status Listener::respond(const Request& req, const Decision& d) {
         resp.error = -d.error;
     }
 
-    if (::ioctl(fd_.get(), kNotifSend, &resp) < 0)
+    if (notif_ioctl(fd_.get(), kNotifSend, &resp) < 0)
         return std::unexpected(Error{Errc::io_error, "broker: NOTIF_SEND", errno});
     return {};
 }

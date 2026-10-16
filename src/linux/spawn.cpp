@@ -5,6 +5,7 @@
 #include <string_view>
 #include <cerrno>
 #include <csignal>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -211,10 +212,20 @@ Result<Spawned> spawn_in(const Plan& plan, const Command& cmd, const cgroup::Gro
         if (char* p = std::strrchr(buf, ')')) {
             int field = 2;
             char* save = nullptr;
+            // the kernel prints these as unsigned decimals; on a 32-bit host
+            // anything above UINTPTR_MAX is a parse we can't trust, so leave
+            // the range empty (no blanking) rather than truncate the address.
+            auto parse_addr = [](const char* s) -> std::uintptr_t {
+                char* end = nullptr;
+                errno = 0;
+                const unsigned long long v = std::strtoull(s, &end, 10);
+                if (errno != 0 || end == s || v > UINTPTR_MAX) return 0;
+                return static_cast<std::uintptr_t>(v);
+            };
             for (char* tok = ::strtok_r(p + 1, " ", &save); tok; tok = ::strtok_r(nullptr, " ", &save)) {
                 ++field;
-                if (field == 48) arg_start = std::strtoull(tok, nullptr, 10);
-                if (field == 49) { arg_end = std::strtoull(tok, nullptr, 10); break; }
+                if (field == 48) arg_start = parse_addr(tok);
+                if (field == 49) { arg_end = parse_addr(tok); break; }
             }
         }
     }
@@ -718,10 +729,14 @@ Result<Spawned> spawn_in(const Plan& plan, const Command& cmd, const cgroup::Gro
         msg.msg_control = u.buf;
         msg.msg_controllen = sizeof u.buf;
         do n = ::recvmsg(report[0], &msg, 0); while (n < 0 && errno == EINTR);
-        if (n > 0)
-            for (struct cmsghdr* cm = CMSG_FIRSTHDR(&msg); cm; cm = CMSG_NXTHDR(&msg, cm))
-                if (cm->cmsg_level == SOL_SOCKET && cm->cmsg_type == SCM_RIGHTS)
-                    std::memcpy(&received_fd, CMSG_DATA(cm), sizeof received_fd);
+        // the shepherd sends exactly one SCM_RIGHTS message carrying one fd,
+        // so read that header and check it fully instead of walking a list.
+        // a truncated control buffer means the fd was dropped: treat as none.
+        if (n > 0 && !(msg.msg_flags & MSG_CTRUNC))
+            if (struct cmsghdr* cm = CMSG_FIRSTHDR(&msg);
+                cm && cm->cmsg_level == SOL_SOCKET && cm->cmsg_type == SCM_RIGHTS &&
+                cm->cmsg_len == CMSG_LEN(sizeof received_fd))
+                std::memcpy(&received_fd, CMSG_DATA(cm), sizeof received_fd);
     }
     ::close(report[0]);
 

@@ -30,6 +30,7 @@
 #include <sys/prctl.h>
 #include <sys/resource.h>
 #include <sys/syscall.h>
+#include <type_traits>
 #include <unistd.h>
 
 namespace clay {
@@ -40,8 +41,34 @@ namespace {
 // ---- raw syscall wrappers. no libc wrappers: several of them touch errno
 // ---- through TLS or take locks we cannot rely on after a fork.
 
-inline long sys(long nr, long a = 0, long b = 0, long c = 0, long d = 0, long e = 0) {
-    return ::syscall(nr, a, b, c, d, e);
+// A syscall argument is a register word. Integers of any width or sign and
+// pointers all go in as one, so convert each explicitly here, once, instead
+// of letting a `long` parameter sign-convert every unsigned field implicitly.
+template <class T>
+inline long syscall_word(T v) noexcept {
+    if constexpr (std::is_pointer_v<T>)
+        return reinterpret_cast<long>(v);
+    else if constexpr (std::is_null_pointer_v<T>)
+        return 0;
+    else if constexpr (std::is_enum_v<T>)
+        return static_cast<long>(static_cast<std::underlying_type_t<T>>(v));
+    else {
+        static_assert(std::is_integral_v<T>, "syscall argument must be an integer or pointer");
+        return static_cast<long>(v);
+    }
+}
+
+template <class... A>
+    requires(sizeof...(A) <= 5)
+inline long sys(long nr, A... args) {
+    // Unused trailing slots stay 0, as the old defaulted parameters made
+    // them: prctl and friends reject garbage in arguments they don't read.
+    long w[5]{};
+    if constexpr (sizeof...(A) > 0) {
+        std::size_t i = 0;
+        ((w[i++] = syscall_word(args)), ...);
+    }
+    return ::syscall(nr, w[0], w[1], w[2], w[3], w[4]);
 }
 
 // write a whole buffer to a path. used for uid_map/gid_map/setgroups, which

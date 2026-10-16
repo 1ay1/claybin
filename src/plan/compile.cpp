@@ -70,7 +70,6 @@ constexpr std::uint64_t kLlIoctlDev = 1ull << 15;  // abi 5
 
 // rlimit resource numbers
 constexpr std::uint32_t kRlimitCpu = 0;
-constexpr std::uint32_t kRlimitFsize = 1;
 constexpr std::uint32_t kRlimitCore = 4;
 constexpr std::uint32_t kRlimitNofile = 7;
 constexpr std::uint32_t kRlimitAs = 9;
@@ -133,7 +132,6 @@ constexpr std::uint64_t kMsNoexec = 8;
 constexpr std::uint64_t kMsRemount = 32;
 constexpr std::uint64_t kMsBind = 4096;
 constexpr std::uint64_t kMsRec = 16384;
-constexpr std::uint64_t kMsPrivate = 1ull << 18;
 constexpr std::uint64_t kMsSlave = 1ull << 19;
 constexpr std::uint64_t kMsSilent = 1ull << 15;
 
@@ -1001,7 +999,7 @@ Result<Compiled> compile(const Policy<Sealed>& policy, const HostCapabilities& h
                     if (e.ops.any(kNetBind)) allowed |= kLlBindTcp;
                     if (allowed == 0) continue;
                     b.op(OpCode::landlock_net_rule,
-                         LandlockNetRuleOp{allowed, e.port, 0});
+                         LandlockNetRuleOp{allowed, e.port, {}});
                 }
             }
         }
