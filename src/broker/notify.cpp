@@ -64,21 +64,17 @@ constexpr unsigned long kNotifAddfd =
     (1ul << 30) | (static_cast<unsigned long>('!') << 8) | 3u |
     (static_cast<unsigned long>(sizeof(NotifAddfd)) << 16);
 
-// ioctl's request parameter is `unsigned long` in glibc but `int` in musl
-// (POSIX says int). RECV and SEND have bit 31 set, so passing them as-is
-// sign-converts on musl. The kernel reads only the low 32 bits, so convert
-// to whatever this libc declares, explicitly and in one place: the bit
-// pattern the kernel decodes is the same either way.
-template <class R> struct ioctl_request;
-template <class Req> struct ioctl_request<int (*)(int, Req, ...)> { using type = Req; };
-template <class Req> struct ioctl_request<int (*)(int, Req, ...) noexcept> { using type = Req; };
-using ioctl_req_t = typename ioctl_request<decltype(&::ioctl)>::type;
-
+// ioctl's request is `unsigned long` in glibc, `int` in musl (POSIX), and
+// Bionic declares BOTH `int` and `unsigned` overloads, so its address can't be
+// taken (`decltype(&::ioctl)` doesn't resolve). The kernel decodes only the low
+// 32 bits, so pass the request as `unsigned`: glibc widens it losslessly, musl
+// converts it to the same bit pattern, and Bionic picks its unsigned overload.
+// RECV and SEND have bit 31 set, which is why it must not go through `int`.
 template <class Arg>
 int notif_ioctl(int fd, unsigned long request, Arg* arg) {
-    static_assert(sizeof(ioctl_req_t) >= sizeof(std::uint32_t),
+    static_assert(sizeof(unsigned) >= sizeof(std::uint32_t),
                   "the ioctl request must hold the 32-bit encoding");
-    return ::ioctl(fd, static_cast<ioctl_req_t>(request), arg);
+    return ::ioctl(fd, static_cast<unsigned>(request), arg);
 }
 
 // SECCOMP_ADDFD_FLAG_SEND: install the fd AND use it as the syscall's return
